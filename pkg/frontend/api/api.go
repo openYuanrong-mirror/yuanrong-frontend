@@ -69,6 +69,7 @@ const (
 	urlStreamSubscribe          = "/serverless/v1/stream/subscribe"
 	urlGetHealthCheck           = "/healthz"
 	urlClusterHealthy           = "/serverless/v1/componentshealth"
+	urlCapabilities             = "/serverless/v1/capabilities"
 	urlResources                = "/global-scheduler/resources"
 	urlGetAsyncResult           = "/serverless/v1/functions/async-results/:request-id"
 	// url to faasmanager
@@ -119,7 +120,8 @@ func InitRoute(r *gin.Engine) {
 	r.Use(middleware.GlobalJWTAuthMiddleware())
 
 	r.GET(urlGetHealthCheck, v1.HealthzHandler)
-	r.GET(urlClusterHealthy, v1.ClusterHealthHandler)              // Health check
+	r.GET(urlClusterHealthy, v1.ClusterHealthHandler) // Health check
+	r.GET(urlCapabilities, v1.CapabilitiesHandler)
 	r.GET(urlResources, resources.QueryHandler)                    // Cluster resource query
 	r.POST(urlPostInvoke, tracer.WrapGinHandler(v1.InvokeHandler)) // Invocation
 	r.POST(urlInterruptSession, tracer.WrapGinHandler(v1.InterruptSessionHandler))

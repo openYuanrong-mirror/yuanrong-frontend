@@ -66,6 +66,18 @@ func TestIsInAuthWhitelist(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "capabilities GET - should be in whitelist",
+			path:     "/serverless/v1/capabilities",
+			method:   "GET",
+			expected: true,
+		},
+		{
+			name:     "capabilities POST - should not be in whitelist",
+			path:     "/serverless/v1/capabilities",
+			method:   "POST",
+			expected: false,
+		},
+		{
 			name:     "lease PUT - should be in whitelist",
 			path:     "/client/v1/lease",
 			method:   "PUT",
