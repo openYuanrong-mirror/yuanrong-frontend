@@ -51,9 +51,8 @@ import (
 )
 
 const (
-	// Default sandbox backend is the dedicated Rust slot (rrt): the akernel SDK
-	// sends no runtime, so create/invoke resolve to the native rrt-runtime
-	// function. python3.x runtimes remain explicitly selectable.
+	// Sandbox v1 always executes through the dedicated Rust slot (rrt).
+	// The public runtime field selects only the sandbox isolation runtime.
 	defaultSandboxRuntime          = "rrt"
 	defaultSandboxFunctionID       = "default/0-defaultservice-rrt/$latest"
 	sandboxCreateTimeoutSeconds    = 60
@@ -129,6 +128,9 @@ type CreateRequest struct {
 	Env         map[string]string        `json:"env"`
 	Mounts      []map[string]interface{} `json:"mounts"`
 	ExtraConfig map[string]interface{}   `json:"extra_config"`
+	// ScheduleAffinities exposes the native scheduler semantics instead of
+	// adding resource-specific shortcut fields such as nodeId.
+	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
 	// Optional logical create budget. A positive request value overrides the
 	// environment and default without changing the legacy request shape.
 	CreateTimeoutSeconds int `json:"createTimeoutSeconds"`
@@ -139,12 +141,13 @@ type CreateRequest struct {
 
 // RootfsSpec describes a structured sandbox rootfs request for the v1 API.
 type RootfsSpec struct {
-	Runtime  string `json:"runtime,omitempty"`
-	Type     string `json:"type,omitempty"`
-	Image    string `json:"image,omitempty"`
-	ImageURL string `json:"imageurl,omitempty"`
-	Path     string `json:"path,omitempty"`
-	ReadOnly *bool  `json:"readonly,omitempty"`
+	Runtime     string                 `json:"runtime,omitempty"`
+	Type        string                 `json:"type,omitempty"`
+	Image       string                 `json:"image,omitempty"`
+	ImageURL    string                 `json:"imageurl,omitempty"`
+	Path        string                 `json:"path,omitempty"`
+	ReadOnly    *bool                  `json:"readonly,omitempty"`
+	StorageInfo map[string]interface{} `json:"storageInfo,omitempty"`
 }
 
 // TunnelSpec asks the frontend to prepare the sandbox-side reverse tunnel.
@@ -174,6 +177,7 @@ type CreateV1Request struct {
 	Env                    map[string]string        `json:"env"`
 	Mounts                 []map[string]interface{} `json:"mounts"`
 	ExtraConfig            map[string]interface{}   `json:"extra_config"`
+	ScheduleAffinities     []api.Affinity           `json:"scheduleAffinities,omitempty"`
 	Tunnel                 TunnelSpec               `json:"tunnel,omitempty"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
@@ -261,14 +265,74 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if req.Namespace == "" {
 		req.Namespace = "default"
 	}
+	if req.Runtime == "" {
+		req.Runtime = "runsc"
+	}
+	if req.Runtime != "runsc" && req.Runtime != "kata" {
+		return "", nil, fmt.Errorf("runtime must be one of: runsc, kata")
+	}
+	if err := validateScheduleAffinities(req.ScheduleAffinities); err != nil {
+		return "", nil, err
+	}
+	req.Rootfs.Runtime = req.Runtime
 	rootfs, err := buildRootfsOption(req.Rootfs, req.Image)
 	if err != nil {
 		return "", nil, err
 	}
-	if usesSandboxRRTRuntime(req.Runtime) {
-		prepareSandboxRRTHTTP(req)
-	}
+	prepareSandboxRRTHTTP(req)
 	return rootfs, prepareSandboxTunnel(req), nil
+}
+
+func validateScheduleAffinities(affinities []api.Affinity) error {
+	for affinityIndex, affinity := range affinities {
+		if affinity.Kind != api.AffinityKindResource &&
+			affinity.Kind != api.AffinityKindInstance {
+			return fmt.Errorf(
+				"scheduleAffinities[%d].kind must be resource(0) or instance(1)",
+				affinityIndex,
+			)
+		}
+		if affinity.Affinity < api.PreferredAffinity ||
+			affinity.Affinity > api.RequiredAntiAffinity {
+			return fmt.Errorf(
+				"scheduleAffinities[%d].affinity must be between 0 and 3",
+				affinityIndex,
+			)
+		}
+		if len(affinity.LabelOps) == 0 {
+			return fmt.Errorf(
+				"scheduleAffinities[%d].labelOps must not be empty",
+				affinityIndex,
+			)
+		}
+		for operatorIndex, operator := range affinity.LabelOps {
+			if operator.Type < api.LabelOpIn ||
+				operator.Type > api.LabelOpNotExists {
+				return fmt.Errorf(
+					"scheduleAffinities[%d].labelOps[%d].type must be between 0 and 3",
+					affinityIndex,
+					operatorIndex,
+				)
+			}
+			if strings.TrimSpace(operator.LabelKey) == "" {
+				return fmt.Errorf(
+					"scheduleAffinities[%d].labelOps[%d].labelKey must not be empty",
+					affinityIndex,
+					operatorIndex,
+				)
+			}
+			if (operator.Type == api.LabelOpIn ||
+				operator.Type == api.LabelOpNotIn) &&
+				len(operator.LabelValues) == 0 {
+				return fmt.Errorf(
+					"scheduleAffinities[%d].labelOps[%d].labelValues must not be empty",
+					affinityIndex,
+					operatorIndex,
+				)
+			}
+		}
+	}
+	return nil
 }
 
 func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
@@ -276,7 +340,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		Name:                   req.Name,
 		Namespace:              req.Namespace,
 		Tenant:                 req.Tenant,
-		Runtime:                req.Runtime,
+		Runtime:                defaultSandboxRuntime,
 		Rootfs:                 rootfs,
 		Ports:                  req.Ports,
 		portRouteKinds:         req.portRouteKinds,
@@ -287,6 +351,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		Env:                    req.Env,
 		Mounts:                 req.Mounts,
 		ExtraConfig:            req.ExtraConfig,
+		ScheduleAffinities:     req.ScheduleAffinities,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
 	}
@@ -546,14 +611,15 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions,
 		return api.InvokeOptions{}, err
 	}
 	invokeOpts := api.InvokeOptions{
-		TraceID:           req.traceID,
-		Cpu:               cpu,
-		Memory:            memory,
-		CpuLimit:          req.createReq.CpuLimit,
-		MemoryLimit:       req.createReq.MemLimit,
-		Timeout:           createTimeoutSeconds,
-		ScheduleTimeoutMs: int64(scheduleTimeoutSeconds) * millisecondsPerSecond,
-		CreateOpt:         map[string]string{},
+		TraceID:            req.traceID,
+		Cpu:                cpu,
+		Memory:             memory,
+		CpuLimit:           req.createReq.CpuLimit,
+		MemoryLimit:        req.createReq.MemLimit,
+		Timeout:            createTimeoutSeconds,
+		ScheduleTimeoutMs:  int64(scheduleTimeoutSeconds) * millisecondsPerSecond,
+		ScheduleAffinities: req.createReq.ScheduleAffinities,
+		CreateOpt:          map[string]string{},
 		CustomExtensions: map[string]string{
 			"lifecycle":   "detached",
 			"Concurrency": sandboxConcurrency,

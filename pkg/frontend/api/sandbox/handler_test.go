@@ -837,6 +837,147 @@ func TestCreateV1HandlerDefaultsAndReturnsSandboxID(t *testing.T) {
 	require.Equal(t, "running", requireStringMapValue(t, data, "status"))
 }
 
+func TestCreateV1HandlerUsesRRTForKataIsolationRuntime(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	var capturedFuncMeta api.FunctionMeta
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedFuncMeta = funcMeta
+			capturedInvokeOpt = invokeOpt
+			return "sandbox-kata", nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{
+		"runtime":"kata",
+		"image":"ubuntu:22.04"
+	}`)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		bytes.NewReader(body),
+	)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, defaultSandboxFunctionID, capturedFuncMeta.FuncID)
+	require.JSONEq(
+		t,
+		`{"runtime":"kata","type":"image","imageurl":"ubuntu:22.04"}`,
+		capturedInvokeOpt.CustomExtensions["rootfs"],
+	)
+}
+
+func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "sandbox-s3", nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{
+		"runtime":"runsc",
+		"scheduleAffinities":[{
+			"kind":0,
+			"affinity":2,
+			"labelOps":[{
+				"type":0,
+				"labelKey":"NODE_ID",
+				"labelValues":["node-a"]
+			}]
+		}],
+		"rootfs":{
+			"type":"s3",
+			"storageInfo":{
+				"endpoint":"https://s3.example",
+				"bucket":"rootfs",
+				"object":"images/base"
+			}
+		}
+	}`)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		bytes.NewReader(body),
+	)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(
+		t,
+		`{
+			"runtime":"runsc",
+			"type":"s3",
+			"storageInfo":{
+				"endpoint":"https://s3.example",
+				"bucket":"rootfs",
+				"object":"images/base"
+			}
+		}`,
+		capturedInvokeOpt.CustomExtensions["rootfs"],
+	)
+	require.Equal(t, []api.Affinity{{
+		Kind:     api.AffinityKindResource,
+		Affinity: api.RequiredAffinity,
+		LabelOps: []api.LabelOperator{{
+			Type:        api.LabelOpIn,
+			LabelKey:    "NODE_ID",
+			LabelValues: []string{"node-a"},
+		}},
+	}}, capturedInvokeOpt.ScheduleAffinities)
+}
+
+func TestCreateV1HandlerRejectsInvalidScheduleAffinity(t *testing.T) {
+	createCalled := false
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			createCalled = true
+			return "sandbox-invalid-affinity", nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{
+		"runtime":"runsc",
+		"image":"ubuntu:22.04",
+		"scheduleAffinities":[{
+			"kind":9,
+			"affinity":2,
+			"labelOps":[{
+				"type":0,
+				"labelKey":"NODE_ID",
+				"labelValues":["node-a"]
+			}]
+		}]
+	}`)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		bytes.NewReader(body),
+	)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.False(t, createCalled)
+	require.Contains(t, recorder.Body.String(), "scheduleAffinities[0].kind")
+}
+
 func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
 	util.SetAPIClientLibruntime(&runtimeStub{
@@ -1042,11 +1183,11 @@ func assertTunnelResponse(t *testing.T, recorder *httptest.ResponseRecorder) {
 	require.Equal(t, "http://127.0.0.1:8766", tunnel["proxyUrl"])
 }
 
-func TestCreateV1HandlerDoesNotInjectRRTPortForPythonRuntime(t *testing.T) {
-	var capturedInvokeOpt api.InvokeOptions
+func TestCreateV1HandlerRejectsLegacyExecutorRuntime(t *testing.T) {
+	createCalled := false
 	util.SetAPIClientLibruntime(&runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
-			capturedInvokeOpt = invokeOpt
+			createCalled = true
 			return "default/sandbox_python.1", nil
 		},
 	})
@@ -1064,13 +1205,9 @@ func TestCreateV1HandlerDoesNotInjectRRTPortForPythonRuntime(t *testing.T) {
 
 	CreateV1Handler(ctx)
 
-	require.Equal(t, http.StatusOK, recorder.Code)
-	require.NotContains(t, capturedInvokeOpt.CreateOpt, "network")
-	require.JSONEq(
-		t,
-		`{"USER_ENV":"ok"}`,
-		capturedInvokeOpt.CreateOpt[constant.DelegateEnvVar],
-	)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.False(t, createCalled)
+	require.Contains(t, recorder.Body.String(), "runtime must be one of: runsc, kata")
 }
 
 func TestNormalizeJSONValuePreservesFractionalAndConvertsIntegers(t *testing.T) {
