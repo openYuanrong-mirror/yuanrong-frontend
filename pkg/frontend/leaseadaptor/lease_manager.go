@@ -291,7 +291,7 @@ func (flps *FuncKeyLeasePools) releaseInstanceLease(leaseID string, abnormal boo
 }
 
 func (flps *FuncKeyLeasePools) loop() {
-	ticker := time.NewTicker(time.Duration(flps.interval.Load()))
+	ticker := time.NewTicker(normalizeRetainInterval(time.Duration(flps.interval.Load())))
 	defer ticker.Stop()
 	for {
 		select {
@@ -307,9 +307,16 @@ func (flps *FuncKeyLeasePools) loop() {
 		case <-ticker.C:
 			flps.clearEmptyLeasePool()
 			flps.doBatchRetain()
-			ticker.Reset(time.Duration(flps.interval.Load()))
+			ticker.Reset(normalizeRetainInterval(time.Duration(flps.interval.Load())))
 		}
 	}
+}
+
+func normalizeRetainInterval(interval time.Duration) time.Duration {
+	if interval < time.Millisecond {
+		return defaultRetainLeaseTime * time.Millisecond
+	}
+	return interval
 }
 
 func (flps *FuncKeyLeasePools) clearEmptyLeasePool() {
@@ -545,7 +552,8 @@ func (flps *FuncKeyLeasePools) processSucceedRetainLeaseIdsBare(batch *BatchReta
 
 func (flps *FuncKeyLeasePools) processBatchResponse(batch *BatchRetainLeaseInfos,
 	resp *commontypes.BatchInstanceResponse) {
-	flps.interval.Store(resp.LeaseInterval / 2 * int64(time.Millisecond)) // half of leaseInterval
+	interval := time.Duration(resp.LeaseInterval/2) * time.Millisecond // half of leaseInterval
+	flps.interval.Store(int64(normalizeRetainInterval(interval)))
 	reacquireLeaseIds, decreaseLeaseIds := flps.parseReacquireAndDecreaseIds(resp)
 
 	flps.Lock()
