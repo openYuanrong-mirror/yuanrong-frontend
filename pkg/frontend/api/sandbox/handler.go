@@ -268,9 +268,6 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if req.Runtime == "" {
 		req.Runtime = "runsc"
 	}
-	if req.Runtime != "runsc" && req.Runtime != "kata" {
-		return "", nil, fmt.Errorf("runtime must be one of: runsc, kata")
-	}
 	if err := validateScheduleAffinities(req.ScheduleAffinities); err != nil {
 		return "", nil, err
 	}

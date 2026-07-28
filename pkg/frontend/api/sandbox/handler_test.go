@@ -1183,21 +1183,22 @@ func assertTunnelResponse(t *testing.T, recorder *httptest.ResponseRecorder) {
 	require.Equal(t, "http://127.0.0.1:8766", tunnel["proxyUrl"])
 }
 
-func TestCreateV1HandlerRejectsLegacyExecutorRuntime(t *testing.T) {
-	createCalled := false
+func TestCreateV1HandlerForwardsIsolationRuntimeWithoutOwningRegistry(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	var capturedFuncMeta api.FunctionMeta
 	util.SetAPIClientLibruntime(&runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
-			createCalled = true
-			return "default/sandbox_python.1", nil
+			capturedFuncMeta = funcMeta
+			capturedInvokeOpt = invokeOpt
+			return "sandbox-next-runtime", nil
 		},
 	})
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	body, err := json.Marshal(CreateV1Request{
-		Runtime: "python3.9",
-		Image:   "aio-yr-runtime:latest",
-		Env:     map[string]string{"USER_ENV": "ok"},
+		Runtime: "gvisor-next",
+		Image:   "ubuntu:22.04",
 	})
 	require.NoError(t, err)
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
@@ -1205,9 +1206,13 @@ func TestCreateV1HandlerRejectsLegacyExecutorRuntime(t *testing.T) {
 
 	CreateV1Handler(ctx)
 
-	require.Equal(t, http.StatusBadRequest, recorder.Code)
-	require.False(t, createCalled)
-	require.Contains(t, recorder.Body.String(), "runtime must be one of: runsc, kata")
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, defaultSandboxFunctionID, capturedFuncMeta.FuncID)
+	require.JSONEq(
+		t,
+		`{"runtime":"gvisor-next","type":"image","imageurl":"ubuntu:22.04"}`,
+		capturedInvokeOpt.CustomExtensions["rootfs"],
+	)
 }
 
 func TestNormalizeJSONValuePreservesFractionalAndConvertsIntegers(t *testing.T) {
