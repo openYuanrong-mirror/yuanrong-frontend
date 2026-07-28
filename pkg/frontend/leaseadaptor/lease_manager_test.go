@@ -279,6 +279,18 @@ func TestFuncKeyLeasePools_BatchRetainLeaseLoop(t *testing.T) {
 	})
 }
 
+func TestNormalizeRetainInterval(t *testing.T) {
+	convey.Convey("normalize retain interval", t, func() {
+		convey.So(normalizeRetainInterval(-time.Millisecond), convey.ShouldEqual,
+			defaultRetainLeaseTime*time.Millisecond)
+		convey.So(normalizeRetainInterval(0), convey.ShouldEqual,
+			defaultRetainLeaseTime*time.Millisecond)
+		convey.So(normalizeRetainInterval(time.Millisecond-1), convey.ShouldEqual,
+			defaultRetainLeaseTime*time.Millisecond)
+		convey.So(normalizeRetainInterval(time.Millisecond), convey.ShouldEqual, time.Millisecond)
+	})
+}
+
 func TestFuncKeyLeasePools_DoBatchRetain(t *testing.T) {
 	convey.Convey("test handleLeaseExpiredLoop", t, func() {
 		// 创建测试实例
@@ -926,6 +938,16 @@ func TestFuncKeyLeasePools_ProcessBatchResponse(t *testing.T) {
 			convey.So(ilps.interval.Load(), convey.ShouldEqual, int64(500*time.Millisecond))
 			_, exists := pool.leaseMap[mockLeaseID3]
 			convey.So(exists, convey.ShouldEqual, false)
+		})
+
+		convey.Convey("When LeaseInterval is zero", func() {
+			setup()
+			resp.LeaseInterval = 0
+
+			ilps.processBatchResponse(batch, resp)
+
+			convey.So(ilps.interval.Load(), convey.ShouldEqual,
+				int64(defaultRetainLeaseTime*time.Millisecond))
 		})
 	})
 }
