@@ -1205,6 +1205,17 @@ func TestCreateV1HandlerReplaysUnnamedCreateByRequestID(t *testing.T) {
 	requireCreateV1SandboxID(t, second, "sandbox-unnamed-replay")
 }
 
+func TestSandboxNameForRequestIDIsStableAndUses128Bits(t *testing.T) {
+	first := sandboxNameForRequestID("create-request-a")
+	retry := sandboxNameForRequestID("create-request-a")
+	second := sandboxNameForRequestID("create-request-b")
+
+	require.Equal(t, first, retry)
+	require.NotEqual(t, first, second)
+	require.Len(t, first, len("sandbox-")+32)
+	require.Regexp(t, `^sandbox-[0-9a-f]{32}$`, first)
+}
+
 func requireCreateV1SandboxID(
 	t *testing.T,
 	recorder *httptest.ResponseRecorder,

@@ -448,7 +448,7 @@ func prepareCreateV1Request(req *CreateV1Request, requestID string) (string, *Tu
 
 func sandboxNameForRequestID(requestID string) string {
 	digest := sha256.Sum256([]byte(requestID))
-	return fmt.Sprintf("sandbox-%x", digest[:8])
+	return fmt.Sprintf("sandbox-%x", digest[:16])
 }
 
 func validateScheduleAffinities(affinities []api.Affinity) error {
