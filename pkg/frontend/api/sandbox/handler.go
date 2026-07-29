@@ -27,6 +27,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -199,11 +200,54 @@ type sandboxCreateResult struct {
 }
 
 type sandboxCreateContext struct {
-	ctx            *gin.Context
-	req            CreateRequest
-	funcID         string
-	invokeOpts     api.InvokeOptions
-	respondOnError bool
+	req        CreateRequest
+	funcID     string
+	invokeOpts api.InvokeOptions
+	traceID    string
+	requestID  string
+}
+
+type sandboxCreateCall struct {
+	done            chan struct{}
+	leaderRequestID string
+	result          sandboxCreateResult
+	err             error
+}
+
+type sandboxCreateSingleflight struct {
+	mu    sync.Mutex
+	calls map[string]*sandboxCreateCall
+}
+
+var createSingleflight = sandboxCreateSingleflight{
+	calls: make(map[string]*sandboxCreateCall),
+}
+
+func (group *sandboxCreateSingleflight) do(
+	key string,
+	requestID string,
+	create func() (sandboxCreateResult, error),
+) (sandboxCreateResult, error, string, bool) {
+	group.mu.Lock()
+	if call, ok := group.calls[key]; ok {
+		group.mu.Unlock()
+		<-call.done
+		return call.result, call.err, call.leaderRequestID, true
+	}
+	call := &sandboxCreateCall{
+		done:            make(chan struct{}),
+		leaderRequestID: requestID,
+	}
+	group.calls[key] = call
+	group.mu.Unlock()
+
+	call.result, call.err = create()
+
+	group.mu.Lock()
+	delete(group.calls, key)
+	close(call.done)
+	group.mu.Unlock()
+	return call.result, call.err, requestID, false
 }
 
 // InvokeV1Request is the single data-plane envelope for file/process/shell actions.
@@ -218,12 +262,13 @@ type InvokeV1Request struct {
 // from its local Python environment (no code upload required).
 func CreateHandler(ctx *gin.Context) {
 	traceID := ensureSandboxTrace(ctx)
+	requestID := ensureSandboxRequestID(ctx, traceID)
 	var req CreateRequest
 	if err := ctx.ShouldBindJSON(&req); err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err))
 		return
 	}
-	result, err := createSandbox(ctx, req, 0, traceID, true)
+	result, err := createSandbox(ctx, req, 0, traceID, requestID, true)
 	if err != nil {
 		return
 	}
@@ -233,6 +278,7 @@ func CreateHandler(ctx *gin.Context) {
 // CreateV1Handler handles POST /api/sandbox/v1/sandboxes.
 func CreateV1Handler(ctx *gin.Context) {
 	traceID := ensureSandboxTrace(ctx)
+	requestID := ensureSandboxRequestID(ctx, traceID)
 	var req CreateV1Request
 	if err := ctx.ShouldBindJSON(&req); err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err))
@@ -245,16 +291,16 @@ func CreateV1Handler(ctx *gin.Context) {
 	}
 	createReq := createRequestFromV1(req, rootfs)
 	if acceptsSandboxCreateEventStream(ctx) {
-		streamSandboxCreate(ctx, createReq, req.IdleTimeoutSeconds, traceID, tunnelInfo)
+		streamSandboxCreate(ctx, createReq, req.IdleTimeoutSeconds, traceID, requestID, tunnelInfo)
 		return
 	}
 
-	result, err := createSandbox(ctx, createReq, req.IdleTimeoutSeconds, traceID, true)
+	result, err := createSandbox(ctx, createReq, req.IdleTimeoutSeconds, traceID, requestID, true)
 	if err != nil {
 		return
 	}
 	app.SetCtxResponse(
-		ctx, createV1Response(result.instanceID, sandboxCreateStatusRunning, tunnelInfo), http.StatusOK, nil,
+		ctx, createV1Response(result.instanceID, sandboxCreateStatusRunning, requestID, tunnelInfo), http.StatusOK, nil,
 	)
 }
 
@@ -359,11 +405,13 @@ func streamSandboxCreate(
 	createReq CreateRequest,
 	idleTimeoutSeconds int,
 	traceID string,
+	requestID string,
 	tunnelInfo *TunnelInfo,
 ) {
 	writeSandboxCreateSSEHeader(ctx)
 	if err := writeSandboxCreateSSEEvent(ctx, "accepted", map[string]interface{}{
-		"status": sandboxCreateStatusCreating,
+		"status":    sandboxCreateStatusCreating,
+		"requestId": requestID,
 	}); err != nil {
 		log.GetLogger().Errorf("failed to write sandbox accepted event: %v", err)
 		return
@@ -372,11 +420,11 @@ func streamSandboxCreate(
 	stopHeartbeat := make(chan struct{})
 	heartbeatDone := make(chan struct{})
 	go serveSandboxCreateHeartbeats(ctx, stopHeartbeat, heartbeatDone)
-	result, createErr := createSandbox(ctx, createReq, idleTimeoutSeconds, traceID, false)
+	result, createErr := createSandbox(ctx, createReq, idleTimeoutSeconds, traceID, requestID, false)
 	close(stopHeartbeat)
 	<-heartbeatDone
 
-	data := createV1Response(result.instanceID, result.status, tunnelInfo)
+	data := createV1Response(result.instanceID, result.status, requestID, tunnelInfo)
 	if createErr != nil {
 		data["errorCode"] = createErrorCode(createErr)
 		data["message"] = createErr.Error()
@@ -386,11 +434,12 @@ func streamSandboxCreate(
 	}
 }
 
-func createV1Response(instanceID, status string, tunnelInfo *TunnelInfo) map[string]interface{} {
+func createV1Response(instanceID, status, requestID string, tunnelInfo *TunnelInfo) map[string]interface{} {
 	resp := map[string]interface{}{
 		"sandboxId":  instanceID,
 		"instanceId": instanceID,
 		"status":     status,
+		"requestId":  requestID,
 	}
 	if tunnelInfo != nil && status == sandboxCreateStatusRunning {
 		tunnelInfo.URL = fmt.Sprintf("/tunnel/%s", route.SanitizeID(instanceID))
@@ -476,6 +525,7 @@ func createSandbox(
 	req CreateRequest,
 	idleTimeoutSeconds int,
 	traceID string,
+	requestID string,
 	respondOnError bool,
 ) (sandboxCreateResult, error) {
 	invocation, err := prepareSandboxInvocation(ctx, req, idleTimeoutSeconds, traceID)
@@ -485,14 +535,56 @@ func createSandbox(
 		}
 		return sandboxCreateResult{status: sandboxCreateStatusFailed}, err
 	}
-	instanceID, err := util.NewClient().CreateInstanceByLibRt(invocation.funcMeta, []api.Arg{}, invocation.invokeOpts)
-	return finishSandboxCreate(sandboxCreateContext{
-		ctx:            ctx,
-		req:            req,
-		funcID:         invocation.funcID,
-		invokeOpts:     invocation.invokeOpts,
-		respondOnError: respondOnError,
-	}, instanceID, err)
+	key := sandboxCreateSingleflightKey(ctx.Request, req)
+	result, createErr, leaderRequestID, shared := createSingleflight.do(key, requestID, func() (
+		sandboxCreateResult, error,
+	) {
+		instanceID, createErr := util.NewClient().CreateInstanceByLibRt(
+			invocation.funcMeta, []api.Arg{}, invocation.invokeOpts,
+		)
+		return finishSandboxCreate(sandboxCreateContext{
+			req:        req,
+			funcID:     invocation.funcID,
+			invokeOpts: invocation.invokeOpts,
+			traceID:    traceID,
+			requestID:  requestID,
+		}, instanceID, createErr)
+	})
+	if shared {
+		log.GetLogger().Infof(
+			"coalesced duplicate sandbox create requestID=%s leaderRequestID=%s "+
+				"sandboxID=%s name=%s ns=%s tenant=%s",
+			requestID, leaderRequestID, result.instanceID, req.Name, req.Namespace, sandboxCreateTenant(ctx.Request, req),
+		)
+	}
+	if createErr != nil && respondOnError {
+		if result.status == sandboxCreateStatusTimeout {
+			app.SetCtxResponse(
+				ctx, nil, http.StatusInternalServerError,
+				fmt.Errorf("sandbox create timeout before running: %w", createErr),
+			)
+		} else {
+			app.SetCtxResponse(
+				ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to create sandbox: %v", createErr),
+			)
+		}
+	}
+	return result, createErr
+}
+
+func sandboxCreateTenant(req *http.Request, createReq CreateRequest) string {
+	if tenant := tenantClaim(req); tenant != "" {
+		return tenant
+	}
+	return createReq.Tenant
+}
+
+func sandboxCreateSingleflightKey(req *http.Request, createReq CreateRequest) string {
+	return strings.Join([]string{
+		sandboxCreateTenant(req, createReq),
+		createReq.Namespace,
+		createReq.Name,
+	}, "\x00")
 }
 
 type sandboxInvocation struct {
@@ -543,36 +635,29 @@ func finishSandboxCreate(createCtx sandboxCreateContext, instanceID string, err 
 				instanceID, createCtx.funcID, createCtx.invokeOpts.CreateOpt[constant.ResourceSpecNote],
 			) {
 				log.GetLogger().Infof(
-					"sandbox instance reached running state after create timeout instanceID=%s name=%s ns=%s",
-					instanceID, createCtx.req.Name, createCtx.req.Namespace,
+					"sandbox instance reached running state after create timeout "+
+						"traceID=%s requestID=%s instanceID=%s name=%s ns=%s",
+					createCtx.traceID, createCtx.requestID, instanceID, createCtx.req.Name, createCtx.req.Namespace,
 				)
 				return sandboxCreateResult{instanceID: instanceID, status: sandboxCreateStatusRunning}, nil
 			}
 			log.GetLogger().Warnf(
-				"sandbox create timed out before running instanceID=%s name=%s ns=%s: %v",
-				instanceID, createCtx.req.Name, createCtx.req.Namespace, err,
+				"sandbox create timed out before running traceID=%s requestID=%s "+
+					"instanceID=%s name=%s ns=%s: %v",
+				createCtx.traceID, createCtx.requestID, instanceID, createCtx.req.Name, createCtx.req.Namespace, err,
 			)
-			if createCtx.respondOnError {
-				app.SetCtxResponse(
-					createCtx.ctx, nil, http.StatusInternalServerError,
-					fmt.Errorf("sandbox create timeout before running: %w", err),
-				)
-			}
 			return sandboxCreateResult{instanceID: instanceID, status: sandboxCreateStatusTimeout}, err
 		}
 		log.GetLogger().Errorf(
-			"failed to create sandbox instance name=%s ns=%s: %v",
-			createCtx.req.Name, createCtx.req.Namespace, err,
+			"failed to create sandbox instance traceID=%s requestID=%s "+
+				"instanceID=%s name=%s ns=%s: %v",
+			createCtx.traceID, createCtx.requestID, instanceID, createCtx.req.Name, createCtx.req.Namespace, err,
 		)
-		if createCtx.respondOnError {
-			app.SetCtxResponse(
-				createCtx.ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to create sandbox: %v", err),
-			)
-		}
 		return sandboxCreateResult{instanceID: instanceID, status: sandboxCreateStatusFailed}, err
 	}
 	log.GetLogger().Infof(
-		"sandbox created: instanceID=%s name=%s ns=%s", instanceID, createCtx.req.Name, createCtx.req.Namespace,
+		"sandbox created traceID=%s requestID=%s instanceID=%s name=%s ns=%s",
+		createCtx.traceID, createCtx.requestID, instanceID, createCtx.req.Name, createCtx.req.Namespace,
 	)
 	return sandboxCreateResult{instanceID: instanceID, status: sandboxCreateStatusRunning}, nil
 }
@@ -879,6 +964,16 @@ func ensureSandboxTrace(ctx *gin.Context) string {
 	traceID := httputil.InitTraceID(ctx)
 	ctx.Header(constant.HeaderTraceID, traceID)
 	return traceID
+}
+
+func ensureSandboxRequestID(ctx *gin.Context, traceID string) string {
+	requestID := strings.TrimSpace(ctx.GetHeader(constant.HeaderRequestID))
+	if requestID == "" {
+		requestID = traceID
+		ctx.Request.Header.Set(constant.HeaderRequestID, requestID)
+	}
+	ctx.Header(constant.HeaderRequestID, requestID)
+	return requestID
 }
 
 func buildRootfsOption(spec RootfsSpec, fallbackImage string) (string, error) {

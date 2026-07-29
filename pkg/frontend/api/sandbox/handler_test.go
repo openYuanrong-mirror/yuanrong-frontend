@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -999,6 +1001,7 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set("Accept", "text/event-stream")
+	ctx.Request.Header.Set(constant.HeaderRequestID, "create-request-sse")
 
 	CreateV1Handler(ctx)
 
@@ -1006,6 +1009,7 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	require.Equal(t, "text/event-stream", recorder.Header().Get("Content-Type"))
 	require.Contains(t, recorder.Body.String(), "event: accepted")
 	require.Contains(t, recorder.Body.String(), `"status":"creating"`)
+	require.Contains(t, recorder.Body.String(), `"requestId":"create-request-sse"`)
 	require.Contains(t, recorder.Body.String(), "event: final")
 	require.Contains(t, recorder.Body.String(), `"sandboxId":"sandbox-sse"`)
 	require.Contains(t, recorder.Body.String(), `"status":"running"`)
@@ -1013,6 +1017,76 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	expectedScheduleMs := int64(customCreateTimeoutSeconds-sandboxScheduleBufferSeconds) * millisecondsPerSecond
 	require.Equal(t, expectedScheduleMs, capturedInvokeOpt.ScheduleTimeoutMs)
 	require.Equal(t, strconv.Itoa(customCreateTimeoutSeconds), capturedInvokeOpt.CreateOpt["call_timeout"])
+}
+
+func TestCreateV1HandlerCoalescesConcurrentCreatesWithSameIdentity(t *testing.T) {
+	var createCalls atomic.Int32
+	createStarted := make(chan struct{})
+	releaseCreate := make(chan struct{})
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			if createCalls.Add(1) == 1 {
+				close(createStarted)
+			}
+			<-releaseCreate
+			return "sandbox-singleflight", nil
+		},
+	})
+
+	type response struct {
+		recorder *httptest.ResponseRecorder
+	}
+	body := []byte(`{
+		"name":"sandbox-singleflight",
+		"namespace":"default",
+		"tenant":"tenant-a"
+	}`)
+	runCreate := func(requestID string, responses chan<- response) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(
+			http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body),
+		)
+		ctx.Request.Header.Set("Accept", "text/event-stream")
+		ctx.Request.Header.Set(constant.HeaderRequestID, requestID)
+		CreateV1Handler(ctx)
+		responses <- response{recorder: recorder}
+	}
+
+	responses := make(chan response, 2)
+	var requests sync.WaitGroup
+	requests.Add(2)
+	go func() {
+		defer requests.Done()
+		runCreate("create-leader", responses)
+	}()
+	<-createStarted
+	go func() {
+		defer requests.Done()
+		runCreate("create-duplicate", responses)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(releaseCreate)
+	requests.Wait()
+	close(responses)
+
+	require.Equal(t, int32(1), createCalls.Load())
+	seenRequestIDs := map[string]bool{}
+	for result := range responses {
+		require.Equal(t, http.StatusOK, result.recorder.Code)
+		require.Contains(t, result.recorder.Body.String(), `"sandboxId":"sandbox-singleflight"`)
+		switch {
+		case bytes.Contains(result.recorder.Body.Bytes(), []byte(`"requestId":"create-leader"`)):
+			seenRequestIDs["create-leader"] = true
+		case bytes.Contains(result.recorder.Body.Bytes(), []byte(`"requestId":"create-duplicate"`)):
+			seenRequestIDs["create-duplicate"] = true
+		}
+	}
+	require.Equal(t, map[string]bool{
+		"create-leader":    true,
+		"create-duplicate": true,
+	}, seenRequestIDs)
 }
 
 var timeoutTestCases = []sandboxTimeoutTestCase{
@@ -1107,6 +1181,7 @@ func TestCreateV1HandlerSSEDoesNotReportUnconfirmedTimeoutAsRunning(t *testing.T
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set("Accept", "text/event-stream")
+	ctx.Request.Header.Set(constant.HeaderRequestID, "create-request-timeout")
 
 	CreateV1Handler(ctx)
 
@@ -1115,6 +1190,7 @@ func TestCreateV1HandlerSSEDoesNotReportUnconfirmedTimeoutAsRunning(t *testing.T
 	require.Contains(t, recorder.Body.String(), `"sandboxId":"sandbox-timeout"`)
 	require.Contains(t, recorder.Body.String(), `"status":"timeout"`)
 	require.Contains(t, recorder.Body.String(), `"errorCode":3002`)
+	require.Contains(t, recorder.Body.String(), `"requestId":"create-request-timeout"`)
 	require.NotContains(t, recorder.Body.String(), `"status":"running"`)
 }
 
