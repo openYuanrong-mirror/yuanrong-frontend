@@ -18,6 +18,7 @@
 package sandbox
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -85,6 +86,8 @@ const (
 	sandboxCreateStatusRunning     = "running"
 	sandboxCreateStatusTimeout     = "timeout"
 	sandboxCreateStatusFailed      = "failed"
+	sandboxCreateReplayTTL         = 10 * time.Minute
+	sandboxCreateReplayMaxEntries  = 10000
 )
 
 var selectSandboxSchedulerID = func(funcKey string) (string, error) {
@@ -219,8 +222,57 @@ type sandboxCreateSingleflight struct {
 	calls map[string]*sandboxCreateCall
 }
 
+type sandboxCreateReplayEntry struct {
+	done        chan struct{}
+	digest      [sha256.Size]byte
+	result      sandboxCreateResult
+	err         error
+	completedAt time.Time
+}
+
+type sandboxCreateReplayStore struct {
+	mu         sync.Mutex
+	entries    map[string]*sandboxCreateReplayEntry
+	ttl        time.Duration
+	maxEntries int
+	now        func() time.Time
+}
+
+type sandboxCreateReuse int
+
+const (
+	sandboxCreateReuseNone sandboxCreateReuse = iota
+	sandboxCreateReuseInflight
+	sandboxCreateReuseCompleted
+)
+
+type sandboxCreateRequestConflictError struct {
+	requestID string
+}
+
+func (err *sandboxCreateRequestConflictError) Error() string {
+	return fmt.Sprintf(
+		"sandbox create requestId was already used with a different request body: %s",
+		err.requestID,
+	)
+}
+
 var createSingleflight = sandboxCreateSingleflight{
 	calls: make(map[string]*sandboxCreateCall),
+}
+
+var createReplayStore = newSandboxCreateReplayStore(
+	sandboxCreateReplayTTL,
+	sandboxCreateReplayMaxEntries,
+)
+
+func newSandboxCreateReplayStore(ttl time.Duration, maxEntries int) *sandboxCreateReplayStore {
+	return &sandboxCreateReplayStore{
+		entries:    make(map[string]*sandboxCreateReplayEntry),
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		now:        time.Now,
+	}
 }
 
 func (group *sandboxCreateSingleflight) do(
@@ -248,6 +300,74 @@ func (group *sandboxCreateSingleflight) do(
 	close(call.done)
 	group.mu.Unlock()
 	return call.result, call.err, requestID, false
+}
+
+func (store *sandboxCreateReplayStore) do(
+	key string,
+	requestID string,
+	digest [sha256.Size]byte,
+	create func() (sandboxCreateResult, error),
+) (sandboxCreateResult, error, sandboxCreateReuse) {
+	store.mu.Lock()
+	now := store.now()
+	store.pruneLocked(now)
+	if entry, ok := store.entries[key]; ok {
+		if entry.digest != digest {
+			store.mu.Unlock()
+			return sandboxCreateResult{status: sandboxCreateStatusFailed},
+				&sandboxCreateRequestConflictError{requestID: requestID},
+				sandboxCreateReuseNone
+		}
+		if entry.completedAt.IsZero() {
+			store.mu.Unlock()
+			<-entry.done
+			return entry.result, entry.err, sandboxCreateReuseInflight
+		}
+		result, err := entry.result, entry.err
+		store.mu.Unlock()
+		return result, err, sandboxCreateReuseCompleted
+	}
+
+	entry := &sandboxCreateReplayEntry{
+		done:   make(chan struct{}),
+		digest: digest,
+	}
+	store.entries[key] = entry
+	store.mu.Unlock()
+
+	entry.result, entry.err = create()
+
+	store.mu.Lock()
+	entry.completedAt = store.now()
+	close(entry.done)
+	store.pruneLocked(entry.completedAt)
+	store.mu.Unlock()
+	return entry.result, entry.err, sandboxCreateReuseNone
+}
+
+func (store *sandboxCreateReplayStore) pruneLocked(now time.Time) {
+	for key, entry := range store.entries {
+		if !entry.completedAt.IsZero() && now.Sub(entry.completedAt) >= store.ttl {
+			delete(store.entries, key)
+		}
+	}
+	for store.maxEntries > 0 && len(store.entries) > store.maxEntries {
+		var oldestKey string
+		var oldest time.Time
+		for key, entry := range store.entries {
+			if entry.completedAt.IsZero() {
+				continue
+			}
+			if oldestKey == "" || entry.completedAt.Before(oldest) {
+				oldestKey = key
+				oldest = entry.completedAt
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(store.entries, oldestKey)
+	}
 }
 
 // InvokeV1Request is the single data-plane envelope for file/process/shell actions.
@@ -284,7 +404,7 @@ func CreateV1Handler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err))
 		return
 	}
-	rootfs, tunnelInfo, err := prepareCreateV1Request(&req)
+	rootfs, tunnelInfo, err := prepareCreateV1Request(&req, requestID)
 	if err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
 		return
@@ -304,9 +424,9 @@ func CreateV1Handler(ctx *gin.Context) {
 	)
 }
 
-func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
+func prepareCreateV1Request(req *CreateV1Request, requestID string) (string, *TunnelInfo, error) {
 	if req.Name == "" {
-		req.Name = fmt.Sprintf("sandbox-%d", time.Now().UnixNano())
+		req.Name = sandboxNameForRequestID(requestID)
 	}
 	if req.Namespace == "" {
 		req.Namespace = "default"
@@ -324,6 +444,11 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	}
 	prepareSandboxRRTHTTP(req)
 	return rootfs, prepareSandboxTunnel(req), nil
+}
+
+func sandboxNameForRequestID(requestID string) string {
+	digest := sha256.Sum256([]byte(requestID))
+	return fmt.Sprintf("sandbox-%x", digest[:8])
 }
 
 func validateScheduleAffinities(affinities []api.Affinity) error {
@@ -535,30 +660,63 @@ func createSandbox(
 		}
 		return sandboxCreateResult{status: sandboxCreateStatusFailed}, err
 	}
-	key := sandboxCreateSingleflightKey(ctx.Request, req)
-	result, createErr, leaderRequestID, shared := createSingleflight.do(key, requestID, func() (
+	digest, err := sandboxCreateRequestDigest(req, idleTimeoutSeconds)
+	if err != nil {
+		if respondOnError {
+			app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		}
+		return sandboxCreateResult{status: sandboxCreateStatusFailed}, err
+	}
+	requestKey := sandboxCreateRequestIDKey(ctx.Request, req, requestID)
+	result, createErr, reuse := createReplayStore.do(requestKey, requestID, digest, func() (
 		sandboxCreateResult, error,
 	) {
-		instanceID, createErr := util.NewClient().CreateInstanceByLibRt(
-			invocation.funcMeta, []api.Arg{}, invocation.invokeOpts,
+		identityKey := sandboxCreateSingleflightKey(ctx.Request, req)
+		identityResult, identityErr, leaderRequestID, shared := createSingleflight.do(
+			identityKey, requestID, func() (sandboxCreateResult, error) {
+				instanceID, callErr := util.NewClient().CreateInstanceByLibRt(
+					invocation.funcMeta, []api.Arg{}, invocation.invokeOpts,
+				)
+				return finishSandboxCreate(sandboxCreateContext{
+					req:        req,
+					funcID:     invocation.funcID,
+					invokeOpts: invocation.invokeOpts,
+					traceID:    traceID,
+					requestID:  requestID,
+				}, instanceID, callErr)
+			},
 		)
-		return finishSandboxCreate(sandboxCreateContext{
-			req:        req,
-			funcID:     invocation.funcID,
-			invokeOpts: invocation.invokeOpts,
-			traceID:    traceID,
-			requestID:  requestID,
-		}, instanceID, createErr)
+		if shared {
+			log.GetLogger().Infof(
+				"coalesced duplicate sandbox create identity requestID=%s "+
+					"leaderRequestID=%s sandboxID=%s name=%s ns=%s tenant=%s",
+				requestID, leaderRequestID, identityResult.instanceID,
+				req.Name, req.Namespace, sandboxCreateTenant(ctx.Request, req),
+			)
+		}
+		return identityResult, identityErr
 	})
-	if shared {
+	switch reuse {
+	case sandboxCreateReuseInflight:
 		log.GetLogger().Infof(
-			"coalesced duplicate sandbox create requestID=%s leaderRequestID=%s "+
-				"sandboxID=%s name=%s ns=%s tenant=%s",
-			requestID, leaderRequestID, result.instanceID, req.Name, req.Namespace, sandboxCreateTenant(ctx.Request, req),
+			"coalesced duplicate sandbox create requestID=%s sandboxID=%s "+
+				"name=%s ns=%s tenant=%s",
+			requestID, result.instanceID, req.Name, req.Namespace,
+			sandboxCreateTenant(ctx.Request, req),
+		)
+	case sandboxCreateReuseCompleted:
+		log.GetLogger().Infof(
+			"replayed completed sandbox create requestID=%s sandboxID=%s "+
+				"name=%s ns=%s tenant=%s",
+			requestID, result.instanceID, req.Name, req.Namespace,
+			sandboxCreateTenant(ctx.Request, req),
 		)
 	}
 	if createErr != nil && respondOnError {
-		if result.status == sandboxCreateStatusTimeout {
+		var conflictErr *sandboxCreateRequestConflictError
+		if errors.As(createErr, &conflictErr) {
+			app.SetCtxResponse(ctx, nil, http.StatusConflict, createErr)
+		} else if result.status == sandboxCreateStatusTimeout {
 			app.SetCtxResponse(
 				ctx, nil, http.StatusInternalServerError,
 				fmt.Errorf("sandbox create timeout before running: %w", createErr),
@@ -585,6 +743,32 @@ func sandboxCreateSingleflightKey(req *http.Request, createReq CreateRequest) st
 		createReq.Namespace,
 		createReq.Name,
 	}, "\x00")
+}
+
+func sandboxCreateRequestIDKey(req *http.Request, createReq CreateRequest, requestID string) string {
+	return strings.Join([]string{
+		sandboxCreateTenant(req, createReq),
+		requestID,
+	}, "\x00")
+}
+
+func sandboxCreateRequestDigest(
+	req CreateRequest,
+	idleTimeoutSeconds int,
+) ([sha256.Size]byte, error) {
+	payload, err := json.Marshal(struct {
+		Request            CreateRequest  `json:"request"`
+		PortRouteKinds     map[int]string `json:"portRouteKinds,omitempty"`
+		IdleTimeoutSeconds int            `json:"idleTimeoutSeconds"`
+	}{
+		Request:            req,
+		PortRouteKinds:     req.portRouteKinds,
+		IdleTimeoutSeconds: idleTimeoutSeconds,
+	})
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("failed to hash sandbox create request: %w", err)
+	}
+	return sha256.Sum256(payload), nil
 }
 
 type sandboxInvocation struct {
@@ -953,6 +1137,10 @@ func tenantClaim(req *http.Request) string {
 }
 
 func createErrorCode(err error) int {
+	var conflictErr *sandboxCreateRequestConflictError
+	if errors.As(err, &conflictErr) {
+		return http.StatusConflict
+	}
 	var errInfo api.ErrorInfo
 	if errors.As(err, &errInfo) {
 		return errInfo.Code

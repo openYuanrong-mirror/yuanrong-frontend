@@ -288,6 +288,7 @@ func TestCreateHandlerFallsBackToBodyTenant(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -368,6 +369,7 @@ func TestCreateHandlerReturnsInstanceIDWhenCreateTimesOutAfterScheduling(t *test
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -484,6 +486,7 @@ func TestCreateHandlerUsesRequestedRuntime(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -513,6 +516,7 @@ func TestCreateHandlerRejectsUnsupportedRuntime(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -549,6 +553,7 @@ func TestCreateHandlerAddsSchedulerCreateOptions(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -607,6 +612,7 @@ func TestCreateHandlerPassesRootfsToSandboxCustomExtensions(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -643,6 +649,7 @@ func TestCreateHandlerAcceptsImageAliasForRootfs(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -679,6 +686,7 @@ func TestCreateHandlerPassesPortForwardingsToNetworkCreateOption(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -715,6 +723,7 @@ func TestCreateHandlerRejectsInvalidPortForwarding(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -753,6 +762,7 @@ func TestCreateHandlerBuildsBuiltinDetachedSandboxRequest(t *testing.T) {
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/create", bytes.NewReader(body))
 	require.NoError(t, err)
 	ctx.Request.Header.Set(constant.HeaderTraceID, "trace-create")
+	ctx.Request.Header.Set(constant.HeaderRequestID, t.Name())
 	ctx.Request.Header.Set(constant.HeaderTraceParent, "00-123e4567e89b12d3a456426614174000-0123456789abcdef-01")
 
 	CreateHandler(ctx)
@@ -1087,6 +1097,179 @@ func TestCreateV1HandlerCoalescesConcurrentCreatesWithSameIdentity(t *testing.T)
 		"create-leader":    true,
 		"create-duplicate": true,
 	}, seenRequestIDs)
+}
+
+func TestCreateV1HandlerReplaysCompletedCreateByRequestID(t *testing.T) {
+	var createCalls atomic.Int32
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			createCalls.Add(1)
+			return "sandbox-request-replay", nil
+		},
+	})
+
+	body := []byte(`{
+		"name":"sandbox-request-replay",
+		"namespace":"default",
+		"tenant":"tenant-replay"
+	}`)
+	runCreate := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(
+			http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body),
+		)
+		ctx.Request.Header.Set(constant.HeaderRequestID, "create-request-replay")
+		CreateV1Handler(ctx)
+		return recorder
+	}
+
+	first := runCreate()
+	second := runCreate()
+
+	require.Equal(t, int32(1), createCalls.Load())
+	require.Equal(t, http.StatusOK, first.Code)
+	require.Equal(t, http.StatusOK, second.Code)
+	requireCreateV1SandboxID(t, first, "sandbox-request-replay")
+	requireCreateV1SandboxID(t, second, "sandbox-request-replay")
+}
+
+func TestCreateV1HandlerRejectsRequestIDBodyConflict(t *testing.T) {
+	var createCalls atomic.Int32
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			createCalls.Add(1)
+			return "sandbox-request-conflict", nil
+		},
+	})
+
+	runCreate := func(name string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		body, err := json.Marshal(CreateV1Request{
+			Name:      name,
+			Namespace: "default",
+			Tenant:    "tenant-conflict",
+		})
+		require.NoError(t, err)
+		ctx.Request = httptest.NewRequest(
+			http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body),
+		)
+		ctx.Request.Header.Set(constant.HeaderRequestID, "create-request-conflict")
+		CreateV1Handler(ctx)
+		return recorder
+	}
+
+	first := runCreate("sandbox-request-conflict-a")
+	second := runCreate("sandbox-request-conflict-b")
+
+	require.Equal(t, int32(1), createCalls.Load())
+	require.Equal(t, http.StatusOK, first.Code)
+	require.Equal(t, http.StatusConflict, second.Code)
+	require.Contains(t, second.Body.String(), "requestId was already used")
+}
+
+func TestCreateV1HandlerReplaysUnnamedCreateByRequestID(t *testing.T) {
+	var createCalls atomic.Int32
+	var createdName string
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			createCalls.Add(1)
+			require.NotNil(t, funcMeta.Name)
+			createdName = *funcMeta.Name
+			return "sandbox-unnamed-replay", nil
+		},
+	})
+
+	runCreate := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(
+			http.MethodPost,
+			"/api/sandbox/v1/sandboxes",
+			bytes.NewReader([]byte(`{"namespace":"default","tenant":"tenant-unnamed"}`)),
+		)
+		ctx.Request.Header.Set(constant.HeaderRequestID, "create-request-unnamed")
+		CreateV1Handler(ctx)
+		return recorder
+	}
+
+	first := runCreate()
+	second := runCreate()
+
+	require.Equal(t, int32(1), createCalls.Load())
+	require.Equal(t, http.StatusOK, first.Code)
+	require.Equal(t, http.StatusOK, second.Code)
+	require.Contains(t, createdName, "sandbox-")
+	requireCreateV1SandboxID(t, first, "sandbox-unnamed-replay")
+	requireCreateV1SandboxID(t, second, "sandbox-unnamed-replay")
+}
+
+func requireCreateV1SandboxID(
+	t *testing.T,
+	recorder *httptest.ResponseRecorder,
+	expected string,
+) {
+	t.Helper()
+	var resp job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
+	var data map[string]interface{}
+	require.NoError(t, json.Unmarshal(resp.Data, &data))
+	require.Equal(t, expected, data["sandboxId"])
+}
+
+func TestSandboxCreateReplayStoreExpiresCompletedResults(t *testing.T) {
+	now := time.Unix(100, 0)
+	store := newSandboxCreateReplayStore(time.Second, 10)
+	store.now = func() time.Time { return now }
+	digest := [32]byte{1}
+	createCalls := 0
+	create := func() (sandboxCreateResult, error) {
+		createCalls++
+		return sandboxCreateResult{
+			instanceID: fmt.Sprintf("sandbox-%d", createCalls),
+			status:     sandboxCreateStatusRunning,
+		}, nil
+	}
+
+	first, firstErr, firstReuse := store.do("tenant\x00request", "request", digest, create)
+	second, secondErr, secondReuse := store.do("tenant\x00request", "request", digest, create)
+	now = now.Add(2 * time.Second)
+	third, thirdErr, thirdReuse := store.do("tenant\x00request", "request", digest, create)
+
+	require.NoError(t, firstErr)
+	require.NoError(t, secondErr)
+	require.NoError(t, thirdErr)
+	require.Equal(t, sandboxCreateReuseNone, firstReuse)
+	require.Equal(t, sandboxCreateReuseCompleted, secondReuse)
+	require.Equal(t, sandboxCreateReuseNone, thirdReuse)
+	require.Equal(t, "sandbox-1", first.instanceID)
+	require.Equal(t, "sandbox-1", second.instanceID)
+	require.Equal(t, "sandbox-2", third.instanceID)
+	require.Equal(t, 2, createCalls)
+}
+
+func TestSandboxCreateReplayStoreReplaysCompletedError(t *testing.T) {
+	store := newSandboxCreateReplayStore(time.Minute, 10)
+	digest := [32]byte{2}
+	createCalls := 0
+	create := func() (sandboxCreateResult, error) {
+		createCalls++
+		return sandboxCreateResult{
+			instanceID: "sandbox-error",
+			status:     sandboxCreateStatusFailed,
+		}, fmt.Errorf("runtime outcome unknown")
+	}
+
+	first, firstErr, firstReuse := store.do("tenant\x00request", "request", digest, create)
+	second, secondErr, secondReuse := store.do("tenant\x00request", "request", digest, create)
+
+	require.EqualError(t, firstErr, "runtime outcome unknown")
+	require.EqualError(t, secondErr, "runtime outcome unknown")
+	require.Equal(t, sandboxCreateReuseNone, firstReuse)
+	require.Equal(t, sandboxCreateReuseCompleted, secondReuse)
+	require.Equal(t, first, second)
+	require.Equal(t, 1, createCalls)
 }
 
 var timeoutTestCases = []sandboxTimeoutTestCase{
