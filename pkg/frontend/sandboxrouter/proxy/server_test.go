@@ -25,9 +25,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/logger/log"
+	"frontend/pkg/common/faas_common/utils"
 	"frontend/pkg/frontend/sandboxrouter/route"
 )
 
@@ -40,6 +44,15 @@ const (
 type fakeResolver struct {
 	target *route.Target
 	err    error
+}
+
+type captureErrorLogger struct {
+	utils.FakeLogger
+	errors []string
+}
+
+func (l *captureErrorLogger) Errorf(format string, args ...interface{}) {
+	l.errors = append(l.errors, fmt.Sprintf(format, args...))
 }
 
 func (f fakeResolver) Resolve(_ context.Context, _ route.Key) (*route.Target, error) {
@@ -134,6 +147,41 @@ func TestProxyUpstreamTimeoutIs504(t *testing.T) {
 	rec := do(s, http.MethodGet, "/inst/8080/x")
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusGatewayTimeout)
+	}
+}
+
+func TestProxyUpstreamFailureLogsErrorTargetAndTraceID(t *testing.T) {
+	originalLogger := log.GetLogger()
+	capture := &captureErrorLogger{}
+	log.SetupLogger(capture)
+	t.Cleanup(func() {
+		log.SetupLogger(originalLogger)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "http://192.168.26.87:21007/invoke?token=secret", nil)
+	req.Header.Set(constant.HeaderTraceID, "trace-direct-123")
+	rec := httptest.NewRecorder()
+
+	errorHandler(rec, req, errors.New("connection reset by peer"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	if len(capture.errors) != 1 {
+		t.Fatalf("error logs = %v, want exactly one entry", capture.errors)
+	}
+	entry := capture.errors[0]
+	for _, want := range []string{
+		"connection reset by peer",
+		"http://192.168.26.87:21007",
+		"trace-direct-123",
+	} {
+		if !strings.Contains(entry, want) {
+			t.Errorf("log entry %q does not contain %q", entry, want)
+		}
+	}
+	if strings.Contains(entry, "secret") {
+		t.Errorf("log entry must not expose the upstream query string: %q", entry)
 	}
 }
 

@@ -381,13 +381,29 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 
 // errorHandler maps upstream transport failures to Traefik-consistent codes:
 // timeouts to 504 Gateway Timeout, everything else to 502 Bad Gateway.
-func errorHandler(w http.ResponseWriter, _ *http.Request, err error) {
+func errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	status := http.StatusBadGateway
 	var netErr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
-		w.WriteHeader(http.StatusGatewayTimeout) // 504
-		return
+		status = http.StatusGatewayTimeout
 	}
-	w.WriteHeader(http.StatusBadGateway) // 502
+
+	target := ""
+	traceID := ""
+	if r != nil {
+		traceID = r.Header.Get(constant.HeaderTraceID)
+		if r.URL != nil {
+			target = r.URL.Scheme + "://" + r.URL.Host
+		}
+	}
+	log.GetLogger().Errorf(
+		"sandboxrouter upstream request failed target(%s) traceID(%s) status(%d) error(%s)",
+		target,
+		traceID,
+		status,
+		err,
+	)
+	w.WriteHeader(status)
 }
 
 // roundTripperFunc adapts a function to http.RoundTripper so the proxy reads
