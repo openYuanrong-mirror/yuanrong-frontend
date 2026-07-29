@@ -1029,7 +1029,7 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	require.Equal(t, strconv.Itoa(customCreateTimeoutSeconds), capturedInvokeOpt.CreateOpt["call_timeout"])
 }
 
-func TestCreateV1HandlerCoalescesConcurrentCreatesWithSameIdentity(t *testing.T) {
+func TestCreateV1HandlerRejectsConcurrentExplicitNameWithDifferentRequestID(t *testing.T) {
 	var createCalls atomic.Int32
 	createStarted := make(chan struct{})
 	releaseCreate := make(chan struct{})
@@ -1046,18 +1046,17 @@ func TestCreateV1HandlerCoalescesConcurrentCreatesWithSameIdentity(t *testing.T)
 	type response struct {
 		recorder *httptest.ResponseRecorder
 	}
-	body := []byte(`{
-		"name":"sandbox-singleflight",
-		"namespace":"default",
-		"tenant":"tenant-a"
-	}`)
-	runCreate := func(requestID string, responses chan<- response) {
+	runCreate := func(requestID, tenant string, responses chan<- response) {
 		recorder := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(recorder)
+		body := []byte(fmt.Sprintf(`{
+			"name":"sandbox-singleflight",
+			"namespace":"default",
+			"tenant":%q
+		}`, tenant))
 		ctx.Request = httptest.NewRequest(
 			http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body),
 		)
-		ctx.Request.Header.Set("Accept", "text/event-stream")
 		ctx.Request.Header.Set(constant.HeaderRequestID, requestID)
 		CreateV1Handler(ctx)
 		responses <- response{recorder: recorder}
@@ -1068,12 +1067,12 @@ func TestCreateV1HandlerCoalescesConcurrentCreatesWithSameIdentity(t *testing.T)
 	requests.Add(2)
 	go func() {
 		defer requests.Done()
-		runCreate("create-leader", responses)
+		runCreate("create-leader", "tenant-a", responses)
 	}()
 	<-createStarted
 	go func() {
 		defer requests.Done()
-		runCreate("create-duplicate", responses)
+		runCreate("create-duplicate", "tenant-b", responses)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -1082,21 +1081,19 @@ func TestCreateV1HandlerCoalescesConcurrentCreatesWithSameIdentity(t *testing.T)
 	close(responses)
 
 	require.Equal(t, int32(1), createCalls.Load())
-	seenRequestIDs := map[string]bool{}
+	statuses := map[int]*httptest.ResponseRecorder{}
 	for result := range responses {
-		require.Equal(t, http.StatusOK, result.recorder.Code)
-		require.Contains(t, result.recorder.Body.String(), `"sandboxId":"sandbox-singleflight"`)
-		switch {
-		case bytes.Contains(result.recorder.Body.Bytes(), []byte(`"requestId":"create-leader"`)):
-			seenRequestIDs["create-leader"] = true
-		case bytes.Contains(result.recorder.Body.Bytes(), []byte(`"requestId":"create-duplicate"`)):
-			seenRequestIDs["create-duplicate"] = true
-		}
+		statuses[result.recorder.Code] = result.recorder
 	}
-	require.Equal(t, map[string]bool{
-		"create-leader":    true,
-		"create-duplicate": true,
-	}, seenRequestIDs)
+	require.Contains(t, statuses, http.StatusOK)
+	require.Contains(t, statuses, http.StatusConflict)
+	requireCreateV1SandboxID(t, statuses[http.StatusOK], "sandbox-singleflight")
+	require.Contains(
+		t,
+		statuses[http.StatusConflict].Body.String(),
+		"sandbox 'default/sandbox-singleflight' is already being created by request create-leader",
+	)
+	require.Contains(t, statuses[http.StatusConflict].Body.String(), "request create-duplicate")
 }
 
 func TestCreateV1HandlerReplaysCompletedCreateByRequestID(t *testing.T) {
@@ -1166,7 +1163,59 @@ func TestCreateV1HandlerRejectsRequestIDBodyConflict(t *testing.T) {
 	require.Equal(t, int32(1), createCalls.Load())
 	require.Equal(t, http.StatusOK, first.Code)
 	require.Equal(t, http.StatusConflict, second.Code)
-	require.Contains(t, second.Body.String(), "requestId was already used")
+	require.Contains(
+		t,
+		second.Body.String(),
+		"requestId 'create-request-conflict' has already been used to create a sandbox with different parameters",
+	)
+}
+
+func TestCreateV1HandlerRejectsExplicitNameAlreadyInSandboxRouterCache(t *testing.T) {
+	const (
+		tenantID  = "tenant-existing"
+		namespace = "default"
+		name      = "sandbox-existing"
+		instance  = namespace + "-" + name
+	)
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instance,
+		TenantID:   "another-tenant",
+		StatusCode: 3,
+	})
+	defer execendpoint.Default().Delete(instance)
+
+	var createCalls atomic.Int32
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			createCalls.Add(1)
+			return instance, nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body, err := json.Marshal(CreateV1Request{
+		Name:      name,
+		Namespace: namespace,
+		Tenant:    tenantID,
+	})
+	require.NoError(t, err)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body),
+	)
+	ctx.Request.Header.Set(constant.HeaderRequestID, "create-existing")
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, int32(0), createCalls.Load())
+	require.Equal(t, http.StatusConflict, recorder.Code)
+	require.Contains(
+		t,
+		recorder.Body.String(),
+		"sandbox 'default/sandbox-existing' already exists",
+	)
+	require.Contains(t, recorder.Body.String(), "sandboxId=default-sandbox-existing")
+	require.Contains(t, recorder.Body.String(), "requestId=create-existing")
 }
 
 func TestCreateV1HandlerReplaysUnnamedCreateByRequestID(t *testing.T) {
@@ -1205,15 +1254,16 @@ func TestCreateV1HandlerReplaysUnnamedCreateByRequestID(t *testing.T) {
 	requireCreateV1SandboxID(t, second, "sandbox-unnamed-replay")
 }
 
-func TestSandboxNameForRequestIDIsStableAndUses128Bits(t *testing.T) {
-	first := sandboxNameForRequestID("create-request-a")
-	retry := sandboxNameForRequestID("create-request-a")
-	second := sandboxNameForRequestID("create-request-b")
+func TestGeneratedSandboxNamesUseIndependentUUIDs(t *testing.T) {
+	first := newSandboxName()
+	second := newSandboxName()
 
-	require.Equal(t, first, retry)
 	require.NotEqual(t, first, second)
-	require.Len(t, first, len("sandbox-")+32)
-	require.Regexp(t, `^sandbox-[0-9a-f]{32}$`, first)
+	require.Regexp(
+		t,
+		`^sandbox-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+		first,
+	)
 }
 
 func requireCreateV1SandboxID(
