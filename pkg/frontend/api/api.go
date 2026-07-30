@@ -45,6 +45,7 @@ import (
 	"frontend/pkg/frontend/middleware"
 	"frontend/pkg/frontend/posixws"
 	"frontend/pkg/frontend/webui"
+	"frontend/pkg/frontend/wsproxy"
 )
 
 const (
@@ -216,6 +217,10 @@ func InitRoute(r *gin.Engine) {
 
 	// POSIX WebSocket for create/invoke operations
 	r.GET("/serverless/v1/posix/ws", gin.WrapF(posixws.HandlePosixWebSocket))
+
+	// Agent WS passthrough: L4-tunnel external WebSocket connections through
+	// to an in-sandbox AgentServer (reuses sshproxy's function_proxy tcp.tunnel).
+	r.GET("/serverless/v1/ws", gin.WrapF(wsproxy.HandleWebSocket))
 
 	// Function invoke tool (requires authentication)
 	r.GET("/functions", gin.WrapF(webui.HandleInvokePage))

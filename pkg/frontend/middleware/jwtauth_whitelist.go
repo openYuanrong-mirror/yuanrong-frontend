@@ -94,6 +94,14 @@ var defaultAuthWhitelist = []AuthWhitelistRule{
 		MatchType: "exact",
 		SkipAuth:  true,
 	},
+	// Agent WS passthrough endpoint - authentication handled inside handler
+	// (JWT via X-Auth / ?token / Sec-WebSocket-Protocol, like posixws/webterm).
+	{
+		Path:      "/serverless/v1/ws",
+		Methods:   []string{"GET"},
+		MatchType: "exact",
+		SkipAuth:  true,
+	},
 	// Note: Other /terminal paths (e.g., /terminal) require JWT authentication
 }
 
