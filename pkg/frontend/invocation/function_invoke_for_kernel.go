@@ -170,9 +170,9 @@ func (k *kernelRequestHandler) legacyMakeReq(logger api.FormatLogger) (*util.Inv
 	if !k.downgrade {
 		var schedulerNodeInfo *schedulerproxy.SchedulerNodeInfo
 		var err error
-		if k.funcSpec.ExtendedMetaData.EnableSessionCtx {
-			logger.Debugf("acquire with sessionCtx routing, funcKey=%s, sessionCtxID=%q", k.funcKey, k.ctx.SessionCtxID)
-			schedulerNodeInfo, err = k.getProxyManager().GetWithSessionCtx(k.funcKey, k.ctx.SessionCtxID, logger)
+		if k.funcSpec.ExtendedMetaData.EnableSessionCtx && k.ctx.SessionCtxID != "" {
+			schedulerNodeInfo, err = k.getProxyManager().GetWithSessionContext(
+				k.funcKey, k.ctx.SessionCtxID, logger)
 		} else {
 			schedulerNodeInfo, err = k.getProxyManager().Get(k.funcKey, logger)
 		}

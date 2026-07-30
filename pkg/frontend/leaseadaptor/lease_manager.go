@@ -754,11 +754,9 @@ func (ip *LeasePool) acquireHandler(funcKey string, option *commontypes.AcquireO
 	acquireDependOnHash := func() error {
 		var schedulerNodeInfo *schedulerproxy.SchedulerNodeInfo
 		var getSchedulerNodeInfoErr error
-		if option.EnableSessionCtx {
-			logger.Debugf("acquire with sessionCtx routing, funcKey=%s, sessionCtxID=%q",
-				funcKey, option.SessionCtxID)
+		if option.EnableSessionCtx && option.SessionCtxID != "" {
 			schedulerNodeInfo, getSchedulerNodeInfoErr = getProxyManagerByRing(
-				option.RingName).GetWithoutUnexpectedSchedulerInfosWithCtx(
+				option.RingName).GetWithoutUnexpectedSchedulerInfosWithSessionContext(
 				funcKey, option.SessionCtxID, unavailableSchedulerNodeInfos, logger)
 		} else {
 			schedulerNodeInfo, getSchedulerNodeInfoErr = getProxyManagerByRing(

@@ -149,24 +149,24 @@ func (im *ProxyManager) Get(funcKey string, logger api.FormatLogger) (*Scheduler
 	return im.getSchedulerByHashKey(funcKey, logger)
 }
 
-// GetWithSessionCtx gets scheduler with session ctx for session ctx routing.
-// When sessionCtx is not empty, it uses funcKey + sessionCtx as the hash key.
-func (im *ProxyManager) GetWithSessionCtx(funcKey, sessionCtx string, logger api.FormatLogger) (*SchedulerNodeInfo, error) {
-	hashKey := funcKey
-	if sessionCtx != "" {
-		hashKey = funcKey + "#" + sessionCtx
-	}
-	return im.getSchedulerByHashKey(hashKey, logger)
+// GetWithSessionContext selects the same owner key used by LiteScheduler:
+// tenantID + "/" + (funcKey + "/" + sessionCtxID).
+func (im *ProxyManager) GetWithSessionContext(funcKey, sessionCtxID string,
+	logger api.FormatLogger) (*SchedulerNodeInfo, error) {
+	return im.getSchedulerByHashKey(sessionContextOwnerKey(funcKey, sessionCtxID), logger)
 }
 
-// GetWithoutUnexpectedSchedulerInfosWithCtx gets scheduler with session ctx, excluding unexpected schedulers.
-func (im *ProxyManager) GetWithoutUnexpectedSchedulerInfosWithCtx(funcKey, sessionCtx string,
-	unexpectedSchedulerNodeInfos []*SchedulerNodeInfo, logger api.FormatLogger) (*SchedulerNodeInfo, error) {
-	hashKey := funcKey
-	if sessionCtx != "" {
-		hashKey = funcKey + "#" + sessionCtx
-	}
-	return im.getWithoutUnexpectedSchedulerInfosByKey(hashKey, unexpectedSchedulerNodeInfos, logger)
+// GetWithoutUnexpectedSchedulerInfosWithSessionContext is the retry variant of
+// GetWithSessionContext.
+func (im *ProxyManager) GetWithoutUnexpectedSchedulerInfosWithSessionContext(funcKey, sessionCtxID string,
+	unexpected []*SchedulerNodeInfo, logger api.FormatLogger) (*SchedulerNodeInfo, error) {
+	return im.getWithoutUnexpectedSchedulerInfosByKey(
+		sessionContextOwnerKey(funcKey, sessionCtxID), unexpected, logger)
+}
+
+func sessionContextOwnerKey(funcKey, sessionCtxID string) string {
+	tenantID := strings.SplitN(funcKey, constant.KeySeparator, 2)[0]
+	return tenantID + constant.KeySeparator + funcKey + constant.KeySeparator + sessionCtxID
 }
 
 func (im *ProxyManager) getSchedulerByHashKey(hashKey string, logger api.FormatLogger) (*SchedulerNodeInfo, error) {
@@ -222,6 +222,11 @@ func (im *ProxyManager) instanceNameToSchedulerNodeInfo(instanceName string) *Sc
 	}
 
 	return faaSScheduler
+}
+
+// GetByInstanceID resolves an owner redirect returned by a scheduler.
+func (im *ProxyManager) GetByInstanceID(instanceID string) *SchedulerNodeInfo {
+	return im.instanceNameToSchedulerNodeInfo(instanceID)
 }
 
 // GetWithoutUnexpectedSchedulerInfos -
