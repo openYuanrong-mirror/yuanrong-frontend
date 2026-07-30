@@ -18,6 +18,7 @@
 package sandbox
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -35,8 +36,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/ugorji/go/codec"
+	"google.golang.org/protobuf/proto"
 
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/affinity"
+	"frontend/pkg/common/faas_common/grpc/pb/common"
+	"frontend/pkg/common/faas_common/grpc/pb/core"
+	"frontend/pkg/common/faas_common/grpc/pb/runtime"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/frontend/api/app"
@@ -50,6 +56,7 @@ import (
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 	"frontend/pkg/frontend/sandboxrouter/route"
 	"frontend/pkg/frontend/schedulerproxy"
+
 	"yuanrong.org/kernel/runtime/libruntime/api"
 )
 
@@ -90,6 +97,8 @@ const (
 	sandboxCreateStatusFailed      = "failed"
 	sandboxCreateReplayTTL         = 10 * time.Minute
 	sandboxCreateReplayMaxEntries  = 10000
+	sandboxRawRequestIDLength      = 18
+	sandboxRawRequestSequence      = "00"
 )
 
 var selectSandboxSchedulerID = func(funcKey string) (string, error) {
@@ -419,9 +428,9 @@ type InvokeV1Request struct {
 }
 
 // CreateHandler handles POST /api/sandbox/create.
-// It calls CreateInstanceByLibRt directly to create the sandbox yrlib actor
-// with skip_serialize semantics: the worker loads yr.sandbox.sandbox.SandboxInstance
-// from its local Python environment (no code upload required).
+// It calls CreateInstanceRaw with the native core CreateRequest to create the
+// built-in sandbox. The worker loads yr.sandbox.sandbox.SandboxInstance from
+// its local Python environment, without actor metadata or serialized arguments.
 func CreateHandler(ctx *gin.Context) {
 	traceID := ensureSandboxTrace(ctx)
 	requestID := ensureSandboxRequestID(ctx, traceID)
@@ -729,8 +738,8 @@ func createSandbox(
 		identityKey := sandboxCreateSingleflightKey(req)
 		identityResult, identityErr, leaderRequestID, shared := createSingleflight.do(
 			identityKey, requestID, func() (sandboxCreateResult, error) {
-				createdInstanceID, callErr := util.NewClient().CreateInstanceByLibRt(
-					invocation.funcMeta, []api.Arg{}, invocation.invokeOpts,
+				createdInstanceID, callErr := createSandboxInstanceRaw(
+					ctx, invocation, req.Name, req.Namespace,
 				)
 				if isSandboxInstanceDuplicated(callErr) {
 					return sandboxCreateResult{
@@ -865,7 +874,6 @@ func isSandboxInstanceDuplicated(err error) bool {
 
 type sandboxInvocation struct {
 	funcID     string
-	funcMeta   api.FunctionMeta
 	invokeOpts api.InvokeOptions
 }
 
@@ -887,7 +895,6 @@ func prepareSandboxInvocation(
 		return sandboxInvocation{}, err
 	}
 
-	funcMeta := newSandboxFunctionMeta(funcID, req.Name, req.Namespace)
 	traceParent := ctx.Request.Header.Get(constant.HeaderTraceParent)
 	invokeOpts, err := newSandboxInvokeOptions(sandboxInvokeOptionRequest{
 		ctx:                ctx,
@@ -901,7 +908,263 @@ func prepareSandboxInvocation(
 	if err != nil {
 		return sandboxInvocation{}, err
 	}
-	return sandboxInvocation{funcID: funcID, funcMeta: funcMeta, invokeOpts: invokeOpts}, nil
+	return sandboxInvocation{funcID: funcID, invokeOpts: invokeOpts}, nil
+}
+
+func createSandboxInstanceRaw(
+	ctx *gin.Context,
+	invocation sandboxInvocation,
+	name string,
+	namespace string,
+) (string, error) {
+	createReq, err := buildSandboxRawCreateRequest(invocation, name, namespace)
+	if err != nil {
+		return "", err
+	}
+	createReqRaw, err := proto.Marshal(createReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal sandbox create request: %w", err)
+	}
+	createCtx := context.WithoutCancel(ctx.Request.Context())
+	if invocation.invokeOpts.Timeout > 0 {
+		var cancel context.CancelFunc
+		createCtx, cancel = context.WithTimeout(
+			createCtx,
+			time.Duration(invocation.invokeOpts.Timeout)*time.Second,
+		)
+		defer cancel()
+	}
+	respRaw, err := util.CreateInstanceRawWithContext(
+		createCtx,
+		util.NewClient(),
+		createReqRaw,
+		api.RawRequestOption{TraceParent: ctx.Request.Header.Get(constant.HeaderTraceParent)},
+	)
+	if err != nil {
+		return "", err
+	}
+	return parseSandboxRawCreateResponse(respRaw, createReq.GetDesignatedInstanceID())
+}
+
+func buildSandboxRawCreateRequest(
+	invocation sandboxInvocation,
+	name string,
+	namespace string,
+) (*core.CreateRequest, error) {
+	invokeOpts := invocation.invokeOpts
+	resources := map[string]float64{}
+	if invokeOpts.Cpu >= 0 {
+		resources["CPU"] = float64(invokeOpts.Cpu)
+	}
+	if invokeOpts.Memory >= 0 {
+		resources["Memory"] = float64(invokeOpts.Memory)
+	}
+	for key, value := range invokeOpts.CustomResources {
+		resources[key] = value
+	}
+
+	extensions := cloneStringMap(invokeOpts.CustomExtensions)
+	if invokeOpts.CpuLimit != 0 {
+		setStringMapDefault(extensions, "CPU_LIMIT", strconv.Itoa(invokeOpts.CpuLimit))
+	}
+	if invokeOpts.MemoryLimit != 0 {
+		setStringMapDefault(extensions, "MEMORY_LIMIT", strconv.Itoa(invokeOpts.MemoryLimit))
+	}
+
+	createOptions := cloneStringMap(invokeOpts.CreateOpt)
+	setStringMapDefault(createOptions, "DATA_AFFINITY_ENABLED", "false")
+	setStringMapDefault(createOptions, "RecoverRetryTimes", strconv.Itoa(invokeOpts.RecoverRetryTimes))
+	for key, value := range invokeOpts.CustomExtensions {
+		if key == "Concurrency" {
+			key = "ConcurrentNum"
+		}
+		setStringMapDefault(createOptions, key, value)
+	}
+
+	scheduleAffinity, err := buildSandboxRawScheduleAffinity(invokeOpts.ScheduleAffinities)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build sandbox schedule affinity: %w", err)
+	}
+
+	return &core.CreateRequest{
+		Function: invocation.funcID,
+		SchedulingOps: &core.SchedulingOptions{
+			Priority:          int32(invokeOpts.Priority),
+			Resources:         resources,
+			Extension:         extensions,
+			ScheduleAffinity:  scheduleAffinity,
+			ScheduleTimeoutMs: invokeOpts.ScheduleTimeoutMs,
+		},
+		RequestID:            newSandboxRawRequestID(),
+		TraceID:              invokeOpts.TraceID,
+		Labels:               append([]string(nil), invokeOpts.Labels...),
+		DesignatedInstanceID: namespace + "-" + name,
+		CreateOptions:        createOptions,
+	}, nil
+}
+
+func buildSandboxRawScheduleAffinity(
+	scheduleAffinities []api.Affinity,
+) (*affinity.Affinity, error) {
+	if len(scheduleAffinities) == 0 {
+		return nil, nil
+	}
+	rawAffinity := &affinity.Affinity{}
+	for _, scheduleAffinity := range scheduleAffinities {
+		selector, err := rawAffinitySelector(rawAffinity, scheduleAffinity)
+		if err != nil {
+			return nil, err
+		}
+		expressions := make([]*affinity.LabelExpression, 0, len(scheduleAffinity.LabelOps))
+		for _, labelOp := range scheduleAffinity.LabelOps {
+			operator, err := rawLabelOperator(labelOp)
+			if err != nil {
+				return nil, err
+			}
+			expressions = append(expressions, &affinity.LabelExpression{
+				Key: labelOp.LabelKey,
+				Op:  operator,
+			})
+		}
+		if selector.Condition == nil {
+			selector.Condition = &affinity.Condition{}
+		}
+		selector.Condition.OrderPriority = scheduleAffinity.PreferredPriority
+		selector.Condition.SubConditions = append(
+			selector.Condition.SubConditions,
+			&affinity.SubCondition{Expressions: expressions},
+		)
+	}
+	return rawAffinity, nil
+}
+
+func rawAffinitySelector(
+	rawAffinity *affinity.Affinity,
+	scheduleAffinity api.Affinity,
+) (*affinity.Selector, error) {
+	switch scheduleAffinity.Kind {
+	case api.AffinityKindResource:
+		if rawAffinity.Resource == nil {
+			rawAffinity.Resource = &affinity.ResourceAffinity{}
+		}
+		return resourceAffinitySelector(rawAffinity.Resource, scheduleAffinity)
+	case api.AffinityKindInstance:
+		if rawAffinity.Instance == nil {
+			rawAffinity.Instance = &affinity.InstanceAffinity{}
+		}
+		return instanceAffinitySelector(rawAffinity.Instance, scheduleAffinity)
+	default:
+		return nil, fmt.Errorf("unsupported affinity kind %d", scheduleAffinity.Kind)
+	}
+}
+
+func resourceAffinitySelector(
+	resource *affinity.ResourceAffinity,
+	scheduleAffinity api.Affinity,
+) (*affinity.Selector, error) {
+	preferRequired := scheduleAffinity.PreferredPriority &&
+		scheduleAffinity.PreferredAntiOtherLabels
+	switch scheduleAffinity.Affinity {
+	case api.PreferredAffinity:
+		if preferRequired {
+			return initializeAffinitySelector(&resource.RequiredAffinity), nil
+		}
+		return initializeAffinitySelector(&resource.PreferredAffinity), nil
+	case api.PreferredAntiAffinity:
+		if preferRequired {
+			return initializeAffinitySelector(&resource.RequiredAntiAffinity), nil
+		}
+		return initializeAffinitySelector(&resource.PreferredAntiAffinity), nil
+	case api.RequiredAffinity:
+		return initializeAffinitySelector(&resource.RequiredAffinity), nil
+	case api.RequiredAntiAffinity:
+		return initializeAffinitySelector(&resource.RequiredAntiAffinity), nil
+	default:
+		return nil, fmt.Errorf("unsupported resource affinity type %d", scheduleAffinity.Affinity)
+	}
+}
+
+func instanceAffinitySelector(
+	instance *affinity.InstanceAffinity,
+	scheduleAffinity api.Affinity,
+) (*affinity.Selector, error) {
+	switch scheduleAffinity.Affinity {
+	case api.PreferredAffinity:
+		return initializeAffinitySelector(&instance.PreferredAffinity), nil
+	case api.PreferredAntiAffinity:
+		return initializeAffinitySelector(&instance.PreferredAntiAffinity), nil
+	case api.RequiredAffinity:
+		return initializeAffinitySelector(&instance.RequiredAffinity), nil
+	case api.RequiredAntiAffinity:
+		return initializeAffinitySelector(&instance.RequiredAntiAffinity), nil
+	default:
+		return nil, fmt.Errorf("unsupported instance affinity type %d", scheduleAffinity.Affinity)
+	}
+}
+
+func initializeAffinitySelector(selector **affinity.Selector) *affinity.Selector {
+	if *selector == nil {
+		*selector = &affinity.Selector{}
+	}
+	return *selector
+}
+
+func rawLabelOperator(labelOp api.LabelOperator) (*affinity.LabelOperator, error) {
+	operator := &affinity.LabelOperator{}
+	switch labelOp.Type {
+	case api.LabelOpIn:
+		operator.LabelOperator = &affinity.LabelOperator_In{
+			In: &affinity.LabelIn{Values: append([]string(nil), labelOp.LabelValues...)},
+		}
+	case api.LabelOpNotIn:
+		operator.LabelOperator = &affinity.LabelOperator_NotIn{
+			NotIn: &affinity.LabelNotIn{Values: append([]string(nil), labelOp.LabelValues...)},
+		}
+	case api.LabelOpExists:
+		operator.LabelOperator = &affinity.LabelOperator_Exists{Exists: &affinity.LabelExists{}}
+	case api.LabelOpNotExists:
+		operator.LabelOperator = &affinity.LabelOperator_NotExist{
+			NotExist: &affinity.LabelDoesNotExist{},
+		}
+	default:
+		return nil, fmt.Errorf("unsupported label operator type %d", labelOp.Type)
+	}
+	return operator, nil
+}
+
+func newSandboxRawRequestID() string {
+	random := strings.ReplaceAll(uuid.NewString(), "-", "")
+	return random[:sandboxRawRequestIDLength-len(sandboxRawRequestSequence)] + sandboxRawRequestSequence
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func setStringMapDefault(values map[string]string, key string, value string) {
+	if _, exists := values[key]; !exists {
+		values[key] = value
+	}
+}
+
+func parseSandboxRawCreateResponse(raw []byte, designatedInstanceID string) (string, error) {
+	var notify runtime.NotifyRequest
+	if err := proto.Unmarshal(raw, &notify); err != nil {
+		return "", fmt.Errorf("failed to unmarshal sandbox create response: %w", err)
+	}
+	code := int(notify.GetCode())
+	message := notify.GetMessage()
+	if code != 0 {
+		if message == "" {
+			message = fmt.Sprintf("sandbox raw create failed with code %d", code)
+		}
+		return designatedInstanceID, api.ErrorInfo{Code: code, Err: errors.New(message)}
+	}
+	return designatedInstanceID, nil
 }
 
 func finishSandboxCreate(createCtx sandboxCreateContext, instanceID string, err error) (sandboxCreateResult, error) {
@@ -936,18 +1199,6 @@ func finishSandboxCreate(createCtx sandboxCreateContext, instanceID string, err 
 		createCtx.traceID, createCtx.requestID, instanceID, createCtx.req.Name, createCtx.req.Namespace,
 	)
 	return sandboxCreateResult{instanceID: instanceID, status: sandboxCreateStatusRunning}, nil
-}
-
-func newSandboxFunctionMeta(funcID, name, namespace string) api.FunctionMeta {
-	return api.FunctionMeta{
-		FuncID:     funcID,
-		ModuleName: sandboxModuleName,
-		ClassName:  sandboxClassName,
-		Language:   api.Python,
-		Api:        api.ActorApi,
-		Name:       &name,
-		Namespace:  &namespace,
-	}
 }
 
 type sandboxInvokeOptionRequest struct {
@@ -1287,17 +1538,6 @@ func buildRootfsOption(spec RootfsSpec, fallbackImage string) (string, error) {
 	return string(data), nil
 }
 
-func methodMeta(method string) api.FunctionMeta {
-	return api.FunctionMeta{
-		FuncID:     defaultSandboxFunctionID,
-		ModuleName: "yr.sandbox.sandbox",
-		ClassName:  "SandboxInstance",
-		FuncName:   method,
-		Language:   api.Python,
-		Api:        api.ActorApi,
-	}
-}
-
 // InvokeV1Handler handles POST /api/sandbox/v1/sandboxes/{sandboxID}/invoke.
 func InvokeV1Handler(ctx *gin.Context) {
 	traceID := ensureSandboxTrace(ctx)
@@ -1323,6 +1563,7 @@ func InvokeV1Handler(ctx *gin.Context) {
 		req.Args = map[string]interface{}{}
 	}
 	result, err := invokeSandboxAction(invokeActionRequest{
+		ctx:         ctx.Request.Context(),
 		instanceID:  instanceID,
 		action:      req.Action,
 		args:        req.Args,
@@ -1338,6 +1579,7 @@ func InvokeV1Handler(ctx *gin.Context) {
 }
 
 type invokeActionRequest struct {
+	ctx         context.Context
 	instanceID  string
 	action      string
 	args        map[string]interface{}
@@ -1348,31 +1590,67 @@ type invokeActionRequest struct {
 
 func invokeSandboxAction(req invokeActionRequest) (interface{}, error) {
 	envelope := map[string]interface{}{
-		"action": req.action,
-		"args":   normalizeJSONValue(req.args),
+		"sandbox_method": "sandbox_invoke",
+		"action":         req.action,
+		"args":           normalizeJSONValue(req.args),
 	}
-	packedArgs, err := packKwargs(envelope)
+	packedArg, err := encodeYRArg(envelope)
 	if err != nil {
 		return nil, err
 	}
-	invokeOpts := api.InvokeOptions{
-		TraceID:          req.traceID,
-		Timeout:          req.timeout,
-		BypassDataSystem: true,
+	invokeReq := &core.InvokeRequest{
+		Function: defaultSandboxFunctionID,
+		Args: []*common.Arg{{
+			Type:       common.Arg_ArgType(packedArg.Type),
+			Value:      packedArg.Data,
+			NestedRefs: packedArg.NestedObjectIDs,
+		}},
+		InstanceID: req.instanceID,
+		RequestID:  newSandboxRawRequestID(),
+		TraceID:    req.traceID,
 	}
-	if req.traceParent != "" {
-		invokeOpts.CustomExtensions = map[string]string{"traceparent": req.traceParent}
+	invokeReqRaw, err := proto.Marshal(invokeReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal sandbox invoke request: %w", err)
 	}
-	data, err := util.NewClient().InvokeInstanceByLibRtAndGet(
-		methodMeta("sandbox_invoke"),
-		req.instanceID,
-		packedArgs,
-		invokeOpts,
+	parent := req.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	if req.timeout > 0 {
+		var cancel context.CancelFunc
+		parent, cancel = context.WithTimeout(parent, time.Duration(req.timeout)*time.Second)
+		defer cancel()
+	}
+	respRaw, err := util.InvokeInstanceRawWithContext(
+		parent,
+		util.NewClient(),
+		invokeReqRaw,
+		api.RawRequestOption{TraceParent: req.traceParent},
 	)
 	if err != nil {
 		return nil, err
 	}
-	return decodeYRValue(data)
+	return parseSandboxRawInvokeResponse(respRaw)
+}
+
+func parseSandboxRawInvokeResponse(raw []byte) (interface{}, error) {
+	var notify runtime.NotifyRequest
+	if err := proto.Unmarshal(raw, &notify); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal sandbox invoke response: %w", err)
+	}
+	code := int(notify.GetCode())
+	if code != 0 {
+		message := notify.GetMessage()
+		if message == "" {
+			message = fmt.Sprintf("sandbox raw invoke failed with code %d", code)
+		}
+		return nil, api.ErrorInfo{Code: code, Err: errors.New(message)}
+	}
+	if len(notify.GetSmallObjects()) == 0 {
+		return nil, fmt.Errorf("sandbox raw invoke response contains no result")
+	}
+	return decodeYRValue(notify.GetSmallObjects()[0].GetValue())
 }
 
 func normalizeJSONValue(value interface{}) interface{} {
@@ -1396,22 +1674,6 @@ func normalizeJSONValue(value interface{}) interface{} {
 	default:
 		return v
 	}
-}
-
-func packKwargs(kwargs map[string]interface{}) ([]api.Arg, error) {
-	args := make([]api.Arg, 0, len(kwargs)*2)
-	for key, value := range kwargs {
-		keyArg, err := encodeYRArg(key)
-		if err != nil {
-			return nil, err
-		}
-		valueArg, err := encodeYRArg(value)
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, keyArg, valueArg)
-	}
-	return args, nil
 }
 
 var msgpackHandle codec.MsgpackHandle
