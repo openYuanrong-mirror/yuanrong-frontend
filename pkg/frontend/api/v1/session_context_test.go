@@ -23,7 +23,10 @@ import (
 	"frontend/pkg/frontend/sessioncontext"
 )
 
-const sessionContextTestURN = "sn:cn:yrk:default:function:0@agentrt@e2e0729:latest"
+const (
+	sessionContextTestURN = "sn:cn:yrk:default:function:0@agentrt@e2e0729:latest"
+	completedEventSeq     = 2
+)
 
 type sessionContextMemoryReader map[string][]byte
 
@@ -31,11 +34,10 @@ func (reader sessionContextMemoryReader) Get(key, _, _ string) ([]byte, error) {
 	return reader[key], nil
 }
 
-func TestSessionContextHandlers(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	scope := sessioncontext.NewScope(
-		"default", "0@agentrt@e2e0729", "latest", sessionContextTestURN)
-	sessionID := "session-1"
+func newSessionContextHandlerReader(
+	t *testing.T, scope sessioncontext.Scope, sessionID string,
+) sessionContextMemoryReader {
+	t.Helper()
 	reader := sessionContextMemoryReader{}
 	putJSON := func(key string, value any) {
 		raw, err := json.Marshal(value)
@@ -59,50 +61,42 @@ func TestSessionContextHandlers(t *testing.T) {
 		Data: map[string]any{"message": "hello"}, SchemaVersion: 1,
 		CreatedAt: "2026-07-29T09:00:00Z",
 	})
-	putJSON(sessioncontext.EventKey(scope, sessionID, 2), sessioncontext.Event{
-		SessionContextID: sessionID, TurnID: "turn-000001", Seq: 2,
+	putJSON(sessioncontext.EventKey(scope, sessionID, completedEventSeq), sessioncontext.Event{
+		SessionContextID: sessionID, TurnID: "turn-000001", Seq: completedEventSeq,
 		EventID: "event-2", Source: "SDK", Type: "turn.completed",
 		Data: map[string]any{"output": "done"}, SchemaVersion: 1,
 		CreatedAt: "2026-07-29T09:00:01Z",
 	})
+	return reader
+}
 
-	restore := installSessionContextHandlerDependencies(reader, false, "default")
-	defer restore()
+type sessionContextHandlerTest struct {
+	name       string
+	handler    gin.HandlerFunc
+	hasSession bool
+	extraParam gin.Param
+	contains   []string
+}
 
-	tests := []struct {
-		name       string
-		handler    gin.HandlerFunc
-		hasSession bool
-		extraParam gin.Param
-		contains   []string
-	}{
-		{
-			name: "list sessions", handler: ListSessionContextsHandler,
-			contains: []string{`"sessionContextId":"session-1"`},
-		},
-		{
-			name: "get session", handler: GetSessionContextHandler,
-			hasSession: true,
-			contains:   []string{`"turnCount":1`, `"eventCount":2`, `"state":"COMPLETED"`},
-		},
-		{
-			name: "list turns", handler: ListSessionContextTurnsHandler,
-			hasSession: true,
-			contains:   []string{`"turnId":"turn-000001"`, `"result":"done"`},
-		},
-		{
-			name: "get turn", handler: GetSessionContextTurnHandler,
-			hasSession: true,
+func sessionContextHandlerTests() []sessionContextHandlerTest {
+	return []sessionContextHandlerTest{
+		{name: "list sessions", handler: ListSessionContextsHandler,
+			contains: []string{`"sessionContextId":"session-1"`}},
+		{name: "get session", handler: GetSessionContextHandler, hasSession: true,
+			contains: []string{`"turnCount":1`, `"eventCount":2`, `"state":"COMPLETED"`}},
+		{name: "list turns", handler: ListSessionContextTurnsHandler, hasSession: true,
+			contains: []string{`"turnId":"turn-000001"`, `"result":"done"`}},
+		{name: "get turn", handler: GetSessionContextTurnHandler, hasSession: true,
 			extraParam: gin.Param{Key: turnIDParam, Value: "turn-000001"},
-			contains:   []string{`"inputs":["hello"]`, `"state":"COMPLETED"`},
-		},
-		{
-			name: "list events", handler: ListSessionContextEventsHandler,
-			hasSession: true,
-			contains:   []string{`"seq":1`, `"seq":2`, `"nextAfterSeq":2`},
-		},
+			contains:   []string{`"inputs":["hello"]`, `"state":"COMPLETED"`}},
+		{name: "list events", handler: ListSessionContextEventsHandler, hasSession: true,
+			contains: []string{`"seq":1`, `"seq":2`, `"nextAfterSeq":2`}},
 	}
-	for _, test := range tests {
+}
+
+func runSessionContextHandlerTests(t *testing.T, sessionID string) {
+	t.Helper()
+	for _, test := range sessionContextHandlerTests() {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
@@ -121,6 +115,17 @@ func TestSessionContextHandlers(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSessionContextHandlers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	scope := sessioncontext.NewScope(
+		"default", "0@agentrt@e2e0729", "latest", sessionContextTestURN)
+	sessionID := "session-1"
+	reader := newSessionContextHandlerReader(t, scope, sessionID)
+	restore := installSessionContextHandlerDependencies(reader, false, "default")
+	defer restore()
+	runSessionContextHandlerTests(t, sessionID)
 }
 
 func TestSessionContextHandlerRejectsCrossTenantQuery(t *testing.T) {

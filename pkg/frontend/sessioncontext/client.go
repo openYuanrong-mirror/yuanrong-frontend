@@ -24,14 +24,20 @@ import (
 	"frontend/pkg/frontend/schedulerproxy"
 )
 
+const defaultManagerClientTimeout = 60 * time.Second
+
+// ManagerClient sends SessionContext lifecycle requests to the owning scheduler.
 type ManagerClient interface {
+	// Post sends a lifecycle request and returns its HTTP response.
 	Post(ctx context.Context, funcKey, path, traceID string, payload any) (int, []byte, error)
 }
 
+// HTTPManagerClient implements ManagerClient over HTTP.
 type HTTPManagerClient struct {
 	Client *http.Client
 }
 
+// Post sends a lifecycle request to the scheduler that owns funcKey.
 func (c HTTPManagerClient) Post(ctx context.Context, funcKey, path, traceID string,
 	payload any) (int, []byte, error) {
 	body, err := json.Marshal(payload)
@@ -88,7 +94,7 @@ func (c HTTPManagerClient) post(ctx context.Context, owner *schedulerproxy.Sched
 		if httpsEnabled {
 			transport.TLSClientConfig = commontls.GetClientTLSConfig()
 		}
-		client = &http.Client{Timeout: 60 * time.Second, Transport: transport}
+		client = &http.Client{Timeout: defaultManagerClientTimeout, Transport: transport}
 	}
 	response, err := client.Do(request)
 	if err != nil {
@@ -99,6 +105,7 @@ func (c HTTPManagerClient) post(ctx context.Context, owner *schedulerproxy.Sched
 	return response.StatusCode, responseBody, err
 }
 
+// ErrorResponse is the error payload returned by a scheduler.
 type ErrorResponse struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`

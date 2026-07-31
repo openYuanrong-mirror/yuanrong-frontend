@@ -32,7 +32,7 @@ func (DataSystemReader) Get(key, tenantID, traceID string) ([]byte, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, &Error{Code: ErrDataSystem, Message: "failed to read DataSystem", Cause: err}
+		return nil, &ServiceError{Code: ErrDataSystem, Message: "failed to read DataSystem", Cause: err}
 	}
 	return value, nil
 }

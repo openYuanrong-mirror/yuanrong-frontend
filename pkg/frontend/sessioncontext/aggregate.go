@@ -40,7 +40,9 @@ func aggregateTurns(records []TurnRecord, events []Event) ([]Turn, error) {
 				return nil, dataCorrupted(
 					fmt.Sprintf("Event e%d belongs to an unexpected Turn", event.Seq), nil)
 			}
-			applyEvent(&turn, event)
+			if err := applyEvent(&turn, event); err != nil {
+				return nil, err
+			}
 			eventIndex++
 		}
 		result = append(result, turn)
@@ -51,8 +53,16 @@ func aggregateTurns(records []TurnRecord, events []Event) ([]Turn, error) {
 	return result, nil
 }
 
-func applyEvent(turn *Turn, event Event) {
-	data, _ := event.Data.(map[string]any)
+func applyEvent(turn *Turn, event Event) error {
+	switch event.Type {
+	case "input.message", "output.message", "turn.input_required", "turn.completed", "turn.failed":
+	default:
+		return nil
+	}
+	data, ok := event.Data.(map[string]any)
+	if !ok {
+		return dataCorrupted(fmt.Sprintf("Event e%d data must be an object", event.Seq), nil)
+	}
 	switch event.Type {
 	case "input.message":
 		turn.State = "WORKING"
@@ -76,4 +86,5 @@ func applyEvent(turn *Turn, event Event) {
 		turn.Result = nil
 		turn.Error = data["error"]
 	}
+	return nil
 }

@@ -12,23 +12,31 @@ package sessioncontext
 
 import "fmt"
 
+// ErrorCode identifies a SessionContext service error.
 type ErrorCode string
 
 const (
-	ErrInvalidQuery    ErrorCode = "INVALID_QUERY"
+	// ErrInvalidQuery indicates that query parameters are invalid.
+	ErrInvalidQuery ErrorCode = "INVALID_QUERY"
+	// ErrSessionNotFound indicates that the requested SessionContext does not exist.
 	ErrSessionNotFound ErrorCode = "SESSION_CONTEXT_NOT_FOUND"
-	ErrTurnNotFound    ErrorCode = "TURN_NOT_FOUND"
-	ErrDataCorrupted   ErrorCode = "SESSION_CONTEXT_DATA_CORRUPTED"
-	ErrDataSystem      ErrorCode = "DATASYSTEM_UNAVAILABLE"
+	// ErrTurnNotFound indicates that the requested turn does not exist.
+	ErrTurnNotFound ErrorCode = "TURN_NOT_FOUND"
+	// ErrDataCorrupted indicates that persisted SessionContext data is invalid.
+	ErrDataCorrupted ErrorCode = "SESSION_CONTEXT_DATA_CORRUPTED"
+	// ErrDataSystem indicates that DataSystem is unavailable.
+	ErrDataSystem ErrorCode = "DATASYSTEM_UNAVAILABLE"
 )
 
-type Error struct {
+// ServiceError describes an error returned by the SessionContext query service.
+type ServiceError struct {
 	Code    ErrorCode
 	Message string
 	Cause   error
 }
 
-func (e *Error) Error() string {
+// Error returns the formatted service error.
+func (e *ServiceError) Error() string {
 	if e.Cause != nil {
 		return fmt.Sprintf("%s: %s: %v", e.Code, e.Message, e.Cause)
 	}
@@ -36,5 +44,5 @@ func (e *Error) Error() string {
 }
 
 func dataCorrupted(message string, cause error) error {
-	return &Error{Code: ErrDataCorrupted, Message: message, Cause: cause}
+	return &ServiceError{Code: ErrDataCorrupted, Message: message, Cause: cause}
 }

@@ -53,6 +53,7 @@ var sessionContextAuthEnabled = func() bool {
 
 var sessionContextAuthenticatedTenant = middleware.JWTAuthenticatedTenant
 
+// ListSessionContextsHandler lists SessionContexts for a function.
 func ListSessionContextsHandler(ctx *gin.Context) {
 	scope, ok := sessionContextScope(ctx)
 	if !ok {
@@ -67,6 +68,7 @@ func ListSessionContextsHandler(ctx *gin.Context) {
 	writeSessionContextResult(ctx, result, err)
 }
 
+// GetSessionContextHandler returns one SessionContext.
 func GetSessionContextHandler(ctx *gin.Context) {
 	scope, sessionID, ok := sessionContextResourceScope(ctx)
 	if !ok {
@@ -76,6 +78,7 @@ func GetSessionContextHandler(ctx *gin.Context) {
 	writeSessionContextResult(ctx, result, err)
 }
 
+// ListSessionContextTurnsHandler lists turns for a SessionContext.
 func ListSessionContextTurnsHandler(ctx *gin.Context) {
 	scope, sessionID, ok := sessionContextResourceScope(ctx)
 	if !ok {
@@ -90,6 +93,7 @@ func ListSessionContextTurnsHandler(ctx *gin.Context) {
 	writeSessionContextResult(ctx, result, err)
 }
 
+// GetSessionContextTurnHandler returns one turn from a SessionContext.
 func GetSessionContextTurnHandler(ctx *gin.Context) {
 	scope, sessionID, ok := sessionContextResourceScope(ctx)
 	if !ok {
@@ -104,6 +108,7 @@ func GetSessionContextTurnHandler(ctx *gin.Context) {
 	writeSessionContextResult(ctx, result, err)
 }
 
+// ListSessionContextEventsHandler lists events for a SessionContext.
 func ListSessionContextEventsHandler(ctx *gin.Context) {
 	scope, sessionID, ok := sessionContextResourceScope(ctx)
 	if !ok {
@@ -136,6 +141,7 @@ type forkSessionContextBody struct {
 	TurnID                 string `json:"turnId"`
 }
 
+// ForkSessionContextHandler forks a SessionContext at a selected turn.
 func ForkSessionContextHandler(ctx *gin.Context) {
 	scope, sourceID, ok := sessionContextResourceScope(ctx)
 	if !ok {
@@ -165,6 +171,7 @@ func ForkSessionContextHandler(ctx *gin.Context) {
 	writeManagerResponse(ctx, status, response, err)
 }
 
+// DeleteSessionContextHandler deletes a SessionContext.
 func DeleteSessionContextHandler(ctx *gin.Context) {
 	scope, sessionID, ok := sessionContextResourceScope(ctx)
 	if !ok {
@@ -188,7 +195,7 @@ func writeManagerResponse(ctx *gin.Context, status int, body []byte, err error) 
 		ctx.Status(status)
 		return
 	}
-	if status >= 200 && status < 300 {
+	if status >= http.StatusOK && status < http.StatusMultipleChoices {
 		var response any
 		if len(body) == 0 || json.Unmarshal(body, &response) != nil {
 			ctx.Status(status)
@@ -289,7 +296,7 @@ func writeSessionContextResult(ctx *gin.Context, result any, err error) {
 		ctx.JSON(http.StatusOK, result)
 		return
 	}
-	var serviceErr *sessioncontext.Error
+	var serviceErr *sessioncontext.ServiceError
 	if !errors.As(err, &serviceErr) {
 		writeSessionContextError(ctx, http.StatusInternalServerError, "INTERNAL_ERROR", "internal error")
 		return

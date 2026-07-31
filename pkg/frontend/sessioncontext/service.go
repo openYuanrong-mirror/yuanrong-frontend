@@ -22,42 +22,21 @@ import (
 
 const schemaVersion = 1
 
+// Service provides read-only access to SessionContext history.
 type Service struct {
 	reader Reader
 }
 
+// NewService creates a SessionContext query service.
 func NewService(reader Reader) *Service {
 	return &Service{reader: reader}
 }
 
+// ListSessions returns registered SessionContexts for a function version.
 func (s *Service) ListSessions(scope Scope, limit int, pageToken, traceID string) (SessionList, error) {
-	raw, err := s.reader.Get(RegistryKey(scope.RegisteredName), scope.TenantID, traceID)
+	entries, err := s.loadRegistryEntries(scope, traceID)
 	if err != nil {
 		return SessionList{}, err
-	}
-	entries := make([]RegistryEntry, 0)
-	if raw != nil {
-		var registry Registry
-		if err = decodeJSON(raw, &registry); err != nil {
-			return SessionList{}, dataCorrupted("invalid session context registry", err)
-		}
-		if registry.SchemaVersion != schemaVersion {
-			return SessionList{}, dataCorrupted("unsupported session context registry schemaVersion", nil)
-		}
-		for _, entry := range registry.SessionContexts {
-			if entry.FunctionVersion == scope.Version {
-				control, controlErr := s.readControl(scope, entry.SessionContextID, traceID)
-				if controlErr != nil {
-					return SessionList{}, controlErr
-				}
-				if control != nil {
-					entry.State = control.State
-					entry.ForkedFrom = control.ForkedFrom
-					entry.ForkTurnID = control.ForkTurnID
-				}
-				entries = append(entries, entry)
-			}
-		}
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].CreatedAt == entries[j].CreatedAt {
@@ -72,7 +51,10 @@ func (s *Service) ListSessions(scope Scope, limit int, pageToken, traceID string
 	end := min(offset+limit, len(entries))
 	var next *string
 	if end < len(entries) {
-		token := encodePageToken(pageScope(scope, "sessions", ""), end)
+		token, encodeErr := encodePageToken(pageScope(scope, "sessions", ""), end)
+		if encodeErr != nil {
+			return SessionList{}, encodeErr
+		}
 		next = &token
 	}
 	return SessionList{
@@ -80,6 +62,41 @@ func (s *Service) ListSessions(scope Scope, limit int, pageToken, traceID string
 	}, nil
 }
 
+func (s *Service) loadRegistryEntries(scope Scope, traceID string) ([]RegistryEntry, error) {
+	raw, err := s.reader.Get(RegistryKey(scope.RegisteredName), scope.TenantID, traceID)
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		return make([]RegistryEntry, 0), nil
+	}
+	var registry Registry
+	if err = decodeJSON(raw, &registry); err != nil {
+		return nil, dataCorrupted("invalid session context registry", err)
+	}
+	if registry.SchemaVersion != schemaVersion {
+		return nil, dataCorrupted("unsupported session context registry schemaVersion", nil)
+	}
+	entries := make([]RegistryEntry, 0, len(registry.SessionContexts))
+	for _, entry := range registry.SessionContexts {
+		if entry.FunctionVersion != scope.Version {
+			continue
+		}
+		control, controlErr := s.readControl(scope, entry.SessionContextID, traceID)
+		if controlErr != nil {
+			return nil, controlErr
+		}
+		if control != nil {
+			entry.State = control.State
+			entry.ForkedFrom = control.ForkedFrom
+			entry.ForkTurnID = control.ForkTurnID
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// GetSession returns summary information for a SessionContext.
 func (s *Service) GetSession(scope Scope, sessionContextID, traceID string) (SessionDetail, error) {
 	turns, events, err := s.readHistory(scope, sessionContextID, traceID)
 	if err != nil {
@@ -95,7 +112,7 @@ func (s *Service) GetSession(scope Scope, sessionContextID, traceID string) (Ses
 			return SessionDetail{}, registryErr
 		}
 		if !registered && control == nil {
-			return SessionDetail{}, &Error{Code: ErrSessionNotFound, Message: "session context not found"}
+			return SessionDetail{}, &ServiceError{Code: ErrSessionNotFound, Message: "session context not found"}
 		}
 	}
 	aggregated, err := aggregateTurns(turns, events)
@@ -159,6 +176,7 @@ func (s *Service) isRegisteredSession(scope Scope, sessionContextID, traceID str
 	return false, nil
 }
 
+// ListTurns returns turns in reverse chronological order.
 func (s *Service) ListTurns(
 	scope Scope, sessionContextID string, limit int, pageToken, traceID string,
 ) (TurnList, error) {
@@ -167,7 +185,7 @@ func (s *Service) ListTurns(
 		return TurnList{}, err
 	}
 	if len(turns) == 0 && len(events) == 0 {
-		return TurnList{}, &Error{Code: ErrSessionNotFound, Message: "session context not found"}
+		return TurnList{}, &ServiceError{Code: ErrSessionNotFound, Message: "session context not found"}
 	}
 	aggregated, err := aggregateTurns(turns, events)
 	if err != nil {
@@ -182,12 +200,16 @@ func (s *Service) ListTurns(
 	end := min(offset+limit, len(aggregated))
 	var next *string
 	if end < len(aggregated) {
-		token := encodePageToken(tokenScope, end)
+		token, encodeErr := encodePageToken(tokenScope, end)
+		if encodeErr != nil {
+			return TurnList{}, encodeErr
+		}
 		next = &token
 	}
 	return TurnList{Turns: aggregated[offset:end], NextPageToken: next}, nil
 }
 
+// GetTurn returns one aggregated turn.
 func (s *Service) GetTurn(scope Scope, sessionContextID, turnID, traceID string) (Turn, error) {
 	turns, events, err := s.readHistory(scope, sessionContextID, traceID)
 	if err != nil {
@@ -202,14 +224,15 @@ func (s *Service) GetTurn(scope Scope, sessionContextID, turnID, traceID string)
 			return turn, nil
 		}
 	}
-	return Turn{}, &Error{Code: ErrTurnNotFound, Message: "turn not found"}
+	return Turn{}, &ServiceError{Code: ErrTurnNotFound, Message: "turn not found"}
 }
 
+// ListEvents returns sequential events matching the supplied filter.
 func (s *Service) ListEvents(
 	scope Scope, sessionContextID string, filter EventFilter, traceID string,
 ) (EventList, error) {
 	if filter.AfterSeq < 0 || filter.Limit <= 0 {
-		return EventList{}, &Error{Code: ErrInvalidQuery, Message: "invalid event query"}
+		return EventList{}, &ServiceError{Code: ErrInvalidQuery, Message: "invalid event query"}
 	}
 	result := make([]Event, 0, filter.Limit)
 	nextAfterSeq := filter.AfterSeq
@@ -244,7 +267,7 @@ func (s *Service) ListEvents(
 			return EventList{}, err
 		}
 		if firstTurn == nil {
-			return EventList{}, &Error{Code: ErrSessionNotFound, Message: "session context not found"}
+			return EventList{}, &ServiceError{Code: ErrSessionNotFound, Message: "session context not found"}
 		}
 	}
 	return EventList{Events: result, NextAfterSeq: nextAfterSeq}, nil
@@ -308,9 +331,12 @@ func pageScope(scope Scope, resource, sessionContextID string) string {
 	return fmt.Sprintf("%s\x00%s\x00%s\x00%s", scope.FunctionURN, resource, scope.Version, sessionContextID)
 }
 
-func encodePageToken(scope string, offset int) string {
-	raw, _ := json.Marshal(pageTokenValue{Scope: scope, Offset: offset})
-	return base64.RawURLEncoding.EncodeToString(raw)
+func encodePageToken(scope string, offset int) (string, error) {
+	raw, err := json.Marshal(pageTokenValue{Scope: scope, Offset: offset})
+	if err != nil {
+		return "", &ServiceError{Code: ErrDataCorrupted, Message: "failed to encode pageToken", Cause: err}
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func decodePageToken(token, scope string, size int) (int, error) {
@@ -319,12 +345,12 @@ func decodePageToken(token, scope string, size int) (int, error) {
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
-		return 0, &Error{Code: ErrInvalidQuery, Message: "invalid pageToken", Cause: err}
+		return 0, &ServiceError{Code: ErrInvalidQuery, Message: "invalid pageToken", Cause: err}
 	}
 	var value pageTokenValue
 	if err = json.Unmarshal(raw, &value); err != nil || value.Scope != scope ||
 		value.Offset < 0 || value.Offset > size {
-		return 0, &Error{Code: ErrInvalidQuery, Message: "pageToken does not match query scope"}
+		return 0, &ServiceError{Code: ErrInvalidQuery, Message: "pageToken does not match query scope"}
 	}
 	return value.Offset, nil
 }
