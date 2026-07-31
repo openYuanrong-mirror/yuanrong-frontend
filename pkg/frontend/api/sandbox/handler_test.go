@@ -168,11 +168,18 @@ func (r *runtimeStub) CreateInstanceRawContext(
 func invokeOptionsFromRawCreate(createReq *core.CreateRequest) api.InvokeOptions {
 	scheduling := createReq.GetSchedulingOps()
 	resources := scheduling.GetResources()
+	customResources := make(map[string]float64, len(resources))
+	for name, value := range resources {
+		if name != "CPU" && name != "Memory" {
+			customResources[name] = value
+		}
+	}
 	return api.InvokeOptions{
 		Cpu:               int(resources["CPU"]),
 		Memory:            int(resources["Memory"]),
 		CpuLimit:          parseTestInt(scheduling.GetExtension()["CPU_LIMIT"]),
 		MemoryLimit:       parseTestInt(scheduling.GetExtension()["MEMORY_LIMIT"]),
+		CustomResources:   customResources,
 		CustomExtensions:  cloneStringMap(scheduling.GetExtension()),
 		CreateOpt:         cloneStringMap(createReq.GetCreateOptions()),
 		Labels:            append([]string(nil), createReq.GetLabels()...),
@@ -808,6 +815,7 @@ func assertSchedulerCreateOptions(t *testing.T, capturedInvokeOpt api.InvokeOpti
 	require.EqualValues(t, sandboxDefaultCPU, resSpec.CPU)
 	require.EqualValues(t, sandboxDefaultMemory, resSpec.Memory)
 	require.Equal(t, "", resSpec.InvokeLabel)
+	require.Nil(t, resSpec.CustomResources)
 	require.Empty(t, capturedInvokeOpt.SchedulerInstanceIDs)
 }
 
@@ -1219,6 +1227,180 @@ func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
 		[]string{"node-a"},
 		expressions[0].GetOp().GetIn().GetValues(),
 	)
+}
+
+func TestCreateV1HandlerConvertsNormalizedXPUToFunctionSystemResource(t *testing.T) {
+	var capturedCreateReq *core.CreateRequest
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstanceRaw: func(
+			createReq *core.CreateRequest,
+			_ api.RawRequestOption,
+		) ([]byte, error) {
+			capturedCreateReq = cloneCreateRequest(t, createReq)
+			return rawCreateNotify(0, ""), nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{"image":"ubuntu:22.04","xpu":"GPU:L20:2"}`)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		bytes.NewReader(body),
+	)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, capturedCreateReq)
+	require.Equal(
+		t,
+		float64(2),
+		capturedCreateReq.GetSchedulingOps().GetResources()["GPU/L20/count"],
+	)
+	var resourceSpec resspeckey.ResourceSpecification
+	require.NoError(
+		t,
+		json.Unmarshal(
+			[]byte(capturedCreateReq.GetCreateOptions()[constant.ResourceSpecNote]),
+			&resourceSpec,
+		),
+	)
+	require.Equal(t, int64(2), resourceSpec.CustomResources["GPU/L20/count"])
+}
+
+func TestCreateV1HandlerEscapesXPUModelAsRegexLiteral(t *testing.T) {
+	var capturedCreateReq *core.CreateRequest
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstanceRaw: func(
+			createReq *core.CreateRequest,
+			_ api.RawRequestOption,
+		) ([]byte, error) {
+			capturedCreateReq = cloneCreateRequest(t, createReq)
+			return rawCreateNotify(0, ""), nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{"xpu":"gpu:L20.*[PRO]:1"}`)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		bytes.NewReader(body),
+	)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(
+		t,
+		capturedCreateReq.GetSchedulingOps().GetResources(),
+		`GPU/L20\.\*\[PRO\]/count`,
+	)
+}
+
+func TestParseSandboxXPUDerivesUppercaseFunctionSystemPrefix(t *testing.T) {
+	xpu, err := parseSandboxXPU("npu:Ascend-910B:1")
+
+	require.NoError(t, err)
+	require.Equal(t, "npu:Ascend-910B:1", xpu.normalized)
+	require.Equal(t, "NPU/Ascend-910B/count", xpu.resourceName)
+	require.Equal(t, int64(1), xpu.count)
+}
+
+func TestCreateV1HandlerUsesFunctionSystemWildcardWhenXPUModelIsEmpty(t *testing.T) {
+	var capturedCreateReq *core.CreateRequest
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstanceRaw: func(
+			createReq *core.CreateRequest,
+			_ api.RawRequestOption,
+		) ([]byte, error) {
+			capturedCreateReq = cloneCreateRequest(t, createReq)
+			return rawCreateNotify(0, ""), nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{"xpu":"gpu::2"}`)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		bytes.NewReader(body),
+	)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, capturedCreateReq)
+	require.Equal(
+		t,
+		float64(2),
+		capturedCreateReq.GetSchedulingOps().GetResources()["GPU/.+/count"],
+	)
+	var resourceSpec resspeckey.ResourceSpecification
+	require.NoError(
+		t,
+		json.Unmarshal(
+			[]byte(capturedCreateReq.GetCreateOptions()[constant.ResourceSpecNote]),
+			&resourceSpec,
+		),
+	)
+	require.Equal(t, int64(2), resourceSpec.CustomResources["GPU/.+/count"])
+}
+
+func TestCreateV1HandlerRejectsInvalidXPU(t *testing.T) {
+	invalidValues := []string{
+		"gpu:l20",
+		"gpu:l20:1:0",
+		":l20:1",
+		"gpu:l20:",
+		"g.*:l20:1",
+		"gpu:l20:0",
+		"gpu:l20:-1",
+		"gpu:l20:1.5",
+		"gpu:l20:1,gpu:h100:1",
+		" gpu:l20:1",
+	}
+	for _, value := range invalidValues {
+		t.Run(value, func(t *testing.T) {
+			createCalled := false
+			util.SetAPIClientLibruntime(&runtimeStub{
+				createInstanceRaw: func(
+					_ *core.CreateRequest,
+					_ api.RawRequestOption,
+				) ([]byte, error) {
+					createCalled = true
+					return rawCreateNotify(0, ""), nil
+				},
+			})
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			body, err := json.Marshal(CreateV1Request{XPU: value})
+			require.NoError(t, err)
+			ctx.Request, err = http.NewRequest(
+				http.MethodPost,
+				"/api/sandbox/v1/sandboxes",
+				bytes.NewReader(body),
+			)
+			require.NoError(t, err)
+
+			CreateV1Handler(ctx)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
+			require.False(t, createCalled)
+			require.Contains(t, recorder.Body.String(), "xpu")
+		})
+	}
 }
 
 func TestCreateV1HandlerRejectsInvalidScheduleAffinity(t *testing.T) {
