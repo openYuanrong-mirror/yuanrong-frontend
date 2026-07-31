@@ -189,6 +189,7 @@ func buildFuncSpec(functionKey string, value []byte, etcdType string) (*types.Fu
 		FuncMetaSignature: utils.GetFuncMetaSignature(funcMeta, false),
 		FuncMetaData:      funcMeta.FuncMetaData,
 		S3MetaData:        funcMeta.S3MetaData,
+		CodeMetaData:      funcMeta.CodeMetaData,
 		EnvMetaData:       funcMeta.EnvMetaData,
 		StsMetaData:       funcMeta.StsMetaData,
 		ResourceMetaData:  funcMeta.ResourceMetaData,

@@ -32,6 +32,7 @@ import (
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
+	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
@@ -51,7 +52,7 @@ import (
 // replaced with agentDefaultWorkspaceTarget so the mount target is a real path, not a literal.
 const (
 	agentUserPlaceholder        = "__AGENT_USER__"
-	agentDefaultWorkspaceTarget = "/workspace"
+	agentDefaultWorkspaceTarget = "/home/agentos"
 	agentBootstrapCmdEnv        = "YR_RUNTIME_BOOTSTRAP_CMD"
 )
 
@@ -61,6 +62,19 @@ const (
 // does not return "invalid function (1015)". agent's real config (imageurl/user/ports/
 // sandboxType) is passed via createOptions — proxy sinks them as-is, docker executor reads.
 const agentExecutorFormat = "default/0-system-faasExecutor%s/$latest"
+
+// createParams mirrors functionscaler.CreateParams (go/pkg/functionscaler/instancepool/
+// instancepool.go:141) for the registered-mode local-codePath non-HTTP/non-CustomContainer
+// path. JSON tags must align so the executor process can deserialize the same payload.
+type createParams struct {
+	InstanceLabel     string            `json:"instanceLabel,omitempty"`
+	EventCreateParams eventCreateParams `json:",inline"`
+}
+
+type eventCreateParams struct {
+	UserInitEntry string `json:"userInitEntry,omitempty"`
+	UserCallEntry string `json:"userCallEntry,omitempty"`
+}
 
 const (
 	defaultAgentCPU              = 1000
@@ -147,7 +161,7 @@ type CreateAgentRequest struct {
 	Name        string            `json:"name" binding:"required"`
 	Urn         string            `json:"urn,omitempty"`
 	RuntimeSpec *RuntimeSpec      `json:"runtime_spec,omitempty"`
-	Workspace   string            `json:"workspace" binding:"required"`
+	Workspace   string            `json:"workspace,omitempty"`
 	EnvVars     map[string]string `json:"env_vars,omitempty"`
 	Mounts      []Mount           `json:"mounts,omitempty"`
 }
@@ -193,29 +207,12 @@ func CreateHandler(ctx *gin.Context) {
 		return
 	}
 
-	var funcKey, executorFuncKey, runtime string
-	if inline {
-		tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
-		if tenantID == "" {
-			tenantID = "default"
-		}
-		funcKey = urnutils.CombineFunctionKey(tenantID, req.Name, urnutils.DefaultURNVersion)
-		runtime = req.RuntimeSpec.Runtime
-	} else {
-		funcUrn := &urnutils.FunctionURN{}
-		if err := funcUrn.ParseFrom(req.Urn); err != nil {
-			app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid urn: %v", err))
-			return
-		}
-		funcKey = urnutils.CombineFunctionKey(funcUrn.TenantID, funcUrn.FuncName, funcUrn.FuncVersion)
-		if spec, ok := functionmeta.LoadFuncSpec(funcKey); ok && spec != nil {
-			runtime = spec.FuncMetaData.Runtime
-		}
+	funcKey, runtime, ok := resolveAgentFuncKeyAndRuntime(ctx, req, inline)
+	if !ok {
+		return
 	}
-	executorFuncKey = getAgentExecutorFuncKey(runtime)
-
 	funcMeta := api.FunctionMeta{
-		FuncID:    executorFuncKey,
+		FuncID:    getAgentExecutorFuncKey(runtime),
 		Language:  api.Python,
 		Api:       api.ActorApi,
 		Namespace: &req.Namespace,
@@ -225,7 +222,46 @@ func CreateHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
 		return
 	}
-	createAgentInstance(ctx, req, funcMeta, invokeOpts)
+	var spec *types.FuncSpec
+	if !inline {
+		if loaded, ok := functionmeta.LoadFuncSpec(funcKey); ok && loaded != nil {
+			spec = loaded
+		}
+	}
+	resKey := resspeckey.ResourceSpecification{
+		CPU:         int64(invokeOpts.Cpu),
+		Memory:      int64(invokeOpts.Memory),
+		InvokeLabel: "",
+	}
+	args := buildAgentCreateArgs(spec, resKey)
+	createAgentInstance(ctx, req, funcMeta, invokeOpts, args)
+}
+
+// resolveAgentFuncKeyAndRuntime resolves the user function key and runtime for the agent.
+// Inline mode composes funcKey from the tenant header + req.Name and takes runtime from
+// RuntimeSpec; registered mode parses req.Urn and loads runtime from the watched funcSpecMap.
+// Returns ok=false after writing a bad-request response on an unparseable URN.
+func resolveAgentFuncKeyAndRuntime(ctx *gin.Context, req CreateAgentRequest, inline bool,
+) (funcKey, runtime string, ok bool) {
+	if inline {
+		tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+		if tenantID == "" {
+			tenantID = "default"
+		}
+		funcKey = urnutils.CombineFunctionKey(tenantID, req.Name, urnutils.DefaultURNVersion)
+		runtime = req.RuntimeSpec.Runtime
+		return funcKey, runtime, true
+	}
+	funcUrn := &urnutils.FunctionURN{}
+	if err := funcUrn.ParseFrom(req.Urn); err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid urn: %v", err))
+		return "", "", false
+	}
+	funcKey = urnutils.CombineFunctionKey(funcUrn.TenantID, funcUrn.FuncName, funcUrn.FuncVersion)
+	if spec, loaded := functionmeta.LoadFuncSpec(funcKey); loaded && spec != nil {
+		runtime = spec.FuncMetaData.Runtime
+	}
+	return funcKey, runtime, true
 }
 
 // isInlineMode reports whether req carries inline container config (runtime_spec present).
@@ -263,6 +299,9 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest, funcKey s
 		applyAgentInlineMeta(&invokeOpts, req)
 	} else {
 		applyAgentFuncMeta(&invokeOpts, funcKey)
+		if spec, ok := functionmeta.LoadFuncSpec(funcKey); ok && spec != nil {
+			applyAgentCodePaths(&invokeOpts, spec)
+		}
 	}
 	applyAgentCreateOpts(&invokeOpts, ctx, req, inline, funcKey)
 	return invokeOpts, nil
@@ -305,6 +344,96 @@ func applyAgentFuncMeta(invokeOpts *api.InvokeOptions, funcKey string) {
 		applyAgentPorts(invokeOpts, spec.RootfsSpecMeta.Ports)
 	}
 	mergeAgentStaticEnv(invokeOpts, spec)
+	applyAgentCodePath(invokeOpts, spec)
+}
+
+// applyAgentCodePath sinks the user function codePath for local-storage registered functions
+// into createOptions["DELEGATE_DOWNLOAD"] as a LocalMetaData JSON. Mirrors function-scaler's
+// instance_operation_kernel.go: prepareDelegateDownload for storageType=="local". When the
+// storageType is not local or codePath is empty, no DELEGATE_DOWNLOAD is written (the agent
+// fallback is to skip code loading — the container starts but cannot run user code). The
+// function_agent's LocalDeployer parses this and returns deployDir without downloading.
+func applyAgentCodePath(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
+	if spec == nil {
+		log.GetLogger().Infof("[AgentCodePath] spec is nil, skip")
+		return
+	}
+	log.GetLogger().Infof("[AgentCodePath] storageType=%s, codePath=%s, sandboxType=%s",
+		spec.CodeMetaData.StorageType, spec.CodeMetaData.CodePath, spec.SandboxType)
+	if spec.CodeMetaData.StorageType != constants.LocalStorageType {
+		return
+	}
+	if spec.CodeMetaData.CodePath == "" {
+		return
+	}
+	delegateDownloadValue := types.LocalMetaData{
+		StorageType: constants.LocalStorageType,
+		CodePath:    spec.CodeMetaData.CodePath,
+	}
+	data, err := json.Marshal(delegateDownloadValue)
+	if err != nil {
+		log.GetLogger().Warnf("failed to marshal agent delegate download: %v", err)
+		return
+	}
+	log.GetLogger().Infof("[AgentCodePath] set DELEGATE_DOWNLOAD=%s", string(data))
+	invokeOpts.CreateOpt[constant.DelegateDownloadKey] = string(data)
+}
+
+// applyAgentCodePaths builds invokeOpts.CodePaths from the spec's init/handler/preStop entries.
+// Mirrors function-scaler instance_operation_kernel.go:309-312. The executor process reads
+// CodePaths to know which entry symbols to load and run for each lifecycle hook.
+func applyAgentCodePaths(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
+	if spec == nil {
+		return
+	}
+	codeEntrys := []string{
+		spec.ExtendedMetaData.Initializer.Handler,
+		spec.FuncMetaData.Handler,
+	}
+	if spec.ExtendedMetaData.PreStop.Handler != "" {
+		codeEntrys = append(codeEntrys, spec.ExtendedMetaData.PreStop.Handler)
+	}
+	invokeOpts.CodePaths = codeEntrys
+}
+
+// buildAgentCreateArgs builds the libruntime CreateInstance args array for the agent create
+// path. Mirrors function-scaler instance_operation_kernel.go:1170-1199, 1202-1235 for the
+// non-HTTP / non-CustomContainer local-codePath path. It returns four args: funcSpecData is an
+// empty JSON object because agent has no funcSpec payload (the executor is the system
+// faasExecutor function, and user-code config travels via createOptions); createParamsData
+// carries instanceLabel plus the userInitEntry and userCallEntry; schedulerData is an empty JSON
+// object because agent instances are not scheduler-managed; createEvent is an empty JSON object
+// because agent has no event payload.
+//
+// When spec is nil (inline mode or uncached registered funcKey), createParamsData falls back to
+// empty init/call entries. resKey mirrors the ResourceSpecification built by
+// buildAgentResourceSpecJSON (same CPU/Memory source, InvokeLabel empty since agent create does
+// not set one).
+func buildAgentCreateArgs(spec *types.FuncSpec, resKey resspeckey.ResourceSpecification) []api.Arg {
+	userInitEntry := ""
+	userCallEntry := ""
+	if spec != nil {
+		userInitEntry = spec.ExtendedMetaData.Initializer.Handler
+		userCallEntry = spec.FuncMetaData.Handler
+	}
+	params := createParams{
+		InstanceLabel: resKey.InvokeLabel,
+		EventCreateParams: eventCreateParams{
+			UserInitEntry: userInitEntry,
+			UserCallEntry: userCallEntry,
+		},
+	}
+	createParamsData, err := json.Marshal(params)
+	if err != nil {
+		log.GetLogger().Warnf("failed to marshal agent create params: %v", err)
+		createParamsData = []byte("{}")
+	}
+	return []api.Arg{
+		{Type: api.Value, Data: []byte("{}")},
+		{Type: api.Value, Data: createParamsData},
+		{Type: api.Value, Data: []byte("{}")},
+		{Type: api.Value, Data: []byte("{}")},
+	}
 }
 
 // applyAgentInlineMeta passes container config from req.RuntimeSpec into createOptions (inline mode).
@@ -598,8 +727,9 @@ func validateBindSource(path, label string) error {
 
 func createAgentInstance(
 	ctx *gin.Context, req CreateAgentRequest, funcMeta api.FunctionMeta, invokeOpts api.InvokeOptions,
+	args []api.Arg,
 ) {
-	instanceID, err := util.NewClient().CreateInstanceByLibRt(funcMeta, []api.Arg{}, invokeOpts)
+	instanceID, err := util.NewClient().CreateInstanceByLibRt(funcMeta, args, invokeOpts)
 	if err != nil {
 		if shouldTreatCreateTimeoutAsSuccess(instanceID, err) {
 			if waitForAgentInstanceRunning(instanceID, funcMeta.FuncID,
