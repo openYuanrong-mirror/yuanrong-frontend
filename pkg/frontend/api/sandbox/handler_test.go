@@ -1272,6 +1272,96 @@ func TestCreateV1HandlerConvertsNormalizedXPUToFunctionSystemResource(t *testing
 	require.Equal(t, int64(2), resourceSpec.CustomResources["GPU/L20/count"])
 }
 
+func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
+	var capturedCreateReq *core.CreateRequest
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstanceRaw: func(
+			createReq *core.CreateRequest,
+			_ api.RawRequestOption,
+		) ([]byte, error) {
+			capturedCreateReq = cloneCreateRequest(t, createReq)
+			return rawCreateNotify(0, ""), nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{
+		"image":"ubuntu:22.04",
+		"xpu":"gpu:L20:1",
+		"storageMb":153600
+	}`)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		bytes.NewReader(body),
+	)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, capturedCreateReq)
+	resources := capturedCreateReq.GetSchedulingOps().GetResources()
+	require.Equal(t, float64(1), resources["GPU/L20/count"])
+	require.Equal(
+		t,
+		float64(153600*bytesPerMiB),
+		resources[sandboxStorageResourceName],
+	)
+	var resourceSpec resspeckey.ResourceSpecification
+	require.NoError(
+		t,
+		json.Unmarshal(
+			[]byte(capturedCreateReq.GetCreateOptions()[constant.ResourceSpecNote]),
+			&resourceSpec,
+		),
+	)
+	require.Equal(
+		t,
+		int64(153600*bytesPerMiB),
+		resourceSpec.CustomResources[sandboxStorageResourceName],
+	)
+}
+
+func TestCreateV1HandlerRejectsInvalidStorage(t *testing.T) {
+	invalidBodies := []string{
+		`{"storageMb":0}`,
+		`{"storageMb":-1}`,
+		`{"storageMb":"1024"}`,
+	}
+	for _, body := range invalidBodies {
+		t.Run(body, func(t *testing.T) {
+			createCalled := false
+			util.SetAPIClientLibruntime(&runtimeStub{
+				createInstanceRaw: func(
+					_ *core.CreateRequest,
+					_ api.RawRequestOption,
+				) ([]byte, error) {
+					createCalled = true
+					return rawCreateNotify(0, ""), nil
+				},
+			})
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			request, err := http.NewRequest(
+				http.MethodPost,
+				"/api/sandbox/v1/sandboxes",
+				strings.NewReader(body),
+			)
+			require.NoError(t, err)
+			ctx.Request = request
+
+			CreateV1Handler(ctx)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
+			require.False(t, createCalled)
+		})
+	}
+}
+
 func TestCreateV1HandlerEscapesXPUModelAsRegexLiteral(t *testing.T) {
 	var capturedCreateReq *core.CreateRequest
 	util.SetAPIClientLibruntime(&runtimeStub{
