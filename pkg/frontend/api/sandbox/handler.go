@@ -27,6 +27,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,6 +100,9 @@ const (
 	sandboxCreateReplayMaxEntries  = 10000
 	sandboxRawRequestIDLength      = 18
 	sandboxRawRequestSequence      = "00"
+	sandboxXPUFieldCount           = 3
+	sandboxStorageResourceName     = "storage"
+	bytesPerMiB                    = 1024 * 1024
 )
 
 var selectSandboxSchedulerID = func(funcKey string) (string, error) {
@@ -123,6 +127,11 @@ var waitForSandboxInstanceRunning = func(instanceID, functionID, resourceSpecNot
 	return isSandboxInstanceRunning(instanceID, functionID, resourceSpecNote)
 }
 
+var (
+	sandboxXPUTypePattern  = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+	sandboxXPUCountPattern = regexp.MustCompile(`^[0-9]+$`)
+)
+
 // CreateRequest holds the parameters for sandbox creation.
 type CreateRequest struct {
 	Name      string   `json:"name"`
@@ -143,6 +152,8 @@ type CreateRequest struct {
 	Env         map[string]string        `json:"env"`
 	Mounts      []map[string]interface{} `json:"mounts"`
 	ExtraConfig map[string]interface{}   `json:"extra_config"`
+	XPU         string                   `json:"xpu"`
+	StorageMb   *int64                   `json:"storageMb,omitempty"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -195,6 +206,8 @@ type CreateV1Request struct {
 	Env                    map[string]string        `json:"env"`
 	Mounts                 []map[string]interface{} `json:"mounts"`
 	ExtraConfig            map[string]interface{}   `json:"extra_config"`
+	XPU                    string                   `json:"xpu"`
+	StorageMb              *int64                   `json:"storageMb,omitempty"`
 	ScheduleAffinities     []api.Affinity           `json:"scheduleAffinities,omitempty"`
 	Tunnel                 TunnelSpec               `json:"tunnel,omitempty"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
@@ -260,6 +273,12 @@ const (
 	sandboxCreateReuseInflight
 	sandboxCreateReuseCompleted
 )
+
+type sandboxXPURequest struct {
+	resourceName string
+	count        int64
+	normalized   string
+}
 
 type sandboxCreateRequestConflictError struct {
 	requestID string
@@ -489,6 +508,16 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if err := validateScheduleAffinities(req.ScheduleAffinities); err != nil {
 		return "", nil, err
 	}
+	xpu, err := parseSandboxXPU(req.XPU)
+	if err != nil {
+		return "", nil, err
+	}
+	if xpu != nil {
+		req.XPU = xpu.normalized
+	}
+	if err := validateSandboxStorageMb(req.StorageMb); err != nil {
+		return "", nil, err
+	}
 	req.Rootfs.Runtime = req.Runtime
 	rootfs, err := buildRootfsOption(req.Rootfs, req.Image)
 	if err != nil {
@@ -496,6 +525,57 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	}
 	prepareSandboxRRTHTTP(req)
 	return rootfs, prepareSandboxTunnel(req), nil
+}
+
+func parseSandboxXPU(value string) (*sandboxXPURequest, error) {
+	if value == "" {
+		return nil, nil
+	}
+	fields := strings.Split(value, ":")
+	if len(fields) != sandboxXPUFieldCount || fields[0] == "" || fields[2] == "" {
+		return nil, fmt.Errorf("xpu must have exactly three fields: type:model:count")
+	}
+	for _, field := range fields {
+		if strings.TrimSpace(field) != field {
+			return nil, fmt.Errorf("xpu fields must not contain surrounding whitespace")
+		}
+	}
+
+	xpuType := strings.ToLower(fields[0])
+	model := fields[1]
+	if !sandboxXPUTypePattern.MatchString(xpuType) {
+		return nil, fmt.Errorf("xpu type must be an identifier")
+	}
+	if !sandboxXPUCountPattern.MatchString(fields[2]) {
+		return nil, fmt.Errorf("xpu count must be a positive integer")
+	}
+	count, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || count <= 0 {
+		return nil, fmt.Errorf("xpu count must be a positive integer")
+	}
+
+	modelPattern := ".+"
+	if model != "" {
+		modelPattern = regexp.QuoteMeta(model)
+	}
+	return &sandboxXPURequest{
+		resourceName: strings.ToUpper(xpuType) + "/" + modelPattern + "/count",
+		count:        count,
+		normalized:   fmt.Sprintf("%s:%s:%d", xpuType, model, count),
+	}, nil
+}
+
+func validateSandboxStorageMb(storageMb *int64) error {
+	if storageMb == nil {
+		return nil
+	}
+	if *storageMb <= 0 {
+		return fmt.Errorf("storageMb must be a positive integer")
+	}
+	if *storageMb > math.MaxInt64/bytesPerMiB {
+		return fmt.Errorf("storageMb is too large")
+	}
+	return nil
 }
 
 func newSandboxName() string {
@@ -570,6 +650,8 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		Env:                    req.Env,
 		Mounts:                 req.Mounts,
 		ExtraConfig:            req.ExtraConfig,
+		XPU:                    req.XPU,
+		StorageMb:              req.StorageMb,
 		ScheduleAffinities:     req.ScheduleAffinities,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
@@ -1213,6 +1295,13 @@ type sandboxInvokeOptionRequest struct {
 
 func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions, error) {
 	cpu, memory := resourceDefaults(req.createReq.Cpu, req.createReq.Memory)
+	xpu, err := parseSandboxXPU(req.createReq.XPU)
+	if err != nil {
+		return api.InvokeOptions{}, err
+	}
+	if err := validateSandboxStorageMb(req.createReq.StorageMb); err != nil {
+		return api.InvokeOptions{}, err
+	}
 	createTimeoutSeconds, scheduleTimeoutSeconds, err := resolveSandboxCreateTimeouts(
 		req.createReq.CreateTimeoutSeconds, req.createReq.ScheduleTimeoutSeconds,
 	)
@@ -1233,6 +1322,16 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions,
 			"lifecycle":   "detached",
 			"Concurrency": sandboxConcurrency,
 		},
+	}
+	if xpu != nil || req.createReq.StorageMb != nil {
+		invokeOpts.CustomResources = make(map[string]float64, 2)
+	}
+	if xpu != nil {
+		invokeOpts.CustomResources[xpu.resourceName] = float64(xpu.count)
+	}
+	if req.createReq.StorageMb != nil {
+		invokeOpts.CustomResources[sandboxStorageResourceName] =
+			float64(*req.createReq.StorageMb) * bytesPerMiB
 	}
 	fillSandboxCustomExtensions(
 		&invokeOpts,
@@ -1335,7 +1434,9 @@ func fillSandboxCreateOptions(
 	invokeOpts.CreateOpt["ConcurrentNum"] = sandboxConcurrency
 	invokeOpts.CreateOpt["moduleName"] = sandboxModuleName
 	invokeOpts.CreateOpt["className"] = sandboxClassName
-	if resSpecJSON, err := buildSandboxResourceSpecJSON(invokeOpts.Cpu, invokeOpts.Memory); err == nil {
+	if resSpecJSON, err := buildSandboxResourceSpecJSON(
+		invokeOpts.Cpu, invokeOpts.Memory, invokeOpts.CustomResources,
+	); err == nil {
 		invokeOpts.CreateOpt[constant.ResourceSpecNote] = resSpecJSON
 	} else {
 		log.GetLogger().Warnf("failed to marshal sandbox resource spec: %v", err)
@@ -1813,11 +1914,22 @@ func shouldTreatCreateTimeoutAsSuccess(instanceID string, err error) bool {
 	return errInfo.Code == createTimeoutSuccessCode
 }
 
-func buildSandboxResourceSpecJSON(cpu, memory int) (string, error) {
+func buildSandboxResourceSpecJSON(
+	cpu, memory int,
+	customResources map[string]float64,
+) (string, error) {
+	var resourceCounts map[string]int64
+	if len(customResources) != 0 {
+		resourceCounts = make(map[string]int64, len(customResources))
+		for name, count := range customResources {
+			resourceCounts[name] = int64(count)
+		}
+	}
 	resourceSpec := resspeckey.ResourceSpecification{
-		CPU:         int64(cpu),
-		Memory:      int64(memory),
-		InvokeLabel: "",
+		CPU:             int64(cpu),
+		Memory:          int64(memory),
+		InvokeLabel:     "",
+		CustomResources: resourceCounts,
 	}
 	data, err := json.Marshal(resourceSpec)
 	if err != nil {
