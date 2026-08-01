@@ -100,6 +100,7 @@ const (
 	sandboxCreateReplayMaxEntries  = 10000
 	sandboxRawRequestIDLength      = 18
 	sandboxRawRequestSequence      = "00"
+	sandboxXPUFieldCount           = 3
 	sandboxStorageResourceName     = "storage"
 	bytesPerMiB                    = 1024 * 1024
 )
@@ -531,7 +532,7 @@ func parseSandboxXPU(value string) (*sandboxXPURequest, error) {
 		return nil, nil
 	}
 	fields := strings.Split(value, ":")
-	if len(fields) != 3 || fields[0] == "" || fields[2] == "" {
+	if len(fields) != sandboxXPUFieldCount || fields[0] == "" || fields[2] == "" {
 		return nil, fmt.Errorf("xpu must have exactly three fields: type:model:count")
 	}
 	for _, field := range fields {

@@ -1273,6 +1273,8 @@ func TestCreateV1HandlerConvertsNormalizedXPUToFunctionSystemResource(t *testing
 }
 
 func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
+	const storageMb int64 = 153600
+
 	var capturedCreateReq *core.CreateRequest
 	util.SetAPIClientLibruntime(&runtimeStub{
 		createInstanceRaw: func(
@@ -1307,7 +1309,7 @@ func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 	require.Equal(t, float64(1), resources["GPU/L20/count"])
 	require.Equal(
 		t,
-		float64(153600*bytesPerMiB),
+		float64(storageMb*bytesPerMiB),
 		resources[sandboxStorageResourceName],
 	)
 	var resourceSpec resspeckey.ResourceSpecification
@@ -1320,7 +1322,7 @@ func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 	)
 	require.Equal(
 		t,
-		int64(153600*bytesPerMiB),
+		storageMb*bytesPerMiB,
 		resourceSpec.CustomResources[sandboxStorageResourceName],
 	)
 }
