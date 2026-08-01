@@ -198,10 +198,19 @@ func TestFuncKeyLeasePools_BatchRetainLeaseLoop(t *testing.T) {
 		convey.Convey("doBatchRetain success", func() {
 			count := 0
 			ch := make(chan time.Time, 1)
+			// done is signalled from inside the patched doBatchRetain so the
+			// test waits deterministically for the loop goroutine to finish one
+			// tick before asserting. time.Sleep would race the loop goroutine's
+			// writes to count/leasePools (race-detector FAIL, flaky on slow CI).
+			done := make(chan struct{})
 			defer gomonkey.ApplyFunc((*FuncKeyLeasePools).doBatchRetain,
 				func(lp *FuncKeyLeasePools) {
 					delete(lp.leasePools, "func1")
 					count++
+					select {
+					case done <- struct{}{}:
+					default:
+					}
 				}).Reset()
 			defer gomonkey.ApplyFunc(time.NewTicker, func(d time.Duration) *time.Ticker {
 				return &time.Ticker{C: ch}
@@ -214,7 +223,11 @@ func TestFuncKeyLeasePools_BatchRetainLeaseLoop(t *testing.T) {
 			funcKeyLeasePools.interval.Store(int64(10 * time.Millisecond))
 			funcKeyLeasePools.leasePools["func1"] = &LeasePool{stopCh: make(chan struct{})}
 			ch <- time.Time{}
-			time.Sleep(10 * time.Millisecond)
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("doBatchRetain did not run within 1s")
+			}
 			convey.So(count, convey.ShouldEqual, 1)
 			convey.So(len(funcKeyLeasePools.leasePools), convey.ShouldEqual, 0)
 			close(funcKeyLeasePools.stopCh)
@@ -246,6 +259,10 @@ func TestFuncKeyLeasePools_BatchRetainLeaseLoop(t *testing.T) {
 			count := 0
 			ch := make(chan time.Time, 1)
 			ticker := &time.Ticker{C: ch}
+			// done signals each doBatchRetain completion; the test drains it
+			// instead of sleeping, avoiding a race with the loop goroutine's
+			// writes to leasePools (race-detector FAIL, flaky on slow CI).
+			done := make(chan struct{}, 2)
 			defer gomonkey.ApplyFunc((*FuncKeyLeasePools).doBatchRetain,
 				func(lp *FuncKeyLeasePools) {
 					leasePool, ok := lp.leasePools["func1"]
@@ -253,6 +270,7 @@ func TestFuncKeyLeasePools_BatchRetainLeaseLoop(t *testing.T) {
 						delete(lp.leasePools, "func1")
 					}
 					count++
+					done <- struct{}{}
 				}).Reset()
 			defer gomonkey.ApplyFunc(time.NewTicker, func(d time.Duration) *time.Ticker {
 				return ticker
@@ -269,16 +287,29 @@ func TestFuncKeyLeasePools_BatchRetainLeaseLoop(t *testing.T) {
 			funcKeyLeasePools.leasePools["func1"] = leasePool
 			leasePool.IncPendingReqNum()
 			ch <- time.Time{}
+			waitTick(t, done)
 			convey.So(len(funcKeyLeasePools.leasePools), convey.ShouldEqual, 1)
 			leasePool.DecPendingReqNum()
 			ch <- time.Time{}
-			time.Sleep(10 * time.Millisecond)
+			waitTick(t, done)
 			convey.So(len(funcKeyLeasePools.leasePools), convey.ShouldEqual, 0)
 			close(funcKeyLeasePools.stopCh)
 		})
 	})
 }
 
+// waitTick blocks until doBatchRetain signals one completion on done, or fails
+// the test after a timeout. It replaces time.Sleep so the loop goroutine's
+// writes establish a happens-before with the assertions (the original test was
+// flaky and failed the race detector on slow CI).
+func waitTick(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("doBatchRetain did not run within 1s")
+	}
+}
 func TestNormalizeRetainInterval(t *testing.T) {
 	convey.Convey("normalize retain interval", t, func() {
 		convey.So(normalizeRetainInterval(-time.Millisecond), convey.ShouldEqual,

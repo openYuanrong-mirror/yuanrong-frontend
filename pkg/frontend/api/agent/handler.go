@@ -66,7 +66,7 @@ const (
 	defaultAgentMemory           = 2048
 	agentCreateTimeoutSeconds    = 60
 	agentInitTimeoutSeconds      = 305
-	agentGracefulShutdownSeconds = 900
+	agentGracefulShutdownSeconds = 0
 	agentDirectoryQuotaMB        = 512
 	agentInstanceType            = "reserved"
 	agentDelegateDirectory       = "/tmp"
