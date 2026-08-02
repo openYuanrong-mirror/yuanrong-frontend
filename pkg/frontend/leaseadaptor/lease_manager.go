@@ -164,6 +164,7 @@ type FuncKeyLeasePools struct {
 	stopCh             chan struct{}
 	globalLeaseList    map[string]*InstanceLease
 	leaseIdToLeasePool map[string]*LeasePool
+	batchRetainWG      sync.WaitGroup
 
 	interval atomic.Int64
 	ringName *types.RingName
@@ -550,7 +551,9 @@ func (flps *FuncKeyLeasePools) processBatchLease(exitLeases []*InstanceLease,
 
 	for _, batches := range funcKeyAllBatches {
 		for _, batch := range batches.arr {
+			flps.batchRetainWG.Add(1)
 			go func(batch *BatchRetainLeaseInfos) {
+				defer flps.batchRetainWG.Done()
 				traceId := uuid.New().String()
 				if resp, err := doBatchRetainInvoke(batch, traceId); err != nil {
 					flps.processErrBatchResponse(batch)
@@ -754,11 +757,9 @@ func (ip *LeasePool) acquireHandler(funcKey string, option *commontypes.AcquireO
 	acquireDependOnHash := func() error {
 		var schedulerNodeInfo *schedulerproxy.SchedulerNodeInfo
 		var getSchedulerNodeInfoErr error
-		if option.EnableSessionCtx {
-			logger.Debugf("acquire with sessionCtx routing, funcKey=%s, sessionCtxID=%q",
-				funcKey, option.SessionCtxID)
+		if option.EnableSessionCtx && option.SessionCtxID != "" {
 			schedulerNodeInfo, getSchedulerNodeInfoErr = getProxyManagerByRing(
-				option.RingName).GetWithoutUnexpectedSchedulerInfosWithCtx(
+				option.RingName).GetWithoutUnexpectedSchedulerInfosWithSessionContext(
 				funcKey, option.SessionCtxID, unavailableSchedulerNodeInfos, logger)
 		} else {
 			schedulerNodeInfo, getSchedulerNodeInfoErr = getProxyManagerByRing(

@@ -56,13 +56,20 @@ const (
 		common.FunctionUrnParam + "/sessions" + constants.DynamicRouterParamPrefix + "sessionId/interrupt"
 	urlDeleteSession = "/serverless/v1/functions/" + common.GinUrnParamMark +
 		common.FunctionUrnParam + "/sessions" + constants.DynamicRouterParamPrefix + "sessionId"
-	urlShortInvoke     = "/invocations/:tenant-id/:namespace/:function/"
-	urlShortInvokeOld  = "/:tenant-id/:namespace/:function/"
-	urlStreamSubscribe = "/serverless/v1/stream/subscribe"
-	urlGetHealthCheck  = "/healthz"
-	urlClusterHealthy  = "/serverless/v1/componentshealth"
-	urlResources       = "/global-scheduler/resources"
-	urlGetAsyncResult  = "/serverless/v1/functions/async-results/:request-id"
+	urlListSessionContexts = "/serverless/v1/functions/" + common.GinUrnParamMark +
+		common.FunctionUrnParam + "/session-contexts"
+	urlGetSessionContext        = urlListSessionContexts + constants.DynamicRouterParamPrefix + "sessionCtxId"
+	urlListSessionContextTurns  = urlGetSessionContext + "/turns"
+	urlGetSessionContextTurn    = urlListSessionContextTurns + constants.DynamicRouterParamPrefix + "turnId"
+	urlListSessionContextEvents = urlGetSessionContext + "/events"
+	urlForkSessionContext       = urlGetSessionContext + "/fork"
+	urlShortInvoke              = "/invocations/:tenant-id/:namespace/:function/"
+	urlShortInvokeOld           = "/:tenant-id/:namespace/:function/"
+	urlStreamSubscribe          = "/serverless/v1/stream/subscribe"
+	urlGetHealthCheck           = "/healthz"
+	urlClusterHealthy           = "/serverless/v1/componentshealth"
+	urlResources                = "/global-scheduler/resources"
+	urlGetAsyncResult           = "/serverless/v1/functions/async-results/:request-id"
 	// url to faasmanager
 	urlLease          = "/client/v1/lease"
 	urlLeaseKeepAlive = "/client/v1/lease/keepalive"
@@ -116,6 +123,13 @@ func InitRoute(r *gin.Engine) {
 	r.POST(urlPostInvoke, tracer.WrapGinHandler(v1.InvokeHandler)) // Invocation
 	r.POST(urlInterruptSession, tracer.WrapGinHandler(v1.InterruptSessionHandler))
 	r.DELETE(urlDeleteSession, tracer.WrapGinHandler(v1.DeleteSessionHandler))
+	r.GET(urlListSessionContexts, tracer.WrapGinHandler(v1.ListSessionContextsHandler))
+	r.GET(urlGetSessionContext, tracer.WrapGinHandler(v1.GetSessionContextHandler))
+	r.GET(urlListSessionContextTurns, tracer.WrapGinHandler(v1.ListSessionContextTurnsHandler))
+	r.GET(urlGetSessionContextTurn, tracer.WrapGinHandler(v1.GetSessionContextTurnHandler))
+	r.GET(urlListSessionContextEvents, tracer.WrapGinHandler(v1.ListSessionContextEventsHandler))
+	r.POST(urlForkSessionContext, tracer.WrapGinHandler(v1.ForkSessionContextHandler))
+	r.DELETE(urlGetSessionContext, tracer.WrapGinHandler(v1.DeleteSessionContextHandler))
 	r.POST(urlShortInvoke, tracer.WrapGinHandler(v1.ShortInvokeHandler))    // Invocation
 	r.POST(urlShortInvokeOld, tracer.WrapGinHandler(v1.ShortInvokeHandler)) // Deprecated short invocation (backward compatibility)
 	r.GET(urlGetAsyncResult, v1.GetAsyncResultHandler)                      // Async invocation result

@@ -190,6 +190,15 @@ func TestGetSchedulerClient(t *testing.T) {
 
 }
 
+func TestNewSchedulerClientWithNilConfig(t *testing.T) {
+	patch := gomonkey.ApplyFunc(config.GetConfig, func() *types.Config {
+		return nil
+	})
+	defer patch.Reset()
+
+	assert.NotNil(t, newSchedulerClient())
+}
+
 func TestReadLimitedBody_Error(t *testing.T) {
 	input := strings.NewReader("test input")
 	maxReadSize := int64(5)

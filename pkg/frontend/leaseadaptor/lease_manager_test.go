@@ -488,6 +488,7 @@ func TestFuncKeyLeasePools_DoBatchRetain(t *testing.T) {
 			}).Reset()
 			ilps.globalLeaseList[leaseId3] = lease3
 			ilps.doBatchRetain()
+			ilps.batchRetainWG.Wait()
 			convey.So(ilps.globalLeaseList[leaseId3], convey.ShouldBeNil)
 		})
 
@@ -499,6 +500,7 @@ func TestFuncKeyLeasePools_DoBatchRetain(t *testing.T) {
 			ilps.globalLeaseList[leaseId2] = lease2
 			lease2.exited.Store(true)
 			ilps.doBatchRetain()
+			ilps.batchRetainWG.Wait()
 			convey.So(len(ilps.globalLeaseList), convey.ShouldEqual, 0)
 			convey.So(ilps.leaseIdToLeasePool[leaseId2], convey.ShouldBeNil)
 			delete(ilps.globalLeaseList, leaseId2)
@@ -511,6 +513,7 @@ func TestFuncKeyLeasePools_DoBatchRetain(t *testing.T) {
 			}).Reset()
 			ilps.globalLeaseList[leaseId1] = lease1
 			ilps.doBatchRetain()
+			ilps.batchRetainWG.Wait()
 			convey.So(ilps.leaseIdToLeasePool[leaseId2], convey.ShouldBeNil)
 			delete(ilps.globalLeaseList, leaseId1)
 		})

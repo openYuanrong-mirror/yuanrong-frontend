@@ -140,7 +140,8 @@ func GetSchedulerClient() *fasthttp.Client {
 
 func newSchedulerClient() *fasthttp.Client {
 	var tlsConfig *tls.Config
-	if config.GetConfig().HTTPSConfig != nil && config.GetConfig().HTTPSConfig.HTTPSEnable {
+	cfg := config.GetConfig()
+	if cfg != nil && cfg.HTTPSConfig != nil && cfg.HTTPSConfig.HTTPSEnable {
 		tlsConfig = commontls.GetClientTLSConfig()
 		if tlsConfig != nil {
 			tlsConfig.NextProtos = []string{"http/1.1"}
