@@ -595,6 +595,14 @@ func DeleteHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
+	// libruntime.Kill is idempotent for missing IDs; check cache first so unknown or
+	// already-deleted instances return 404 instead of 200.
+	if instancemanager.GetGlobalInstanceScheduler().
+		GetInstanceByIDAcrossFunctions(instanceID) == nil {
+		ctx.JSON(http.StatusNotFound,
+			gin.H{"code": 404, "message": fmt.Sprintf("instance not found: %s", instanceID)})
+		return
+	}
 	if err := util.NewClient().KillByLibRt(instanceID, agentKillInstanceSignal,
 		[]byte("agent deleted")); err != nil {
 		log.GetLogger().Errorf("failed to kill agent instance %s: %v", instanceID, err)

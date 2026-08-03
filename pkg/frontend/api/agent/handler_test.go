@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
@@ -19,7 +20,22 @@ import (
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/common/util"
 	"frontend/pkg/frontend/functionmeta"
+	"frontend/pkg/frontend/instancemanager"
 )
+
+// stubInstanceFound patches the instance cache to report instanceID as present.
+func stubInstanceFound(t *testing.T, instanceID string) *gomonkey.Patches {
+	t.Helper()
+	return gomonkey.ApplyMethod(
+		reflect.TypeOf(instancemanager.GetGlobalInstanceScheduler()),
+		"GetInstanceByIDAcrossFunctions",
+		func(_ *instancemanager.FunctionInstancesMap, id string) *types.InstanceSpecification {
+			if id == instanceID {
+				return &types.InstanceSpecification{}
+			}
+			return nil
+		})
+}
 
 // runtimeStub is a minimal invokerLibruntime implementation for unit tests.
 // Only CreateInstance and Kill are exercised; the rest are no-ops to satisfy
@@ -603,6 +619,9 @@ func TestIsSafeBindSource(t *testing.T) {
 }
 
 func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
+	const instanceID = "0b6c6322-6533-4901-8000-00000000bb0b"
+	defer stubInstanceFound(t, instanceID).Reset()
+
 	var (
 		capturedInstanceID string
 		capturedSignal     int
@@ -621,15 +640,15 @@ func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Params = gin.Params{{Key: "instanceId", Value: "0b6c6322-6533-4901-8000-00000000bb0b"}}
-	req, err := http.NewRequest(http.MethodDelete, "/api/agent/0b6c6322-6533-4901-8000-00000000bb0b", nil)
+	ctx.Params = gin.Params{{Key: "instanceId", Value: instanceID}}
+	req, err := http.NewRequest(http.MethodDelete, "/api/agent/"+instanceID, nil)
 	require.NoError(t, err)
 	ctx.Request = req
 
 	DeleteHandler(ctx)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
-	require.Equal(t, "0b6c6322-6533-4901-8000-00000000bb0b", capturedInstanceID)
+	require.Equal(t, instanceID, capturedInstanceID)
 	require.Equal(t, agentKillInstanceSignal, capturedSignal)
 	require.Equal(t, []byte("agent deleted"), capturedPayload)
 	// KillByLibRt always passes an empty InvokeOptions to the libruntime client.
@@ -638,6 +657,9 @@ func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
 }
 
 func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
+	const instanceID = "agent-delete-fail"
+	defer stubInstanceFound(t, instanceID).Reset()
+
 	util.SetAPIClientLibruntime(&runtimeStub{
 		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
 			return fmt.Errorf("kill failed")
@@ -646,8 +668,8 @@ func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Params = gin.Params{{Key: "instanceId", Value: "agent-delete-fail"}}
-	req, err := http.NewRequest(http.MethodDelete, "/api/agent/agent-delete-fail", nil)
+	ctx.Params = gin.Params{{Key: "instanceId", Value: instanceID}}
+	req, err := http.NewRequest(http.MethodDelete, "/api/agent/"+instanceID, nil)
 	require.NoError(t, err)
 	ctx.Request = req
 
@@ -655,6 +677,33 @@ func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
 
 	require.Equal(t, http.StatusInternalServerError, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "failed to delete agent")
+}
+
+func TestDeleteHandlerReturns404ForNonExistentInstance(t *testing.T) {
+	// No stubInstanceFound patch: instance cache reports nil for unknown IDs,
+	// so a non-existent or already-deleted instanceID returns 404, not 200.
+	killCalled := false
+	util.SetAPIClientLibruntime(&runtimeStub{
+		kill: func(string, int, []byte, api.InvokeOptions) error {
+			killCalled = true
+			return nil
+		},
+	})
+
+	for _, instanceID := range []string{"non-existent-uuid-12345", "agent-kill-twice"} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Params = gin.Params{{Key: "instanceId", Value: instanceID}}
+		req, err := http.NewRequest(http.MethodDelete, "/api/agent/"+instanceID, nil)
+		require.NoError(t, err)
+		ctx.Request = req
+
+		DeleteHandler(ctx)
+
+		require.Equal(t, http.StatusNotFound, recorder.Code, instanceID)
+		require.Contains(t, recorder.Body.String(), "instance not found", instanceID)
+	}
+	require.False(t, killCalled, "kill must not be called for non-existent instance")
 }
 
 // inlineRootfsReq is an inline-mode CreateAgentRequest (RuntimeSpec set, no Urn) used by the
