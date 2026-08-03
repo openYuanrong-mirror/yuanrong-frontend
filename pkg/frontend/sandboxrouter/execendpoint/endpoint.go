@@ -68,6 +68,14 @@ type Summary struct {
 	// used only when the service-side startTime is missing or unparsable.
 	ObservedRunningAt time.Time
 	Resources         map[string]Resource
+	// ContainerID is InstanceInfo.containerID (docker containerID or supervisor/runsc sandboxID).
+	ContainerID string
+	// ContainerIP is the container internal IP (docker bridge network only); empty for supervisor/runsc.
+	ContainerIP string
+	// SandboxType is the executor kind, from createOptions["sandbox_type"].
+	SandboxType string
+	// CreateOptions is a copy of the instance createOptions map, for the agent Get handler to parse.
+	CreateOptions map[string]string
 }
 
 // Store is a concurrency-safe instanceID -> Endpoint map. The zero value is not

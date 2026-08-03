@@ -21,6 +21,8 @@ import (
 	"frontend/pkg/frontend/common/util"
 	"frontend/pkg/frontend/functionmeta"
 	"frontend/pkg/frontend/instancemanager"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
+	"frontend/pkg/frontend/sandboxrouter/route"
 )
 
 // stubInstanceFound patches the instance cache to report instanceID as present.
@@ -842,4 +844,187 @@ func TestCreateHandlerInlineOverridesUrn(t *testing.T) {
 	// FuncID from inline runtime (python3.11), FunctionKeyNote from inline funcKey (not URN).
 	require.Contains(t, capturedFuncMeta.FuncID, "0-system-faasExecutorPython3.11")
 	require.Equal(t, "default/agent-inline/latest", capturedInvokeOpt.CreateOpt[constant.FunctionKeyNote])
+}
+
+// --- List/Get handler tests ---
+
+// stubListGetLookups swaps the package-level indirections for List/Get handlers
+// (cache is empty in unit tests). The returned func restores the originals.
+func stubListGetLookups(t *testing.T, summaries []execendpoint.Summary,
+	endpoints map[string]execendpoint.Endpoint,
+) func() {
+	t.Helper()
+	oldSummaries := lookupAgentInstanceSummaries
+	oldEndpoint := lookupAgentInstanceEndpoint
+	oldExtract := extractNodeIP
+	lookupAgentInstanceSummaries = func(tenantID, instanceID string) []execendpoint.Summary {
+		return summaries
+	}
+	lookupAgentInstanceEndpoint = func(instanceID string) (execendpoint.Endpoint, bool) {
+		ep, ok := endpoints[instanceID]
+		return ep, ok
+	}
+	extractNodeIP = func(proxyGrpcAddress string) string { return route.ExtractIP(proxyGrpcAddress) }
+	return func() {
+		lookupAgentInstanceSummaries = oldSummaries
+		lookupAgentInstanceEndpoint = oldEndpoint
+		extractNodeIP = oldExtract
+	}
+}
+
+func newAgentGetRecorder(t *testing.T, method, target string) (*httptest.ResponseRecorder, *gin.Context) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	req, err := http.NewRequest(method, target, nil)
+	require.NoError(t, err)
+	ctx.Request = req
+	return recorder, ctx
+}
+
+// sampleAgentSummaries builds two canned summaries (docker + supervisor) for List/Get tests.
+func sampleAgentSummaries() []execendpoint.Summary {
+	return []execendpoint.Summary{
+		{
+			InstanceID:  "inst-docker-1",
+			TenantID:    "tenantA",
+			Function:    "tenantA/agentFunc/1",
+			ContainerID: "4fb6aa1c",
+			ContainerIP: "172.17.0.5",
+			SandboxType: "docker",
+			StartTime:   "2026-07-30T03:00:00Z",
+			CreateOptions: map[string]string{
+				"sandbox_type":     "docker",
+				"host_user":        "agentos",
+				"DELEGATE_ENV_VAR": `{"FOO":"bar"}`,
+				"rootfs": `{"type":"image","imageurl":"yr-docker-runtime:v0","mounts":[` +
+					`{"source":"/data","target":"/data","readonly":false}]}`,
+				"network":          `{"portForwardings":[{"port":22,"protocol":"TCP"}]}`,
+			},
+		},
+		{
+			InstanceID:  "inst-sup-1",
+			TenantID:    "tenantA",
+			Function:    "tenantA/agentFunc/2",
+			SandboxType: "supervisor",
+			StartTime:   "2026-07-30T03:01:00Z",
+			CreateOptions: map[string]string{
+				"sandbox_type": "supervisor",
+			},
+		},
+	}
+}
+
+func TestListHandlerReturnsAllInstances(t *testing.T) {
+	summaries := sampleAgentSummaries()
+	endpoints := map[string]execendpoint.Endpoint{
+		"inst-docker-1": {InstanceID: "inst-docker-1", ProxyGrpcAddress: "10.0.0.5:50051"},
+		"inst-sup-1":   {InstanceID: "inst-sup-1", ProxyGrpcAddress: "10.0.0.6:50051"},
+	}
+	defer stubListGetLookups(t, summaries, endpoints)()
+
+	recorder, ctx := newAgentGetRecorder(t, http.MethodGet, "/api/agent")
+	ListHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var resp struct {
+		Code      int              `json:"code"`
+		Instances []InstanceBrief  `json:"instances"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
+	require.Equal(t, http.StatusOK, resp.Code)
+	require.Len(t, resp.Instances, len(summaries))
+	// ListSummaries sorts by InstanceID, so inst-docker-1 precedes inst-sup-1.
+	docker := resp.Instances[0]
+	require.Equal(t, "inst-docker-1", docker.InstanceID)
+	require.Equal(t, "10.0.0.5", docker.NodeIP)
+	require.Equal(t, "172.17.0.5", docker.SandboxIP)
+	require.Equal(t, "docker", docker.SandboxType)
+	sup := resp.Instances[1]
+	require.Equal(t, "inst-sup-1", sup.InstanceID)
+	require.Equal(t, "10.0.0.6", sup.NodeIP)
+	// supervisor is host-networked: no containerIP in etcd, falls back to node IP.
+	require.Equal(t, "10.0.0.6", sup.SandboxIP)
+	require.Equal(t, "supervisor", sup.SandboxType)
+}
+
+func TestListHandlerSkipsInstancesWithoutSandboxType(t *testing.T) {
+	// System drivers (driver-frontend/driver-scheduler) register in the instance cache
+	// without a sandbox_type; List must not surface them as user agent instances.
+	summaries := []execendpoint.Summary{
+		{InstanceID: "driver-frontend-node1"},
+		{InstanceID: "driver-scheduler-node1"},
+		{InstanceID: "inst-docker-1", SandboxType: "docker"},
+	}
+	defer stubListGetLookups(t, summaries, nil)()
+
+	recorder, ctx := newAgentGetRecorder(t, http.MethodGet, "/api/agent")
+	ListHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var resp struct {
+		Code      int             `json:"code"`
+		Instances []InstanceBrief `json:"instances"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
+	require.Len(t, resp.Instances, 1)
+	require.Equal(t, "inst-docker-1", resp.Instances[0].InstanceID)
+}
+
+func TestListHandlerEmptyReturnsEmptyArray(t *testing.T) {
+	defer stubListGetLookups(t, nil, nil)()
+
+	recorder, ctx := newAgentGetRecorder(t, http.MethodGet, "/api/agent")
+	ListHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"code":200,"instances":[]}`, recorder.Body.String())
+}
+
+func TestGetHandlerReturnsSingleInstance(t *testing.T) {
+	summaries := sampleAgentSummaries()
+	endpoints := map[string]execendpoint.Endpoint{
+		"inst-docker-1": {InstanceID: "inst-docker-1", ProxyGrpcAddress: "10.0.0.5:50051"},
+	}
+	defer stubListGetLookups(t, summaries, endpoints)()
+
+	recorder, ctx := newAgentGetRecorder(t, http.MethodGet, "/api/agent/inst-docker-1")
+	ctx.Params = gin.Params{{Key: "instanceId", Value: "inst-docker-1"}}
+	GetHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var resp struct {
+		Code     int             `json:"code"`
+		Instance InstanceDetail  `json:"instance"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
+	require.Equal(t, http.StatusOK, resp.Code)
+
+	d := resp.Instance
+	require.Equal(t, "inst-docker-1", d.InstanceID)
+	require.Equal(t, "10.0.0.5", d.NodeIP)
+	require.Equal(t, "172.17.0.5", d.SandboxIP)
+	require.Equal(t, "docker", d.SandboxType)
+	require.Equal(t, "4fb6aa1c", d.SandboxID)
+	require.Equal(t, "agentos", d.HostUser)
+	require.Equal(t, "bar", d.EnvVars["FOO"])
+	require.Equal(t, []string{"tcp:22"}, d.Ports)
+	require.NotNil(t, d.Rootfs)
+	require.Equal(t, "image", d.Rootfs.Type)
+	require.Equal(t, "yr-docker-runtime:v0", d.Rootfs.ImageURL)
+	require.Len(t, d.Rootfs.Mounts, 1)
+	require.Equal(t, "/data", d.Rootfs.Mounts[0].Source)
+	require.False(t, d.Rootfs.Mounts[0].ReadOnly)
+}
+
+func TestGetHandlerReturns404WhenNotFound(t *testing.T) {
+	// Empty summary list ⇒ cache miss (instance not RUNNING or absent).
+	defer stubListGetLookups(t, nil, nil)()
+
+	recorder, ctx := newAgentGetRecorder(t, http.MethodGet, "/api/agent/unknown-id")
+	ctx.Params = gin.Params{{Key: "instanceId", Value: "unknown-id"}}
+	GetHandler(ctx)
+
+	require.Equal(t, http.StatusNotFound, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "instance not found")
 }

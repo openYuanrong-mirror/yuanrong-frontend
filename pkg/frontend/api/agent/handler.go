@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// Package agent provides HTTP handlers for agent instance lifecycle (create/kill).
+// Package agent provides HTTP handlers for agent instance lifecycle (create/kill)
+// and read-only status query (get/list).
 package agent
 
 import (
@@ -42,6 +43,8 @@ import (
 	"frontend/pkg/frontend/common/util"
 	"frontend/pkg/frontend/functionmeta"
 	"frontend/pkg/frontend/instancemanager"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
+	"frontend/pkg/frontend/sandboxrouter/route"
 	"frontend/pkg/frontend/schedulerproxy"
 )
 
@@ -662,4 +665,209 @@ func isSafeBindSource(path string) bool {
 		return false
 	}
 	return true
+}
+
+// --- instance status query (GET /api/agent, GET /api/agent/:instanceId) ---
+
+// Package-level indirections so tests can stub the execendpoint cache and IP extraction.
+var (
+	lookupAgentInstanceSummaries = func(tenantID, instanceID string) []execendpoint.Summary {
+		return execendpoint.Default().ListSummaries(tenantID, instanceID)
+	}
+	lookupAgentInstanceEndpoint = func(instanceID string) (execendpoint.Endpoint, bool) {
+		return execendpoint.Default().Get(instanceID)
+	}
+	extractNodeIP = func(proxyGrpcAddress string) string { return route.ExtractIP(proxyGrpcAddress) }
+)
+
+// InstanceBrief is the minimal List output: identity + addresses only.
+type InstanceBrief struct {
+	InstanceID  string `json:"instance_id"`
+	NodeIP      string `json:"node_ip,omitempty"`
+	SandboxIP   string `json:"sandbox_ip,omitempty"`
+	SandboxType string `json:"sandbox_type,omitempty"`
+}
+
+// InstanceDetail is the verbose Get output: brief fields plus create configuration from createOptions.
+type InstanceDetail struct {
+	InstanceID  string `json:"instance_id"`
+	NodeIP      string `json:"node_ip,omitempty"`
+	SandboxIP   string `json:"sandbox_ip,omitempty"`
+	SandboxType string `json:"sandbox_type,omitempty"`
+	SandboxID   string `json:"sandbox_id,omitempty"`
+	Rootfs      *RootfsInfo `json:"rootfs,omitempty"`
+	HostUser    string      `json:"host_user,omitempty"`
+	Ports       []string    `json:"ports,omitempty"`
+	EnvVars     map[string]string `json:"env_vars,omitempty"`
+	Resources   map[string]float64 `json:"resources,omitempty"`
+	StartTime   string `json:"start_time,omitempty"`
+}
+
+// RootfsInfo mirrors createOptions["rootfs"] (image identity + nested bind mounts).
+type RootfsInfo struct {
+	Type     string      `json:"type,omitempty"`
+	ImageURL string      `json:"imageurl,omitempty"`
+	Mounts   []MountInfo `json:"mounts,omitempty"`
+}
+
+// MountInfo is one bind mount from rootfs.mounts.
+type MountInfo struct {
+	Source   string `json:"source,omitempty"`
+	Target   string `json:"target,omitempty"`
+	ReadOnly bool   `json:"readonly,omitempty"`
+}
+
+// rootfsJSON mirrors the subset of createOptions["rootfs"] Get needs.
+type rootfsJSON struct {
+	Type     string             `json:"type"`
+	ImageURL string             `json:"imageurl"`
+	Mounts   []json.RawMessage  `json:"mounts"`
+}
+
+// networkJSON mirrors createOptions["network"] (built by applyAgentPorts).
+type networkJSON struct {
+	PortForwardings []struct {
+		Port     int    `json:"port"`
+		Protocol string `json:"protocol"`
+	} `json:"portForwardings"`
+}
+
+// ListHandler handles GET /api/agent: returns the brief view of every cached (RUNNING) instance.
+func ListHandler(ctx *gin.Context) {
+	summaries := lookupAgentInstanceSummaries("", "")
+	instances := make([]InstanceBrief, 0, len(summaries))
+	for _, s := range summaries {
+		// Skip system drivers (driver-frontend/driver-scheduler, etc.): they register in
+		// the instance cache without a sandbox_type, so they are not user agent instances.
+		if s.SandboxType == "" {
+			continue
+		}
+		b := InstanceBrief{InstanceID: s.InstanceID, SandboxType: s.SandboxType}
+		if ep, ok := lookupAgentInstanceEndpoint(s.InstanceID); ok {
+			b.NodeIP = extractNodeIP(ep.ProxyGrpcAddress)
+		}
+		b.SandboxIP = resolveSandboxIP(s.ContainerIP, s.SandboxType, b.NodeIP)
+		instances = append(instances, b)
+	}
+	ctx.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "instances": instances})
+}
+
+// GetHandler handles GET /api/agent/:instanceId: returns the detailed view of one instance.
+// GET /api/agent (no path segment) routes to ListHandler, so :instanceId is never empty here.
+func GetHandler(ctx *gin.Context) {
+	instanceID := ctx.Param("instanceId")
+	summaries := lookupAgentInstanceSummaries("", instanceID)
+	if len(summaries) == 0 {
+		ctx.JSON(http.StatusNotFound, gin.H{"code": http.StatusNotFound,
+			"message": "instance not found or not running"})
+		return
+	}
+	s := summaries[0]
+	d := InstanceDetail{
+		InstanceID:  s.InstanceID,
+		SandboxType: s.SandboxType,
+		SandboxID:   s.ContainerID,
+		Resources:   flattenResources(s.Resources),
+		StartTime:   s.StartTime,
+	}
+	if ep, ok := lookupAgentInstanceEndpoint(instanceID); ok {
+		d.NodeIP = extractNodeIP(ep.ProxyGrpcAddress)
+	}
+	d.SandboxIP = resolveSandboxIP(s.ContainerIP, s.SandboxType, d.NodeIP)
+	applyDetailCreateOptions(&d, s.CreateOptions)
+	ctx.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "instance": d})
+}
+
+// resolveSandboxIP returns the container/sandbox internal IP. docker's comes from
+// etcd ContainerIP (inspect); supervisor is host-networked, so it falls back to nodeIP.
+func resolveSandboxIP(containerIP, sandboxType, nodeIP string) string {
+	if containerIP != "" {
+		return containerIP
+	}
+	if sandboxType == "supervisor" {
+		return nodeIP
+	}
+	return ""
+}
+
+// flattenResources collapses the scalar-resource map (e.g. {"CPU":{"scalar":{"value":600,"limit":0}}})
+// to {"CPU":600}, exposing only the scalar value. limit is dropped.
+func flattenResources(in map[string]execendpoint.Resource) map[string]float64 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(in))
+	for name, r := range in {
+		out[name] = r.Scalar.Value
+	}
+	return out
+}
+
+// applyDetailCreateOptions parses rootfs/host_user/network/env_vars from createOptions into the detail.
+// Malformed JSON is logged and skipped so a bad value never blanks the whole response.
+func applyDetailCreateOptions(d *InstanceDetail, opts map[string]string) {
+	if len(opts) == 0 {
+		return
+	}
+	d.HostUser = opts["host_user"]
+	d.Rootfs = parseRootfs(opts["rootfs"], d.InstanceID)
+	d.Ports = parsePorts(opts["network"])
+	d.EnvVars = parseEnvVars(opts["DELEGATE_ENV_VAR"])
+}
+
+// parseRootfs decodes createOptions["rootfs"] into RootfsInfo, tolerating per-mount
+// JSON errors by skipping the bad mount. Returns nil when the field is empty or invalid.
+func parseRootfs(rootfsStr, instanceID string) *RootfsInfo {
+	if rootfsStr == "" {
+		return nil
+	}
+	var rf rootfsJSON
+	if err := json.Unmarshal([]byte(rootfsStr), &rf); err != nil {
+		log.GetLogger().Warnf("agent get: failed to unmarshal rootfs for %s: %v", instanceID, err)
+		return nil
+	}
+	info := &RootfsInfo{Type: rf.Type, ImageURL: rf.ImageURL}
+	info.Mounts = make([]MountInfo, 0, len(rf.Mounts))
+	for _, raw := range rf.Mounts {
+		var m MountInfo
+		if err := json.Unmarshal(raw, &m); err == nil {
+			info.Mounts = append(info.Mounts, m)
+		}
+	}
+	if info.Type != "" || info.ImageURL != "" || len(info.Mounts) > 0 {
+		return info
+	}
+	return nil
+}
+
+// parsePorts decodes createOptions["network"] into the list of port labels (e.g. "tcp:22").
+func parsePorts(networkStr string) []string {
+	if networkStr == "" {
+		return nil
+	}
+	var netCfg networkJSON
+	if err := json.Unmarshal([]byte(networkStr), &netCfg); err != nil {
+		return nil
+	}
+	ports := make([]string, 0, len(netCfg.PortForwardings))
+	for _, pf := range netCfg.PortForwardings {
+		label := strconv.Itoa(pf.Port)
+		if pf.Protocol != "" {
+			label = strings.ToLower(pf.Protocol) + ":" + label
+		}
+		ports = append(ports, label)
+	}
+	return ports
+}
+
+// parseEnvVars decodes createOptions["DELEGATE_ENV_VAR"] (a JSON object) into the env map.
+func parseEnvVars(envStr string) map[string]string {
+	if envStr == "" {
+		return nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(envStr), &env); err == nil && len(env) > 0 {
+		return env
+	}
+	return nil
 }
