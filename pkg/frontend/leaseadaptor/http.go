@@ -248,18 +248,23 @@ func QuerySession(funcKey, sessionID, traceID string) (*types.InstanceAllocation
 
 // 不用关心是否成功
 func (ip *LeasePool) doReleaseInvoke(funcKey string, leaseId string, option *types.AcquireOption,
-	report *InstanceReport) {
+	report *InstanceReport, schedulerInstanceID string) {
 	logger := log.GetLogger().With(zap.Any("leaseId", leaseId), zap.Any("ringName", option.RingName))
 	args, err := createReleaseArgs(leaseId, option, report)
 	if err != nil {
 		logger.Warnf("create release args failed, abort release, err: %s", err.Error())
 		return
 	}
-	schedulerInfo, err := getProxyManagerByRing(option.RingName).Get(funcKey, logger)
+	schedulerInfo, _, err := resolveLeaseScheduler(funcKey, option, schedulerInstanceID, logger)
 	if err != nil {
 		logger.Errorf("can not get scheduler, err: %s", err.Error())
 		return
 	}
+	if schedulerInfo == nil || schedulerInfo.InstanceInfo == nil {
+		logger.Errorf("scheduler info is empty")
+		return
+	}
+	logger.Infof("release lease through scheduler %s", schedulerInfo.InstanceInfo.InstanceID)
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 	resp := fasthttp.AcquireResponse()

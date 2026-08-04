@@ -45,6 +45,21 @@ func TestGetAccessFaaSSchedulerType(t *testing.T) {
 	})
 }
 
+func TestIsLiteSchedulerEnabled(t *testing.T) {
+	t.Setenv(LiteSchedulerEnableEnv, "true")
+	if !IsLiteSchedulerEnabled() {
+		t.Fatal("expected LiteScheduler to be enabled")
+	}
+	t.Setenv(LiteSchedulerEnableEnv, "false")
+	if IsLiteSchedulerEnabled() {
+		t.Fatal("expected LiteScheduler to be disabled")
+	}
+	t.Setenv(LiteSchedulerEnableEnv, "invalid")
+	if IsLiteSchedulerEnabled() {
+		t.Fatal("expected an invalid value to preserve the disabled default")
+	}
+}
+
 func TestLoadAccessFaaSSchedulerType(t *testing.T) {
 	Convey("Given valid config file", t, func() {
 		tempFile, err := os.CreateTemp("", "test-config-*.json")

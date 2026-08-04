@@ -28,6 +28,7 @@ import (
 	"frontend/pkg/common/faas_common/loadbalance"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
+	"frontend/pkg/frontend/upgradecompatible"
 )
 
 func mockSchedulerNodeInfo(instanceName, instanceId string, updateTime time.Time) *SchedulerNodeInfo {
@@ -210,4 +211,55 @@ func Test_schedulerProxy_GetWithoutUnexpectedSchedulerInfos(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestAcquireOwnerKey(t *testing.T) {
+	t.Setenv(upgradecompatible.LiteSchedulerEnableEnv, "true")
+	funcKey := "tenant/function/version"
+	tests := []struct {
+		name     string
+		option   *types.AcquireOption
+		expected string
+	}{
+		{name: "function owner", option: &types.AcquireOption{}, expected: funcKey},
+		{
+			name: "instance session owner",
+			option: &types.AcquireOption{InstanceSession: &types.InstanceSessionConfig{
+				SessionID: "instance-session",
+			}},
+			expected: "tenant/instance-session",
+		},
+		{
+			name: "session context takes precedence",
+			option: &types.AcquireOption{
+				EnableSessionCtx: true,
+				SessionCtxID:     "session-context",
+				InstanceSession: &types.InstanceSessionConfig{
+					SessionID: "instance-session",
+				},
+			},
+			expected: "tenant/tenant/function/version/session-context",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if actual := acquireOwnerKey(funcKey, test.option); actual != test.expected {
+				t.Fatalf("unexpected owner key: got %q, want %q", actual, test.expected)
+			}
+		})
+	}
+}
+
+func TestAcquireOwnerKeyUsesFunctionOwnerWhenLiteSchedulerDisabled(t *testing.T) {
+	t.Setenv(upgradecompatible.LiteSchedulerEnableEnv, "false")
+	funcKey := "tenant/function/version"
+	option := &types.AcquireOption{
+		EnableSessionCtx: true,
+		SessionCtxID:     "session-context",
+		InstanceSession:  &types.InstanceSessionConfig{SessionID: "instance-session"},
+	}
+	if actual := acquireOwnerKey(funcKey, option); actual != funcKey {
+		t.Fatalf("unexpected owner key: got %q, want %q", actual, funcKey)
+	}
 }

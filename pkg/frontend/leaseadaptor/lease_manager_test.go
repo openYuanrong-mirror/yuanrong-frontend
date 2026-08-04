@@ -598,6 +598,7 @@ func Test_AcquireRepeatedLease(t *testing.T) {
 		schedulerproxy.Proxy.Add(&schedulerproxy.SchedulerNodeInfo{InstanceInfo: &commType.InstanceInfo{
 			FunctionName: "test-scheduler",
 			InstanceName: "test-schedulerID",
+			InstanceID:   "test-scheduler-instance-id",
 			Address:      "127.0.0.1",
 		}}, log.GetLogger())
 		resp := &commType.InstanceResponse{
@@ -639,6 +640,7 @@ func Test_AcquireRepeatedLease(t *testing.T) {
 			lease, err := leasePool.acquireInstanceLease(op)
 			convey.So(err, convey.ShouldBeNil)
 			convey.So(lease.ThreadID, convey.ShouldEqual, "lease1-1")
+			convey.So(lease.schedulerInstanceId, convey.ShouldEqual, "test-scheduler-instance-id")
 			convey.So(len(leasePool.leaseMap), convey.ShouldEqual, 1)
 			convey.So(leasePool.idleLeaseList.Len(), convey.ShouldEqual, 0)
 		})
@@ -669,7 +671,8 @@ func Test_AcquireRepeatedLease(t *testing.T) {
 
 		convey.Convey("acquireResponseErr not nil", func() {
 			convey.Convey("case 1: all scheduler unavailable", func() {
-				defer gomonkey.ApplyMethodReturn(schedulerproxy.Proxy, "GetWithoutUnexpectedSchedulerInfos",
+				defer gomonkey.ApplyMethodReturn(schedulerproxy.Proxy,
+					"GetWithoutUnexpectedSchedulerInfosByAcquireOption",
 					nil, errors.New(constant.AllSchedulerUnavailableErrorMessage)).Reset()
 				lease, err := leasePool.acquireInstanceLease(op)
 				convey.So(lease, convey.ShouldBeNil)
@@ -679,7 +682,8 @@ func Test_AcquireRepeatedLease(t *testing.T) {
 			})
 
 			convey.Convey("other errors", func() {
-				defer gomonkey.ApplyMethodReturn(schedulerproxy.Proxy, "GetWithoutUnexpectedSchedulerInfos",
+				defer gomonkey.ApplyMethodReturn(schedulerproxy.Proxy,
+					"GetWithoutUnexpectedSchedulerInfosByAcquireOption",
 					nil, errors.New("test error")).Reset()
 				lease, err := leasePool.acquireInstanceLease(op)
 				convey.So(lease, convey.ShouldBeNil)
@@ -735,7 +739,7 @@ func TestInstanceLeasePool_handleLeaseLifeCycle(t *testing.T) {
 			})
 			defer patch.Reset()
 			patch.ApplyFunc((*LeasePool).doReleaseInvoke, func(_ *LeasePool, funcKey string, leaseId string,
-				option *commType.AcquireOption, report *InstanceReport) {
+				option *commType.AcquireOption, report *InstanceReport, schedulerInstanceID string) {
 				return
 			})
 			defer patch.Reset()
@@ -819,7 +823,7 @@ func TestInstanceLeasePool_handleLeaseLifeCycle(t *testing.T) {
 			})
 			defer patch.Reset()
 			patch.ApplyFunc((*LeasePool).doReleaseInvoke, func(_ *LeasePool, funcKey string, leaseId string,
-				option *commType.AcquireOption, report *InstanceReport) {
+				option *commType.AcquireOption, report *InstanceReport, schedulerInstanceID string) {
 				return
 			})
 			defer patch.Reset()
@@ -983,6 +987,49 @@ func TestFuncKeyLeasePools_ProcessBatchResponse(t *testing.T) {
 			convey.So(ilps.interval.Load(), convey.ShouldEqual,
 				int64(defaultRetainLeaseTime*time.Millisecond))
 		})
+	})
+}
+
+func TestGetPoolKeySessionContext(t *testing.T) {
+	convey.Convey("session context isolates lease pools only when enabled", t, func() {
+		base := &commType.AcquireOption{
+			ResourceSpecs: map[string]int64{"cpu": 500},
+			SessionCtxID:  "ctx-a",
+		}
+		other := *base
+		other.SessionCtxID = "ctx-b"
+
+		convey.So(getPoolKey("func-key", base), convey.ShouldEqual, getPoolKey("func-key", &other))
+
+		base.EnableSessionCtx = true
+		other.EnableSessionCtx = true
+		convey.So(getPoolKey("func-key", base), convey.ShouldNotEqual, getPoolKey("func-key", &other))
+	})
+}
+
+func TestGetSchedulerNodeInfoPersistsRecalculatedScheduler(t *testing.T) {
+	convey.Convey("fallback owner is persisted on the lease", t, func() {
+		defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "GetSchedulerByInstanceId",
+			func(_ string) *schedulerproxy.SchedulerNodeInfo { return nil }).Reset()
+		owner := &schedulerproxy.SchedulerNodeInfo{InstanceInfo: &commType.InstanceInfo{
+			InstanceID: "new-owner",
+		}}
+		defer gomonkey.ApplyMethodReturn(
+			schedulerproxy.Proxy, "GetByAcquireOption", owner, nil).Reset()
+
+		lease := &InstanceLease{
+			InstanceAllocationInfo: &commType.InstanceAllocationInfo{
+				FuncKey:  "test-func",
+				ThreadID: "lease-1",
+			},
+			acquireOption:       &commType.AcquireOption{},
+			schedulerInstanceId: "gone-owner",
+		}
+
+		info := (&FuncKeyLeasePools{}).getSchedulerNodeInfo(lease)
+
+		convey.So(info, convey.ShouldNotBeNil)
+		convey.So(lease.schedulerInstanceId, convey.ShouldEqual, "new-owner")
 	})
 }
 

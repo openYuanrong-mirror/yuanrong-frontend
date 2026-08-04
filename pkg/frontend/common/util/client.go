@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"reflect"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
@@ -404,17 +403,8 @@ func convertCommonInvokeOption(req InvokeRequest) api.InvokeOptions {
 		}
 	}
 	invokeOpt.IsInterrupted = req.IsInterrupted
-	setInvokeOptionSessionCtxID(&invokeOpt, req.SessionCtxID)
+	invokeOpt.SessionCtxID = req.SessionCtxID
 	return invokeOpt
-}
-
-// setInvokeOptionSessionCtxID keeps Frontend compatible with runtime API
-// closures from before SessionCtxID was added to api.InvokeOptions.
-func setInvokeOptionSessionCtxID(invokeOpt *api.InvokeOptions, sessionCtxID string) {
-	field := reflect.ValueOf(invokeOpt).Elem().FieldByName("SessionCtxID")
-	if field.IsValid() && field.CanSet() {
-		field.SetString(sessionCtxID)
-	}
 }
 
 func convertAcquireOption(req types.AcquireOption) api.InvokeOptions {
@@ -435,8 +425,8 @@ func convertAcquireOption(req types.AcquireOption) api.InvokeOptions {
 		Timeout:              int(req.Timeout),
 		AcquireTimeout:       int(req.Timeout),
 		TrafficLimited:       req.TrafficLimited,
+		SessionCtxID:         req.SessionCtxID,
 	}
-	setInvokeOptionSessionCtxID(&invokeOpt, req.SessionCtxID)
 	return invokeOpt
 }
 

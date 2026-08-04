@@ -363,6 +363,7 @@ func Test_convertCommonInvokeOption(t *testing.T) {
 				InvokeTimeout: 60,
 				AcceptHeader:  httpconstant.AcceptEventStream,
 				IsInterrupted: true,
+				SessionCtxID:  "session-context",
 			}
 			res := convertCommonInvokeOption(req)
 			So(res.TraceID, ShouldNotBeEmpty)
@@ -372,6 +373,7 @@ func Test_convertCommonInvokeOption(t *testing.T) {
 			So(res.CustomExtensions["tagKey"], ShouldEqual, "tagValue")
 			So(res.CustomExtensions[traceParentExtensionKey], ShouldEqual, req.TraceParent)
 			So(res.IsInterrupted, ShouldBeTrue)
+			So(res.SessionCtxID, ShouldEqual, req.SessionCtxID)
 		})
 
 		Convey("check route address option", func() {
@@ -393,11 +395,13 @@ func TestConvertAcquireOption(t *testing.T) {
 			SchedulerID:   "scheduler-id",
 			ResourceSpecs: map[string]int64{"cpu": 1},
 			Timeout:       60,
+			SessionCtxID:  "session-context",
 		}
 
 		res := convertAcquireOption(req)
 		So(res.TraceID, ShouldEqual, req.TraceID)
 		So(res.CustomExtensions, ShouldNotBeNil)
 		So(res.CustomExtensions[traceParentExtensionKey], ShouldEqual, req.TraceParent)
+		So(res.SessionCtxID, ShouldEqual, req.SessionCtxID)
 	})
 }

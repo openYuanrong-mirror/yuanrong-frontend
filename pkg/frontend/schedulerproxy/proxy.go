@@ -29,6 +29,7 @@ import (
 	"frontend/pkg/common/faas_common/loadbalance"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/instancemanager"
+	"frontend/pkg/frontend/upgradecompatible"
 )
 
 const (
@@ -149,24 +150,36 @@ func (im *ProxyManager) Get(funcKey string, logger api.FormatLogger) (*Scheduler
 	return im.getSchedulerByHashKey(funcKey, logger)
 }
 
-// GetWithSessionContext selects the same owner key used by LiteScheduler:
-// tenantID + "/" + (funcKey + "/" + sessionCtxID).
-func (im *ProxyManager) GetWithSessionContext(funcKey, sessionCtxID string,
+// GetByAcquireOption selects an owner with the same routing precedence as LiteScheduler:
+// SessionContext, InstanceSession, then function owner.
+func (im *ProxyManager) GetByAcquireOption(funcKey string, option *types.AcquireOption,
 	logger api.FormatLogger) (*SchedulerNodeInfo, error) {
-	return im.getSchedulerByHashKey(sessionContextOwnerKey(funcKey, sessionCtxID), logger)
+	return im.getSchedulerByHashKey(acquireOwnerKey(funcKey, option), logger)
 }
 
-// GetWithoutUnexpectedSchedulerInfosWithSessionContext is the retry variant of
-// GetWithSessionContext.
-func (im *ProxyManager) GetWithoutUnexpectedSchedulerInfosWithSessionContext(funcKey, sessionCtxID string,
-	unexpected []*SchedulerNodeInfo, logger api.FormatLogger) (*SchedulerNodeInfo, error) {
-	return im.getWithoutUnexpectedSchedulerInfosByKey(
-		sessionContextOwnerKey(funcKey, sessionCtxID), unexpected, logger)
+// GetWithoutUnexpectedSchedulerInfosByAcquireOption is the retry variant of GetByAcquireOption.
+func (im *ProxyManager) GetWithoutUnexpectedSchedulerInfosByAcquireOption(funcKey string,
+	option *types.AcquireOption, unexpected []*SchedulerNodeInfo, logger api.FormatLogger) (*SchedulerNodeInfo, error) {
+	return im.getWithoutUnexpectedSchedulerInfosByKey(acquireOwnerKey(funcKey, option), unexpected, logger)
 }
 
 func sessionContextOwnerKey(funcKey, sessionCtxID string) string {
 	tenantID := strings.SplitN(funcKey, constant.KeySeparator, 2)[0]
 	return tenantID + constant.KeySeparator + funcKey + constant.KeySeparator + sessionCtxID
+}
+
+func acquireOwnerKey(funcKey string, option *types.AcquireOption) string {
+	if !upgradecompatible.IsLiteSchedulerEnabled() || option == nil {
+		return funcKey
+	}
+	if option.EnableSessionCtx && option.SessionCtxID != "" {
+		return sessionContextOwnerKey(funcKey, option.SessionCtxID)
+	}
+	if option.InstanceSession != nil && option.InstanceSession.SessionID != "" {
+		tenantID := strings.SplitN(funcKey, constant.KeySeparator, 2)[0]
+		return tenantID + constant.KeySeparator + option.InstanceSession.SessionID
+	}
+	return funcKey
 }
 
 func (im *ProxyManager) getSchedulerByHashKey(hashKey string, logger api.FormatLogger) (*SchedulerNodeInfo, error) {
@@ -305,6 +318,9 @@ func (im *ProxyManager) IsEmpty() bool {
 
 // GetSchedulerByInstanceId -
 func (im *ProxyManager) GetSchedulerByInstanceId(instanceId string) *SchedulerNodeInfo {
+	if instanceId == "" {
+		return nil
+	}
 	var instanceInfo *SchedulerNodeInfo
 	im.faasSchedulers.Range(func(k, v any) bool {
 		schedulerNodeInfo, ok := v.(*SchedulerNodeInfo)

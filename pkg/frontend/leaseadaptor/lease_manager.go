@@ -216,9 +216,6 @@ func getMapStr(m map[string]any) string {
 }
 
 func getPoolKey(funckey string, option *commontypes.AcquireOption) string {
-	poolKey := funckey
-	poolKey += "|"
-
 	splits := make([]string, 0)
 	splits = append(splits, funckey)
 	m := make(map[string]any, len(option.ResourceSpecs))
@@ -238,6 +235,11 @@ func getPoolKey(funckey string, option *commontypes.AcquireOption) string {
 		sessionStr = option.InstanceSession.ToString()
 	}
 	splits = append(splits, sessionStr)
+	sessionCtxID := ""
+	if option.EnableSessionCtx {
+		sessionCtxID = option.SessionCtxID
+	}
+	splits = append(splits, sessionCtxID)
 	splits = append(splits, option.RingName)
 	return strings.Join(splits, "|")
 }
@@ -331,17 +333,43 @@ func (flps *FuncKeyLeasePools) clearEmptyLeasePool() {
 	flps.Unlock()
 }
 
+func resolveLeaseScheduler(funcKey string, option *commontypes.AcquireOption, schedulerID string,
+	logger api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, bool, error) {
+	proxyManager := getProxyManagerByRing(option.RingName)
+	schedulerInfo := proxyManager.GetSchedulerByInstanceId(schedulerID)
+	if schedulerInfo != nil {
+		return schedulerInfo, false, nil
+	}
+	logger.Infof("recorded scheduler %s unavailable, recalculate owner", schedulerID)
+	schedulerInfo, err := proxyManager.GetByAcquireOption(funcKey, option, logger)
+	return schedulerInfo, true, err
+}
+
 func (flps *FuncKeyLeasePools) getSchedulerNodeInfo(lease *InstanceLease) *schedulerproxy.SchedulerNodeInfo {
-	schedulerId := lease.schedulerInstanceId
-	schedulerInfo := getProxyManagerByRing(lease.ringName).GetSchedulerByInstanceId(schedulerId)
-	logger := log.GetLogger().With(zap.Any("leaseId", lease.ThreadID), zap.Any("ringName", lease.ringName))
-	if schedulerInfo == nil {
-		var err error
-		schedulerInfo, err = getProxyManagerByRing(lease.ringName).Get(lease.FuncKey, logger)
-		if err != nil {
-			logger.Warnf("can not get scheduler")
-			return nil
+	lease.RLock()
+	funcKey := lease.FuncKey
+	option := lease.acquireOption
+	schedulerID := lease.schedulerInstanceId
+	leaseID := lease.ThreadID
+	ringName := lease.ringName
+	lease.RUnlock()
+
+	logger := log.GetLogger().With(zap.Any("leaseId", leaseID), zap.Any("ringName", ringName))
+	schedulerInfo, recalculated, err := resolveLeaseScheduler(funcKey, option, schedulerID, logger)
+	if err != nil {
+		logger.Warnf("can not get scheduler")
+		return nil
+	}
+	if schedulerInfo == nil || schedulerInfo.InstanceInfo == nil {
+		logger.Warnf("scheduler info is empty")
+		return nil
+	}
+	if recalculated {
+		lease.Lock()
+		if lease.schedulerInstanceId == schedulerID {
+			lease.schedulerInstanceId = schedulerInfo.InstanceInfo.InstanceID
 		}
+		lease.Unlock()
 	}
 	return schedulerInfo
 }
@@ -486,14 +514,16 @@ func (flps *FuncKeyLeasePools) assembleRetainBatches(
 	for _, snap := range snapshots {
 		lease := snap.lease
 		lease.RLock()
+		ringName := lease.ringName
+		lease.RUnlock()
 		logger := log.GetLogger().With(zap.Any("batchRetain", true), zap.Any("leaseId", snap.leaseId),
-			zap.Any("ringName", lease.ringName))
+			zap.Any("ringName", ringName))
 		schedulerInfo := flps.getSchedulerNodeInfo(lease)
 		if schedulerInfo == nil {
-			lease.RUnlock()
 			continue
 		}
 		logger = logger.With(zap.Any("scheduler", schedulerInfo.InstanceInfo.InstanceName))
+		lease.RLock()
 		info := assembleBatchRetainLeaseInfo(flps.funcKey, snap.pool, lease, logger)
 		lease.RUnlock()
 		appendRetainInfo(funcKeyAllBatches, schedulerInfo.InstanceInfo.InstanceID,
@@ -754,22 +784,18 @@ func (ip *LeasePool) acquireHandler(funcKey string, option *commontypes.AcquireO
 	hashRetry := true
 	var acquireResponse *commontypes.InstanceResponse
 	var acquireResponseErr error
+	var schedulerInstanceID string
 	acquireDependOnHash := func() error {
 		var schedulerNodeInfo *schedulerproxy.SchedulerNodeInfo
 		var getSchedulerNodeInfoErr error
-		if option.EnableSessionCtx && option.SessionCtxID != "" {
-			schedulerNodeInfo, getSchedulerNodeInfoErr = getProxyManagerByRing(
-				option.RingName).GetWithoutUnexpectedSchedulerInfosWithSessionContext(
-				funcKey, option.SessionCtxID, unavailableSchedulerNodeInfos, logger)
-		} else {
-			schedulerNodeInfo, getSchedulerNodeInfoErr = getProxyManagerByRing(
-				option.RingName).GetWithoutUnexpectedSchedulerInfos(
-				funcKey, unavailableSchedulerNodeInfos, logger)
-		}
+		schedulerNodeInfo, getSchedulerNodeInfoErr = getProxyManagerByRing(
+			option.RingName).GetWithoutUnexpectedSchedulerInfosByAcquireOption(
+			funcKey, option, unavailableSchedulerNodeInfos, logger)
 		if getSchedulerNodeInfoErr != nil {
 			hashRetry = false
 			return getSchedulerNodeInfoErr
 		}
+		schedulerInstanceID = schedulerNodeInfo.InstanceInfo.InstanceID
 		acquireResponse, acquireResponseErr = doAcquireInvoke(option, schedulerNodeInfo.InstanceInfo.Address, funcKey,
 			option.Timeout)
 		if acquireResponseErr != nil {
@@ -780,8 +806,10 @@ func (ip *LeasePool) acquireHandler(funcKey string, option *commontypes.AcquireO
 			return acquireResponseErr
 		}
 		if acquireResponse != nil && acquireResponse.ErrorCode == statuscode.AcquireNonOwnerSchedulerErrorCode {
+			schedulerInstanceID = acquireResponse.ErrorMessage
 			acquireResponse, getSchedulerNodeInfoErr = ip.acquireWithSameSchedulerIdRetry(funcKey, option,
-				acquireResponse.ErrorMessage)
+				schedulerInstanceID)
+			acquireResponseErr = getSchedulerNodeInfoErr
 		}
 		return acquireResponseErr
 	}
@@ -804,6 +832,7 @@ func (ip *LeasePool) acquireHandler(funcKey string, option *commontypes.AcquireO
 		return nil, snerror.New(acquireResponse.ErrorCode, acquireResponse.ErrorMessage)
 	}
 	lease := newInstanceLease(&acquireResponse.InstanceAllocationInfo, option)
+	lease.schedulerInstanceId = schedulerInstanceID
 	return lease, nil
 }
 
@@ -885,7 +914,8 @@ func (ip *LeasePool) handleLeaseExpiredLoop(lease *InstanceLease) {
 		}
 		if release {
 			ip.removeLease(lease.ThreadID)
-			ip.doReleaseInvoke(ip.funcKey, lease.ThreadID, lease.acquireOption, lease.report(true))
+			ip.doReleaseInvoke(ip.funcKey, lease.ThreadID, lease.acquireOption, lease.report(true),
+				lease.schedulerInstanceId)
 			logger.Infof("release lease")
 			return
 		}
