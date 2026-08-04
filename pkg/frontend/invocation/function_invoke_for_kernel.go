@@ -168,14 +168,12 @@ func (k *kernelRequestHandler) getProxyManager() *schedulerproxy.ProxyManager {
 func (k *kernelRequestHandler) legacyMakeReq(logger api.FormatLogger) (*util.InvokeRequest, error) {
 	k.legacyCurrentSchedulerInfo = nil
 	if !k.downgrade {
-		var schedulerNodeInfo *schedulerproxy.SchedulerNodeInfo
-		var err error
-		if k.funcSpec.ExtendedMetaData.EnableSessionCtx && k.ctx.SessionCtxID != "" {
-			schedulerNodeInfo, err = k.getProxyManager().GetWithSessionContext(
-				k.funcKey, k.ctx.SessionCtxID, logger)
-		} else {
-			schedulerNodeInfo, err = k.getProxyManager().Get(k.funcKey, logger)
+		option := &commontype.AcquireOption{
+			EnableSessionCtx: k.funcSpec.ExtendedMetaData.EnableSessionCtx,
+			SessionCtxID:     k.ctx.SessionCtxID,
+			InstanceSession:  k.session,
 		}
+		schedulerNodeInfo, err := k.getProxyManager().GetByAcquireOption(k.funcKey, option, logger)
 		if err != nil {
 			logger.Warnf("failed to get scheduler, err: %s", err.Error())
 		} else if schedulerNodeInfo != nil {

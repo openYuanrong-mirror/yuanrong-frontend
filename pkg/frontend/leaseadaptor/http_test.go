@@ -31,6 +31,7 @@ import (
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	commonconstant "frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/tls"
 	commontypes "frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/common/httputil"
@@ -238,25 +239,29 @@ func TestDoAcquireInvoke(t *testing.T) {
 func TestDoReleaseInvoke(t *testing.T) {
 	Convey("Test doReleaseInvoke", t, func() {
 		Convey("Should not panic when scheduler not found", func() {
-			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "Get", func(_ string, _ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
-				return nil, errors.New("not found")
-			}).Reset()
+			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "GetByAcquireOption",
+				func(_ string, _ *commontypes.AcquireOption,
+					_ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
+					return nil, errors.New("not found")
+				}).Reset()
 
 			So(func() {
 				leasePool := LeasePool{}
-				leasePool.doReleaseInvoke("test-func", "lease-123", &commontypes.AcquireOption{}, &InstanceReport{})
+				leasePool.doReleaseInvoke("test-func", "lease-123", &commontypes.AcquireOption{}, &InstanceReport{}, "")
 			}, ShouldNotPanic)
 		})
 
 		Convey("Should call requestScheduler when scheduler exist", func() {
 			called := false
-			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "Get", func(_ string, _ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
-				return &schedulerproxy.SchedulerNodeInfo{
-					InstanceInfo: &commontypes.InstanceInfo{
-						Address: "127.0.0.1",
-					},
-				}, nil
-			}).Reset()
+			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "GetByAcquireOption",
+				func(_ string, _ *commontypes.AcquireOption,
+					_ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
+					return &schedulerproxy.SchedulerNodeInfo{
+						InstanceInfo: &commontypes.InstanceInfo{
+							Address: "127.0.0.1",
+						},
+					}, nil
+				}).Reset()
 
 			defer gomonkey.ApplyFunc(requestScheduler, func(_ *fasthttp.Request, _ *fasthttp.Response, _ int64) error {
 				called = true
@@ -265,35 +270,61 @@ func TestDoReleaseInvoke(t *testing.T) {
 
 			leasePool := LeasePool{}
 
-			leasePool.doReleaseInvoke("test-func", "lease-123", &commontypes.AcquireOption{}, &InstanceReport{})
+			leasePool.doReleaseInvoke("test-func", "lease-123", &commontypes.AcquireOption{}, &InstanceReport{}, "")
 
 			So(called, ShouldBeTrue)
 		})
+
+	})
+}
+
+func TestResolveLeaseSchedulerPrefersRecordedOwner(t *testing.T) {
+	Convey("recorded scheduler bypasses owner recalculation", t, func() {
+		owner := &schedulerproxy.SchedulerNodeInfo{InstanceInfo: &commontypes.InstanceInfo{}}
+		defer gomonkey.ApplyMethodReturn(
+			schedulerproxy.Proxy, "GetSchedulerByInstanceId", owner).Reset()
+		defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "GetByAcquireOption",
+			func(_ string, _ *commontypes.AcquireOption,
+				_ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
+				t.Fatal("unexpected owner recalculation")
+				return nil, nil
+			}).Reset()
+
+		got, recalculated, err := resolveLeaseScheduler(
+			"test-func", &commontypes.AcquireOption{}, "owner", log.GetLogger())
+
+		So(err, ShouldBeNil)
+		So(recalculated, ShouldBeFalse)
+		So(got, ShouldEqual, owner)
 	})
 }
 
 func TestDoBatchRetainInvoke(t *testing.T) {
 	Convey("Test doBatchRetainInvoke", t, func() {
 		Convey("Should not panic when scheduler not found", func() {
-			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "Get", func(_ string, _ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
-				return nil, errors.New("not found")
-			}).Reset()
+			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "GetByAcquireOption",
+				func(_ string, _ *commontypes.AcquireOption,
+					_ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
+					return nil, errors.New("not found")
+				}).Reset()
 
 			So(func() {
 				leasePool := LeasePool{}
-				leasePool.doReleaseInvoke("test-func", "lease-123", &commontypes.AcquireOption{}, &InstanceReport{})
+				leasePool.doReleaseInvoke("test-func", "lease-123", &commontypes.AcquireOption{}, &InstanceReport{}, "")
 			}, ShouldNotPanic)
 		})
 
 		Convey("Should call requestScheduler when scheduler exist", func() {
 			called := false
-			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "Get", func(_ string, _ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
-				return &schedulerproxy.SchedulerNodeInfo{
-					InstanceInfo: &commontypes.InstanceInfo{
-						Address: "127.0.0.1",
-					},
-				}, nil
-			}).Reset()
+			defer gomonkey.ApplyMethodFunc(schedulerproxy.Proxy, "GetByAcquireOption",
+				func(_ string, _ *commontypes.AcquireOption,
+					_ api.FormatLogger) (*schedulerproxy.SchedulerNodeInfo, error) {
+					return &schedulerproxy.SchedulerNodeInfo{
+						InstanceInfo: &commontypes.InstanceInfo{
+							Address: "127.0.0.1",
+						},
+					}, nil
+				}).Reset()
 
 			defer gomonkey.ApplyFunc(requestScheduler, func(_ *fasthttp.Request, _ *fasthttp.Response, _ int64) error {
 				called = true

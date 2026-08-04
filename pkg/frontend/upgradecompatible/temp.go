@@ -20,6 +20,7 @@ package upgradecompatible
 import (
 	"encoding/json"
 	"os"
+	"strconv"
 	"sync"
 
 	"frontend/pkg/common/faas_common/logger/log"
@@ -30,6 +31,8 @@ import (
 const (
 	DefaultAccessSchedulerType  = "frontend"
 	AccessSchedulerByLibruntime = "libruntime"
+	// LiteSchedulerEnableEnv is injected by yr start from values.lite_scheduler.enable.
+	LiteSchedulerEnableEnv = "YR_LITE_SCHEDULER_ENABLE"
 )
 
 var (
@@ -57,6 +60,13 @@ func SetAccessFaaSSchedulerType(accessType string) {
 	lock.Lock()
 	defer lock.Unlock()
 	accessFaaSSchedulerType = accessType
+}
+
+// IsLiteSchedulerEnabled reports whether Frontend should use session-based
+// Scheduler ownership. Invalid and missing values preserve legacy function ownership.
+func IsLiteSchedulerEnabled() bool {
+	enabled, err := strconv.ParseBool(os.Getenv(LiteSchedulerEnableEnv))
+	return err == nil && enabled
 }
 
 func loadAccessFaaSSchedulerType(fileName string, opType monitor.OpType) {
