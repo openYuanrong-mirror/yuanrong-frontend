@@ -52,6 +52,7 @@ import (
 const (
 	agentUserPlaceholder        = "__AGENT_USER__"
 	agentDefaultWorkspaceTarget = "/workspace"
+	agentBootstrapCmdEnv        = "YR_RUNTIME_BOOTSTRAP_CMD"
 )
 
 // agentExecutorFormat is the system executor function funcKey pattern. agent reuses the
@@ -156,6 +157,7 @@ type RuntimeSpec struct {
 	Runtime     string      `json:"runtime,omitempty"`
 	SandboxType string      `json:"sandbox_type,omitempty"`
 	Rootfs      *RootfsSpec `json:"rootfs,omitempty"`
+	Cmds        [][]string  `json:"cmds,omitempty"`
 	CPU         int         `json:"cpu,omitempty"`
 	Memory      int         `json:"memory,omitempty"`
 }
@@ -226,10 +228,10 @@ func CreateHandler(ctx *gin.Context) {
 	createAgentInstance(ctx, req, funcMeta, invokeOpts)
 }
 
-// isInlineMode reports whether req carries inline container config (runtime + rootfs.imageurl).
+// isInlineMode reports whether req carries inline container config (runtime_spec present).
+// imageurl is validated downstream per sandbox type, not here.
 func isInlineMode(req CreateAgentRequest) bool {
-	return req.RuntimeSpec != nil && req.RuntimeSpec.Runtime != "" &&
-		req.RuntimeSpec.Rootfs != nil && req.RuntimeSpec.Rootfs.ImageURL != ""
+	return req.RuntimeSpec != nil && req.RuntimeSpec.Runtime != ""
 }
 
 // buildAgentInvokeOptions builds the invoke options for agent create.
@@ -314,6 +316,9 @@ func applyAgentInlineMeta(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 	if c.SandboxType != "" {
 		invokeOpts.CreateOpt["sandbox_type"] = c.SandboxType
 	}
+	if len(c.Cmds) > 0 {
+		mergeAgentBootstrapCmds(invokeOpts, c.Cmds)
+	}
 	if c.Rootfs == nil {
 		return
 	}
@@ -336,6 +341,37 @@ func applyAgentInlineMeta(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 	if len(c.Rootfs.Ports) > 0 {
 		applyAgentPorts(invokeOpts, c.Rootfs.Ports)
 	}
+}
+
+// mergeAgentBootstrapCmds serializes runtime_spec.cmds (a list of argv arrays) into the
+// YR_RUNTIME_BOOTSTRAP_CMD key inside createOptions["DELEGATE_ENV_VAR"]. The runtime reads
+// this env at startup and fork+execs each argv as a child process. It merges into the
+// existing DELEGATE_ENV_VAR map without clobbering other env vars; a pre-existing
+// YR_RUNTIME_BOOTSTRAP_CMD key (e.g. set explicitly via env_vars) wins and is left untouched.
+func mergeAgentBootstrapCmds(invokeOpts *api.InvokeOptions, cmds [][]string) {
+	cmdsJSON, err := json.Marshal(cmds)
+	if err != nil {
+		log.GetLogger().Warnf("failed to marshal agent cmds: %v", err)
+		return
+	}
+	env := map[string]string{}
+	if existing, ok := invokeOpts.CreateOpt["DELEGATE_ENV_VAR"]; ok && existing != "" {
+		if err := json.Unmarshal([]byte(existing), &env); err != nil {
+			log.GetLogger().Warnf("failed to unmarshal agent DELEGATE_ENV_VAR: %v", err)
+			env = map[string]string{}
+		}
+	}
+	if _, exists := env[agentBootstrapCmdEnv]; exists {
+		log.GetLogger().Warnf("agent %s already set, skip merging runtime_spec.cmds", agentBootstrapCmdEnv)
+		return
+	}
+	env[agentBootstrapCmdEnv] = string(cmdsJSON)
+	merged, err := json.Marshal(env)
+	if err != nil {
+		log.GetLogger().Warnf("failed to marshal agent env with cmds: %v", err)
+		return
+	}
+	invokeOpts.CreateOpt["DELEGATE_ENV_VAR"] = string(merged)
 }
 
 // replaceAgentUserPlaceholder replaces the workspace target placeholder in createOptions["rootfs"]
