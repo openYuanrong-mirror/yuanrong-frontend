@@ -776,11 +776,11 @@ func TestCreateHandlerInlineEmptyUserFallsBackToDefaultTarget(t *testing.T) {
 	CreateHandler(ctx)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
-	// no host_user when User is empty; workspace target falls back to /workspace (not literal __AGENT_USER__).
+	// no host_user when User is empty; workspace target falls back to /home/agentos (not literal __AGENT_USER__).
 	_, hasHostUser := capturedInvokeOpt.CreateOpt["host_user"]
 	require.False(t, hasHostUser)
 	require.NotContains(t, capturedInvokeOpt.CreateOpt["rootfs"], agentUserPlaceholder)
-	require.Contains(t, capturedInvokeOpt.CreateOpt["rootfs"], `"/workspace"`)
+	require.Contains(t, capturedInvokeOpt.CreateOpt["rootfs"], `"/home/agentos"`)
 }
 
 func TestCreateHandlerInlineSinksEnvVars(t *testing.T) {
