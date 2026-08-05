@@ -51,6 +51,7 @@ type instanceExecInfo struct {
 	FunctionProxyID  string            `json:"functionProxyID"`
 	ProxyGrpcAddress string            `json:"proxyGrpcAddress"`
 	ContainerID      string            `json:"containerID"`
+	ContainerIP      string            `json:"containerIP"`
 	Function         string            `json:"function"`
 	StartTime        string            `json:"startTime"`
 	CreateOptions    map[string]string `json:"createOptions"`
@@ -118,6 +119,10 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 		StatusErrCode:  info.InstanceStatus.ErrCode,
 		StartTime:      info.StartTime,
 		Resources:      info.Resources.Resources,
+		ContainerID:    info.ContainerID,
+		ContainerIP:    info.ContainerIP,
+		SandboxType:    info.CreateOptions["sandbox_type"],
+		CreateOptions:  copyStringMap(info.CreateOptions),
 	})
 
 	if info.ProxyGrpcAddress == "" {
@@ -160,4 +165,16 @@ func tenantIDFromKey(key string) string {
 		}
 	}
 	return ""
+}
+
+// copyStringMap returns a shallow copy of m, or nil when empty/nil.
+func copyStringMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }

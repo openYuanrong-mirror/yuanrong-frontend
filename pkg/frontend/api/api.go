@@ -212,11 +212,13 @@ func InitRoute(r *gin.Engine) {
 		sandboxV1Group.POST("/:sandboxID/invoke", sandboxTraceHandler(sandbox.InvokeV1Handler))
 	}
 
-	// agent management (create/kill by user function URN, with workspace/user/userid)
+	// agent management (create/kill/get/list by user function URN, with workspace/user/userid)
 	agentGroup := r.Group("/api/agent")
 	{
 		agentGroup.POST("", agent.CreateHandler)
 		agentGroup.DELETE("/:instanceId", agent.DeleteHandler)
+		agentGroup.GET("", agent.ListHandler)
+		agentGroup.GET("/:instanceId", agent.GetHandler)
 	}
 
 	// web terminal
