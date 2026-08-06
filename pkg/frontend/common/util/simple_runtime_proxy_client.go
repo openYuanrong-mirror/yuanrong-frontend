@@ -66,32 +66,33 @@ var (
 )
 
 const (
-	frontendProxyRouteKey                             = "YR_ROUTE"
-	frontendProxyCreateSourceKey                      = "source"
-	frontendProxyCreateSource                         = "frontend"
-	frontendProxyControlNotWired                      = "control-path-not-wired"
-	simpleRuntimeFaaSMetaPrefix                       = "0000000000000000"
-	defaultFrontendProxyTimeout                       = 60 * time.Second
-	frontendProxyKeepaliveTimeout                     = 10 * time.Second
-	runtimeRequestIDLength                            = 18
-	createReadyCallResultFieldNumber protowire.Number = 4
-	runtimeNotifyRequestIDField      protowire.Number = 1
-	runtimeNotifyCodeField           protowire.Number = 2
-	runtimeNotifyMessageField        protowire.Number = 3
-	runtimeNotifySmallObjectField    protowire.Number = 4
-	runtimeNotifyStackTraceField     protowire.Number = 5
-	runtimeNotifyRuntimeInfoField    protowire.Number = 7
-	runtimeNotifyInstanceIDField     protowire.Number = 8
-	functionMetaAppNameField         protowire.Number = 1
-	functionMetaModuleNameField      protowire.Number = 2
-	functionMetaFunctionNameField    protowire.Number = 3
-	functionMetaClassNameField       protowire.Number = 4
-	functionMetaLanguageField        protowire.Number = 5
-	functionMetaSignatureField       protowire.Number = 7
-	functionMetaAPIField             protowire.Number = 8
-	functionMetaNameField            protowire.Number = 9
-	functionMetaNamespaceField       protowire.Number = 10
-	functionMetaIDField              protowire.Number = 11
+	frontendProxyRouteKey                               = "YR_ROUTE"
+	frontendProxyCreateSourceKey                        = "source"
+	frontendProxyCreateSource                           = "frontend"
+	frontendProxyControlNotWired                        = "control-path-not-wired"
+	simpleRuntimeFaaSMetaPrefix                         = "0000000000000000"
+	defaultFrontendProxyTimeout                         = 60 * time.Second
+	frontendProxyKeepaliveTimeout                       = 10 * time.Second
+	frontendProxyFileTransferChunkSize                  = 4 * 1024 * 1024
+	runtimeRequestIDLength                              = 18
+	createReadyCallResultFieldNumber   protowire.Number = 4
+	runtimeNotifyRequestIDField        protowire.Number = 1
+	runtimeNotifyCodeField             protowire.Number = 2
+	runtimeNotifyMessageField          protowire.Number = 3
+	runtimeNotifySmallObjectField      protowire.Number = 4
+	runtimeNotifyStackTraceField       protowire.Number = 5
+	runtimeNotifyRuntimeInfoField      protowire.Number = 7
+	runtimeNotifyInstanceIDField       protowire.Number = 8
+	functionMetaAppNameField           protowire.Number = 1
+	functionMetaModuleNameField        protowire.Number = 2
+	functionMetaFunctionNameField      protowire.Number = 3
+	functionMetaClassNameField         protowire.Number = 4
+	functionMetaLanguageField          protowire.Number = 5
+	functionMetaSignatureField         protowire.Number = 7
+	functionMetaAPIField               protowire.Number = 8
+	functionMetaNameField              protowire.Number = 9
+	functionMetaNamespaceField         protowire.Number = 10
+	functionMetaIDField                protowire.Number = 11
 )
 
 type grpcFrontendProxyInvokeClient struct {
@@ -387,6 +388,96 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRuntimeR
 	return nil, fmt.Errorf("frontend proxy invoke missing call result")
 }
 
+// UploadFile streams the contents of reader to the owning frontend proxy of
+// instanceID using the client-streaming UploadFile RPC. The reader is chunked
+// at frontendProxyFileTransferChunkSize bytes; the final chunk carries isLast.
+func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instanceID string, path string,
+	reader io.Reader, tenantID string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("frontend proxy grpc client is nil")
+	}
+	if instanceID == "" {
+		return nil, fmt.Errorf("frontend proxy upload file requires non-empty instance id")
+	}
+	if path == "" {
+		return nil, fmt.Errorf("frontend proxy upload file requires non-empty path")
+	}
+	stream, err := c.client.UploadFile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	requestID := newFrontendProxyRuntimeRequestID()
+	chunkBuffer := make([]byte, frontendProxyFileTransferChunkSize)
+	var offset int64
+	for {
+		n, readErr := reader.Read(chunkBuffer)
+		if n > 0 {
+			offset += int64(n)
+			if err := stream.Send(&frontend_proxy.FileChunk{
+				Context: &frontend_proxy.FrontendRequestContext{
+					FrontendClientID: c.frontendClientID,
+					TenantID:         tenantID,
+					RequestID:        requestID,
+				},
+				InstanceID: instanceID,
+				Path:       path,
+				Offset:     offset - int64(n),
+				Data:       chunkBuffer[:n],
+				IsLast:     readErr == io.EOF,
+			}); err != nil {
+				return nil, err
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("frontend proxy upload file read failed: %w", readErr)
+		}
+	}
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("frontend proxy upload file response is nil")
+	}
+	if err := checkFrontendProxyStatus("upload", resp.GetStatus()); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// DownloadFile opens a server-streaming DownloadFile RPC against the owning
+// frontend proxy of instanceID and returns the stream receiver for the caller
+// to iterate. The caller is responsible for reading chunks until io.EOF.
+func (c *grpcFrontendProxyInvokeClient) DownloadFile(ctx context.Context, instanceID string, path string,
+	offset int64, tenantID string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("frontend proxy grpc client is nil")
+	}
+	if instanceID == "" {
+		return nil, fmt.Errorf("frontend proxy download file requires non-empty instance id")
+	}
+	if path == "" {
+		return nil, fmt.Errorf("frontend proxy download file requires non-empty path")
+	}
+	requestID := newFrontendProxyRuntimeRequestID()
+	return c.client.DownloadFile(ctx, &frontend_proxy.FileTransferRequest{
+		Context: &frontend_proxy.FrontendRequestContext{
+			FrontendClientID: c.frontendClientID,
+			TenantID:         tenantID,
+			RequestID:        requestID,
+		},
+		InstanceID: instanceID,
+		Path:       path,
+		Offset:     offset,
+		ChunkSize:  frontendProxyFileTransferChunkSize,
+	})
+}
+
 type frontendProxyRouteResolver interface {
 	ResolveFrontendProxyAddress(req simpleRuntimeInvokeRequest) (string, error)
 }
@@ -598,6 +689,93 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRunti
 		return nil, err
 	}
 	return notify, nil
+}
+
+// resolveFileTransferProxyAddress resolves the owning frontend proxy gRPC
+// address for instanceID. It mirrors the invoke route resolution: the instance
+// watcher cache is preferred, and when the owning proxy is published by node
+// id the proxy_discovery cache (LookupFrontendProxyEndpoint) resolves the
+// concrete host:port. It falls back to the sole published invoke endpoint
+// before failing so single-proxy rollouts keep working.
+func resolveFileTransferProxyAddress(instanceID string) (string, error) {
+	if instanceID == "" {
+		return "", fmt.Errorf("frontend proxy file transfer requires non-empty instance id")
+	}
+	instance := instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID)
+	if instance != nil {
+		if isHostPort(instance.FunctionProxyID) && !frontendProxyAddressIsSuspect(instance.FunctionProxyID) {
+			return instance.FunctionProxyID, nil
+		}
+		if instance.FunctionProxyID != "" {
+			if endpoint, ok := LookupFrontendProxyEndpoint(instance.FunctionProxyID, frontendProxyCapabilityInvoke); ok {
+				return endpoint.Address, nil
+			}
+		}
+		if endpoint, ok := resolveFrontendProxyEndpointByRuntimeHost(instance.RuntimeAddress, frontendProxyCapabilityInvoke); ok {
+			return endpoint.Address, nil
+		}
+	}
+	if endpoint, ok := LookupFrontendProxyEndpoint(instanceID, frontendProxyCapabilityInvoke); ok {
+		return endpoint.Address, nil
+	}
+	if endpoint, ok := resolveSoleFrontendProxyEndpoint(frontendProxyCapabilityInvoke); ok {
+		return endpoint.Address, nil
+	}
+	if instance != nil && isHostPort(instance.ProxyGrpcAddress) {
+		return instance.ProxyGrpcAddress, nil
+	}
+	return "", fmt.Errorf("frontend proxy file transfer route is not configured for instance %s", instanceID)
+}
+
+// UploadFile resolves the owning proxy for instanceID, acquires a pooled gRPC
+// client, and streams reader to the proxy via the client-streaming UploadFile RPC.
+func (c *routingFrontendProxyInvokeClient) UploadFile(ctx context.Context, instanceID string, path string,
+	reader io.Reader, tenantID string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	if c == nil || c.clientFactory == nil {
+		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
+	}
+	address, err := resolveFileTransferProxyAddress(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	serviceClient, err := c.clientFactory.ClientForAddress(address)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, err
+	}
+	resp, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).UploadFile(ctx, instanceID, path, reader, tenantID)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, err
+	}
+	return resp, nil
+}
+
+// DownloadFile resolves the owning proxy for instanceID, acquires a pooled gRPC
+// client, and opens the server-streaming DownloadFile RPC. The caller reads
+// chunks from the returned stream until io.EOF.
+func (c *routingFrontendProxyInvokeClient) DownloadFile(ctx context.Context, instanceID string, path string,
+	offset int64, tenantID string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	if c == nil || c.clientFactory == nil {
+		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
+	}
+	address, err := resolveFileTransferProxyAddress(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	serviceClient, err := c.clientFactory.ClientForAddress(address)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, err
+	}
+	stream, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).DownloadFile(ctx, instanceID, path, offset, tenantID)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, err
+	}
+	return stream, nil
 }
 
 type defaultFrontendProxyRouteResolver struct{}
@@ -1105,6 +1283,30 @@ func frontendProxyBusinessError(operation string, code common.ErrorCode, message
 		code:      code,
 		message:   message,
 	}
+}
+
+// IsFileTransferNotFoundError reports whether err was returned by a file
+// transfer RPC and indicates the instance/path does not exist on the owning
+// proxy. It inspects the gRPC status code (NotFound) and the frontend proxy
+// business/status error envelopes (code ERR_INSTANCE_NOT_FOUND). It is the
+// exported seam that lets the HTTP handler map the failure to 404 without
+// depending on the unexported error types.
+func IsFileTransferNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == codes.NotFound {
+		return true
+	}
+	var businessErr *frontendProxyBusinessErr
+	if errors.As(err, &businessErr) {
+		return businessErr.code == common.ErrorCode_ERR_INSTANCE_NOT_FOUND
+	}
+	var statusErr *frontendProxyStatusErr
+	if errors.As(err, &statusErr) {
+		return statusErr.code == common.ErrorCode_ERR_INSTANCE_NOT_FOUND
+	}
+	return false
 }
 
 func marshalRuntimeNotifyFromCallResult(callResult *core.CallResult) ([]byte, error) {

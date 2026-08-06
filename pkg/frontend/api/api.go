@@ -219,6 +219,9 @@ func InitRoute(r *gin.Engine) {
 		agentGroup.DELETE("/:instanceId", agent.DeleteHandler)
 		agentGroup.GET("", agent.ListHandler)
 		agentGroup.GET("/:instanceId", agent.GetHandler)
+		// agent instance file transfer (upload/download to the owning proxy)
+		agentGroup.POST("/:instanceId/files/upload", agent.FileUploadHandler)
+		agentGroup.GET("/:instanceId/files/download", agent.FileDownloadHandler)
 	}
 
 	// web terminal
