@@ -57,6 +57,7 @@ const (
 	agentUserPlaceholder        = "__AGENT_USER__"
 	agentDefaultWorkspaceTarget = "/home/agentos"
 	agentBootstrapCmdEnv        = "YR_RUNTIME_BOOTSTRAP_CMD"
+	agentSandboxTypeSupervisor  = "supervisor"
 )
 
 // agentExecutorFormat is the system executor function funcKey pattern. agent reuses the
@@ -179,9 +180,11 @@ type RuntimeSpec struct {
 	Memory      int         `json:"memory,omitempty"`
 }
 
-// RootfsSpec carries the inline container rootfs config.
+// RootfsSpec carries the inline container rootfs config. ImageURL is optional here: it is
+// validated per sandbox type in buildAgentInvokeOptions (required unless the sandbox_type is
+// supervisor, which runs without a container image).
 type RootfsSpec struct {
-	ImageURL string   `json:"imageurl" binding:"required"`
+	ImageURL string   `json:"imageurl,omitempty"`
 	User     string   `json:"user,omitempty"`
 	Ports    []string `json:"ports,omitempty"`
 }
@@ -273,6 +276,35 @@ func isInlineMode(req CreateAgentRequest) bool {
 	return req.RuntimeSpec != nil && req.RuntimeSpec.Runtime != ""
 }
 
+// validateRootfsImageURL enforces rootfs.imageurl per sandbox type. imageurl is required for
+// container-based sandboxes (e.g. docker) and optional only when sandbox_type is supervisor,
+// which runs without a container image. Inline mode reads imageurl/sandbox_type from the request;
+// registered mode reads them from the watched funcSpecMap. A missing funcSpec cache entry is
+// tolerated (mirrors applyAgentFuncMeta) — the create call downstream surfaces the failure.
+func validateRootfsImageURL(req CreateAgentRequest, funcKey string, inline bool) error {
+	var imageurl, sandboxType string
+	if inline {
+		if req.RuntimeSpec == nil {
+			return nil
+		}
+		if req.RuntimeSpec.Rootfs != nil {
+			imageurl = req.RuntimeSpec.Rootfs.ImageURL
+		}
+		sandboxType = req.RuntimeSpec.SandboxType
+	} else {
+		spec, ok := functionmeta.LoadFuncSpec(funcKey)
+		if !ok || spec == nil {
+			return nil
+		}
+		imageurl = spec.RootfsSpecMeta.ImageURL
+		sandboxType = spec.SandboxType
+	}
+	if imageurl == "" && !strings.EqualFold(sandboxType, agentSandboxTypeSupervisor) {
+		return fmt.Errorf("rootfs.imageurl is required for sandbox_type %q", sandboxType)
+	}
+	return nil
+}
+
 // buildAgentInvokeOptions builds the invoke options for agent create.
 // inline=true: container config from req; inline=false: from funcSpecMap by funcKey.
 func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest, funcKey string, inline bool,
@@ -292,6 +324,10 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest, funcKey s
 		Timeout:          agentCreateTimeoutSeconds,
 		CreateOpt:        map[string]string{},
 		CustomExtensions: map[string]string{"lifecycle": "detached", "Concurrency": agentConcurrency},
+	}
+
+	if err := validateRootfsImageURL(req, funcKey, inline); err != nil {
+		return api.InvokeOptions{}, err
 	}
 
 	if err := applyAgentRootfsMounts(&invokeOpts, req); err != nil {
@@ -950,7 +986,7 @@ func resolveSandboxIP(containerIP, sandboxType, nodeIP string) string {
 	if containerIP != "" {
 		return containerIP
 	}
-	if sandboxType == "supervisor" {
+	if sandboxType == agentSandboxTypeSupervisor {
 		return nodeIP
 	}
 	return ""

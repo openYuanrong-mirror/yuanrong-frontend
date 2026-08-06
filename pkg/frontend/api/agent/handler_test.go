@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package agent
 
 import (
@@ -781,6 +797,96 @@ func TestCreateHandlerInlineEmptyUserFallsBackToDefaultTarget(t *testing.T) {
 	require.False(t, hasHostUser)
 	require.NotContains(t, capturedInvokeOpt.CreateOpt["rootfs"], agentUserPlaceholder)
 	require.Contains(t, capturedInvokeOpt.CreateOpt["rootfs"], `"/home/agentos"`)
+}
+
+func TestCreateHandlerInlineSupervisorToleratesEmptyImageURL(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "instance-inline-supervisor", nil
+		},
+	})
+
+	req := inlineRootfsReq()
+	req.RuntimeSpec.SandboxType = agentSandboxTypeSupervisor
+	req.RuntimeSpec.Rootfs.ImageURL = "" // supervisor runs without a container image
+	recorder, ctx := newAgentCreateRecorder(t, req)
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	// sandbox_type is sunk as-is; rootfs carries mounts only (no image url).
+	require.Equal(t, agentSandboxTypeSupervisor, capturedInvokeOpt.CreateOpt["sandbox_type"])
+	require.NotContains(t, capturedInvokeOpt.CreateOpt["rootfs"], "imageurl")
+}
+
+func TestCreateHandlerInlineRejectsEmptyImageURLForDocker(t *testing.T) {
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			t.Fatalf("createInstance should not be called when imageurl is empty for non-supervisor sandbox")
+			return "", nil
+		},
+	})
+
+	req := inlineRootfsReq()
+	req.RuntimeSpec.Rootfs.ImageURL = "" // docker requires an image
+	recorder, ctx := newAgentCreateRecorder(t, req)
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "rootfs.imageurl is required")
+}
+
+func TestCreateHandlerRegisteredSupervisorToleratesEmptyImageURL(t *testing.T) {
+	defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(funcKey string) (*types.FuncSpec, bool) {
+		return &types.FuncSpec{
+			FuncMetaData:   types.FuncMetaData{Runtime: "python3.11"},
+			RootfsSpecMeta:  types.RootfsSpecMeta{User: "agentos"}, // imageurl intentionally empty
+			SandboxType:     agentSandboxTypeSupervisor,
+		}, true
+	}).Reset()
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			return "instance-reg-supervisor", nil
+		},
+	})
+
+	recorder, ctx := newAgentCreateRecorder(t, CreateAgentRequest{
+		Namespace: "agent-ns",
+		Name:      "agent-reg-supervisor",
+		Urn:       validAgentURN,
+		Workspace: "/home/snuser/workspaceA",
+	})
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+}
+
+func TestCreateHandlerRegisteredRejectsEmptyImageURLForDocker(t *testing.T) {
+	defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(funcKey string) (*types.FuncSpec, bool) {
+		return &types.FuncSpec{
+			FuncMetaData:  types.FuncMetaData{Runtime: "python3.11"},
+			RootfsSpecMeta: types.RootfsSpecMeta{User: "agentos"}, // imageurl empty, sandboxType docker
+			SandboxType:    "docker",
+		}, true
+	}).Reset()
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			t.Fatalf("createInstance should not be called when registered funcSpec lacks imageurl for docker")
+			return "", nil
+		},
+	})
+
+	recorder, ctx := newAgentCreateRecorder(t, CreateAgentRequest{
+		Namespace: "agent-ns",
+		Name:      "agent-reg-noimg",
+		Urn:       validAgentURN,
+		Workspace: "/home/snuser/workspaceA",
+	})
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "rootfs.imageurl is required")
 }
 
 func TestCreateHandlerInlineSinksEnvVars(t *testing.T) {
