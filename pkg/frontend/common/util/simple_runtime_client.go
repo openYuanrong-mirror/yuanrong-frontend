@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ import (
 
 	"frontend/pkg/common/faas_common/grpc/pb/common"
 	"frontend/pkg/common/faas_common/grpc/pb/core"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 )
 
@@ -89,6 +91,10 @@ type simpleRuntimeKillRequest struct {
 type frontendProxyInvokeClient interface {
 	InvokeByInstanceID(simpleRuntimeInvokeRequest) ([]byte, error)
 	InvokeByInstanceIDRaw(simpleRuntimeRawInvokeRequest) ([]byte, error)
+	UploadFile(ctx context.Context, instanceID string, path string,
+		reader io.Reader, tenantID string) (*frontend_proxy.FileTransferResponse, error)
+	DownloadFile(ctx context.Context, instanceID string, path string,
+		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
 }
 
 type frontendProxyLifecycleClient interface {
@@ -592,6 +598,41 @@ func (c *clientSimpleRuntime) GetActiveMasterAddr() string {
 		return c.control.GetActiveMasterAddr()
 	}
 	return ""
+}
+
+// fileTransferClient is the capability interface implemented by a frontend
+// proxy invoke client that supports streaming file upload/download.
+type fileTransferClient interface {
+	UploadFile(ctx context.Context, instanceID string, path string,
+		reader io.Reader, tenantID string) (*frontend_proxy.FileTransferResponse, error)
+	DownloadFile(ctx context.Context, instanceID string, path string,
+		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
+}
+
+// UploadFile streams reader to the owning frontend proxy of instanceID via the
+// pooled gRPC client. It is only available when the proxy invoke backend exposes
+// the file-transfer capability (routingFrontendProxyInvokeClient).
+func (c *clientSimpleRuntime) UploadFile(ctx context.Context, instanceID string, path string,
+	reader io.Reader, tenantID string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	transferClient, ok := c.proxyClient.(fileTransferClient)
+	if !ok || transferClient == nil {
+		return nil, fmt.Errorf("clientSimpleRuntime.UploadFile requires frontend proxy file transfer client")
+	}
+	return transferClient.UploadFile(ctx, instanceID, path, reader, tenantID)
+}
+
+// DownloadFile opens a server-streaming DownloadFile RPC against the owning
+// frontend proxy of instanceID. The caller reads chunks from the returned
+// stream until io.EOF.
+func (c *clientSimpleRuntime) DownloadFile(ctx context.Context, instanceID string, path string,
+	offset int64, tenantID string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	transferClient, ok := c.proxyClient.(fileTransferClient)
+	if !ok || transferClient == nil {
+		return nil, fmt.Errorf("clientSimpleRuntime.DownloadFile requires frontend proxy file transfer client")
+	}
+	return transferClient.DownloadFile(ctx, instanceID, path, offset, tenantID)
 }
 
 func (c *clientSimpleRuntime) missingLocalObjects(objectIDs []string) []string {

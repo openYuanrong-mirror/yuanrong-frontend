@@ -35,6 +35,8 @@ service FrontendProxyService {
   rpc InvokeInstance (InvokeInstanceRequest) returns (InvokeInstanceResponse) {}
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceResponse) {}
   rpc KillInstance (KillInstanceRequest) returns (KillInstanceResponse) {}
+  rpc UploadFile (stream FileChunk) returns (FileTransferResponse) {}
+  rpc DownloadFile (FileTransferRequest) returns (stream FileChunk) {}
 }
 
 message FrontendRequestContext {
@@ -97,4 +99,30 @@ message KillInstanceRequest {
 message KillInstanceResponse {
   FrontendProxyStatus status = 1;
   core_service.KillResponse kill = 2;
+}
+
+// FileChunk represents a single chunk of a file transfer stream.
+message FileChunk {
+  FrontendRequestContext context = 1;
+  string instanceID = 2;
+  string path = 3;
+  int64 offset = 4;
+  bytes data = 5;
+  bool isLast = 6;
+}
+
+// FileTransferRequest is the request message for a download (server-streaming).
+message FileTransferRequest {
+  FrontendRequestContext context = 1;
+  string instanceID = 2;
+  string path = 3;
+  int64 offset = 4;
+  int64 chunkSize = 5;
+}
+
+// FileTransferResponse is the final response for an upload (client-streaming).
+message FileTransferResponse {
+  FrontendProxyStatus status = 1;
+  string path = 2;
+  int64 size = 3;
 }

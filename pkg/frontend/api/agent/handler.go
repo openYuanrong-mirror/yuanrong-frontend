@@ -19,9 +19,11 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,6 +37,7 @@ import (
 
 	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/types"
@@ -731,9 +734,10 @@ func applyAgentDynamicEnv(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 func applyAgentCreateOpts(invokeOpts *api.InvokeOptions, ctx *gin.Context, req CreateAgentRequest,
 	inline bool, funcKey string) {
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
-	if tenantID != "" {
-		invokeOpts.CreateOpt["tenantId"] = tenantID
+	if tenantID == "" {
+		tenantID = "default"
 	}
+	invokeOpts.CreateOpt["tenantId"] = tenantID
 	if inline {
 		invokeOpts.CreateOpt[constant.FunctionKeyNote] = funcKey
 	} else {
@@ -1072,4 +1076,421 @@ func parseEnvVars(envStr string) map[string]string {
 		return env
 	}
 	return nil
+}
+
+// maxFileUploadSize is the per-request upload size cap (512MB). It is enforced
+// both via Content-Length and by accumulating bytes read from the multipart
+// file so a client lying about Content-Length cannot bypass it.
+const maxFileUploadSize int64 = 512 * 1024 * 1024
+
+// fileTransferWaitTimeout bounds how long the file-transfer handlers wait for
+// an instance to appear in the watcher cache before returning 404.
+const fileTransferWaitTimeout = 5 * time.Second
+
+// waitForAgentInstanceExist returns the instance spec for instanceID if it is
+// present in the watcher cache within fileTransferWaitTimeout. It reuses the
+// same WaitInstanceByID primitive the rest of the lifecycle path relies on.
+func waitForAgentInstanceExist(instanceID string) (*types.InstanceSpecification, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), fileTransferWaitTimeout)
+	defer cancel()
+	return instancemanager.WaitInstanceByID(ctx, instanceID)
+}
+
+// fileTransferClient resolves a FileTransferClient from util.NewClient(). It
+// returns nil and a 503 when the selected backend does not advertise file
+// transfer, so callers can map the unsupported case to a clean HTTP error.
+func fileTransferClient() (util.FileTransferClient, error) {
+	client := util.NewClient()
+	transferClient := util.AsFileTransferClient(client)
+	if transferClient == nil {
+		return nil, fmt.Errorf("selected runtime backend does not support file transfer")
+	}
+	return transferClient, nil
+}
+
+// isFileNotFoundError reports whether err indicates the file/path does not
+// exist on the owning proxy. It delegates to util.IsFileTransferNotFoundError,
+// which inspects both the grpc status code (NotFound) and the frontend proxy
+// business/status error envelopes so download handlers can map the failure to
+// 404 without depending on the unexported error types.
+func isFileNotFoundError(err error) bool {
+	return util.IsFileTransferNotFoundError(err)
+}
+
+// FileUploadHandler handles POST /api/agent/:instanceId/files/upload.
+// It streams the uploaded file to the owning proxy of the instance, validating
+// the file extension whitelist and the 512MB size cap before dispatching.
+//
+// The multipart form must include a "path" text field and a "file" file field.
+// The "path" field should precede "file" so the target is known before the
+// stream is opened; if "file" arrives before "path", the request is rejected
+// with 400 to keep streaming single-pass.
+func FileUploadHandler(ctx *gin.Context) {
+	instanceID := ctx.Param("instanceId")
+	if instanceID == "" {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
+		return
+	}
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	// Validate Content-Length against the size cap before reading the body so
+	// an oversized request is rejected without buffering it.
+	if contentLength := ctx.Request.ContentLength; contentLength > maxFileUploadSize {
+		ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"code":    http.StatusRequestEntityTooLarge,
+			"message": fmt.Sprintf("upload size %d exceeds max %d", contentLength, maxFileUploadSize),
+		})
+		return
+	}
+
+	// Verify the instance exists and is known to the watcher cache. A missing
+	// instance cannot receive files.
+	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
+		log.GetLogger().Warnf("file upload instance not found %s: %v", instanceID, err)
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": fmt.Sprintf("instance %s not found", instanceID),
+		})
+		return
+	}
+
+	// Limit the multipart reader memory to the cap so a malicious payload is
+	// rejected at the parse boundary instead of exhausting memory.
+	ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, maxFileUploadSize)
+	reader, err := ctx.Request.MultipartReader()
+	if err != nil {
+		log.GetLogger().Warnf("file upload multipart read failed instance %s: %v", instanceID, err)
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"message": fmt.Sprintf("invalid multipart request: %v", err),
+		})
+		return
+	}
+
+	var targetPath string
+	pathSeen := false
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			writeMultipartReadError(ctx, instanceID, err)
+			return
+		}
+		switch part.FormName() {
+		case "path":
+			pathSeen = true
+			buf, err := io.ReadAll(part)
+			if err != nil {
+				log.GetLogger().Warnf("file upload path read failed instance %s: %v", instanceID, err)
+				ctx.JSON(http.StatusBadRequest, gin.H{
+					"code":    http.StatusBadRequest,
+					"message": fmt.Sprintf("read path failed: %v", err),
+				})
+				return
+			}
+			targetPath = strings.TrimSpace(string(buf))
+		case "file":
+			// The "path" field must precede the "file" field so the upload
+			// target is known before streaming begins.
+			if !pathSeen || targetPath == "" {
+				ctx.JSON(http.StatusBadRequest, gin.H{
+					"code":    http.StatusBadRequest,
+					"message": "'path' field must precede 'file' in the multipart form",
+				})
+				return
+			}
+			// Wrap the part so cumulative size is checked against the cap while
+			// bytes are streamed straight to the owning proxy.
+			countingReader := &countingReader{reader: part}
+			resp, uploadErr := uploadInstanceFile(ctx, instanceID, targetPath, countingReader, tenantID)
+			if uploadErr != nil {
+				log.GetLogger().Errorf("file upload failed instance %s path %s: %v",
+					instanceID, targetPath, uploadErr)
+				writeFileTransferError(ctx, uploadErr)
+				return
+			}
+			if resp != nil {
+				ctx.JSON(http.StatusOK, gin.H{
+					"success": true,
+					"path":    resp.GetPath(),
+					"size":    resp.GetSize(),
+				})
+				return
+			}
+			ctx.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"path":    targetPath,
+				"size":    countingReader.count,
+			})
+			return
+		default:
+			// Skip unknown parts; only path and file are consumed.
+			_, _ = io.Copy(io.Discard, part)
+		}
+	}
+	ctx.JSON(http.StatusBadRequest, gin.H{
+		"code":    http.StatusBadRequest,
+		"message": "multipart form must include a 'file' field",
+	})
+}
+
+// writeMultipartReadError maps a multipart read failure (including the
+// MaxBytesReader overflow) to the right HTTP status.
+func writeMultipartReadError(ctx *gin.Context, instanceID string, err error) {
+	if err == nil {
+		return
+	}
+	if err.Error() == "http: request body too large" {
+		ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"code":    http.StatusRequestEntityTooLarge,
+			"message": fmt.Sprintf("upload size exceeds max %d", maxFileUploadSize),
+		})
+		return
+	}
+	log.GetLogger().Warnf("file upload part read failed instance %s: %v", instanceID, err)
+	ctx.JSON(http.StatusBadRequest, gin.H{
+		"code":    http.StatusBadRequest,
+		"message": fmt.Sprintf("multipart read failed: %v", err),
+	})
+}
+
+// countingReader wraps a reader and counts the bytes read so the upload path
+// can enforce the size cap even when Content-Length is absent or inaccurate.
+// It is also used to short-circuit an oversized read before it completes.
+type countingReader struct {
+	reader io.Reader
+	count  int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.reader.Read(p)
+	c.count += int64(n)
+	if c.count > maxFileUploadSize {
+		return n, fmt.Errorf("upload size exceeds max %d: %w", maxFileUploadSize, err)
+	}
+	return n, err
+}
+
+// uploadInstanceFile resolves the file transfer client and dispatches the
+// upload. It centralizes the client resolution so the handler stays focused
+// on HTTP concerns.
+func uploadInstanceFile(ctx *gin.Context, instanceID, path string,
+	reader io.Reader, tenantID string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	if path == "" {
+		return nil, fmt.Errorf("path is required")
+	}
+	transferClient, err := fileTransferClient()
+	if err != nil {
+		return nil, err
+	}
+	return transferClient.UploadFile(ctx.Request.Context(), instanceID, path, reader, tenantID)
+}
+
+// writeFileTransferError maps a file transfer error to the most appropriate
+// HTTP status. Business/instance-not-found errors map to 404, size overflow
+// to 413, invalid input to 400, everything else to 500.
+func writeFileTransferError(ctx *gin.Context, err error) {
+	if err == nil {
+		return
+	}
+	if isFileNotFoundError(err) {
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": err.Error(),
+		})
+		return
+	}
+	if strings.Contains(err.Error(), "exceeds max") {
+		ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"code":    http.StatusRequestEntityTooLarge,
+			"message": err.Error(),
+		})
+		return
+	}
+	if strings.Contains(err.Error(), "is required") {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"message": err.Error(),
+		})
+		return
+	}
+	ctx.JSON(http.StatusInternalServerError, gin.H{
+		"code":    http.StatusInternalServerError,
+		"message": err.Error(),
+	})
+}
+
+// FileDownloadHandler handles GET /api/agent/:instanceId/files/download.
+// It streams the file from the owning proxy to the HTTP response, honoring the
+// Range header for partial downloads. The file is never buffered in memory in
+// full; each gRPC chunk is flushed to the response writer.
+func FileDownloadHandler(ctx *gin.Context) {
+	instanceID := ctx.Param("instanceId")
+	if instanceID == "" {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
+		return
+	}
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	targetPath := strings.TrimSpace(ctx.Query("path"))
+	if targetPath == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"message": "path query parameter is required",
+		})
+		return
+	}
+
+	// Verify the instance exists before resolving the download route.
+	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
+		log.GetLogger().Warnf("file download instance not found %s: %v", instanceID, err)
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": fmt.Sprintf("instance %s not found", instanceID),
+		})
+		return
+	}
+
+	// Parse the Range header for byte-offset downloads. Only a single byte
+	// range of the form "bytes=<start>-" is supported, mirroring the proxy's
+	// offset-based download contract.
+	var offset int64
+	hasRange := false
+	if rangeHeader := ctx.GetHeader("Range"); rangeHeader != "" {
+		if parsed, ok := parseSingleRange(rangeHeader); ok {
+			offset = parsed
+			hasRange = true
+		} else {
+			ctx.Header("Content-Range", "bytes=*/0")
+			ctx.JSON(http.StatusRequestedRangeNotSatisfiable, gin.H{
+				"code":    http.StatusRequestedRangeNotSatisfiable,
+				"message": "unsupported range request",
+			})
+			return
+		}
+	}
+
+	transferClient, err := fileTransferClient()
+	if err != nil {
+		log.GetLogger().Errorf("file download client unavailable instance %s: %v", instanceID, err)
+		ctx.JSON(http.StatusServiceUnavailable, gin.H{
+			"code":    http.StatusServiceUnavailable,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	stream, err := transferClient.DownloadFile(ctx.Request.Context(), instanceID, targetPath, offset, tenantID)
+	if err != nil {
+		log.GetLogger().Errorf("file download open stream failed instance %s path %s: %v",
+			instanceID, targetPath, err)
+		writeFileTransferError(ctx, err)
+		return
+	}
+	// Server-streaming clients (grpc.ServerStreamingClient) have no Close
+	// method; the underlying connection is managed by the pooled gRPC client.
+	// Reading until io.EOF signals the end of the stream.
+
+	// Set response headers before the first byte is written. Once Write is
+	// called the status defaults to 200, so for Range requests we emit the
+	// 206 status up front; the proxy does not pre-declare total size, so the
+	// Content-Range uses the unknown-length form "bytes <start>-*".
+	ctx.Writer.Header().Set("Content-Type", "application/octet-stream")
+	ctx.Writer.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`,
+		filepath.Base(targetPath)))
+	ctx.Writer.Header().Set("Accept-Ranges", "bytes")
+	if hasRange {
+		ctx.Writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-*/*", offset))
+		ctx.Writer.WriteHeader(http.StatusPartialContent)
+	}
+
+	// Stream each FileChunk directly to the response writer, flushing after
+	// every chunk so large files do not accumulate in memory or buffers.
+	var bytesWritten int64
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if bytesWritten == 0 && !hasRange {
+				// No bytes have been written to the client yet; we can still
+				// return a clean status code. A not-found error from the proxy
+				// before any data was sent maps to 404.
+				writeFileTransferError(ctx, err)
+				return
+			}
+			// The response is already committed (status/headers sent). Log and
+			// abort the connection rather than sending a misleading status.
+			log.GetLogger().Errorf("file download stream interrupted instance %s path %s after %d bytes: %v",
+				instanceID, targetPath, bytesWritten, err)
+			return
+		}
+		if chunk == nil {
+			continue
+		}
+		data := chunk.GetData()
+		if len(data) == 0 {
+			continue
+		}
+		n, err := ctx.Writer.Write(data)
+		bytesWritten += int64(n)
+		if err != nil {
+			log.GetLogger().Warnf("file download client write failed instance %s path %s: %v",
+				instanceID, targetPath, err)
+			return
+		}
+		ctx.Writer.Flush()
+	}
+
+	// If nothing was streamed at all and the status is still uncommitted, the
+	// path did not exist on the proxy but the stream opened and closed cleanly
+	// (Recv returned EOF immediately). Surface that as 404 so clients can
+	// distinguish empty/missing files. For ranged requests the 206 status was
+	// already committed before streaming, so we cannot rewrite it to 404.
+	if bytesWritten == 0 && !hasRange {
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": fmt.Sprintf("file %s not found in instance %s", targetPath, instanceID),
+		})
+		return
+	}
+}
+
+// parseSingleRange parses a Range header of the form "bytes=<start>-" and
+// returns the start offset. Only single-range open-ended requests are
+// supported because the underlying proxy download is offset-based.
+func parseSingleRange(rangeHeader string) (int64, bool) {
+	const (
+		prefix       = "bytes="
+		decimalBase  = 10
+		int64BitSize = 64
+	)
+	trimmed := strings.ToLower(strings.TrimSpace(rangeHeader))
+	if !strings.HasPrefix(trimmed, prefix) {
+		return 0, false
+	}
+	rest := strings.TrimSpace(trimmed[len(prefix):])
+	dash := strings.Index(rest, "-")
+	if dash < 0 {
+		return 0, false
+	}
+	startStr := strings.TrimSpace(rest[:dash])
+	if startStr == "" {
+		// Suffix range "bytes=-N" is not supported by the offset-only proxy.
+		return 0, false
+	}
+	start, err := strconv.ParseInt(startStr, decimalBase, int64BitSize)
+	if err != nil || start < 0 {
+		return 0, false
+	}
+	return start, true
 }

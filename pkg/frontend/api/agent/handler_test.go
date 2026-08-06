@@ -19,14 +19,18 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/require"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
@@ -1133,4 +1137,150 @@ func TestGetHandlerReturns404WhenNotFound(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "instance not found")
+}
+
+// ---- File transfer handler tests ----
+
+func TestParseSingleRange(t *testing.T) {
+	convey.Convey("parseSingleRange should handle various Range headers", t, func() {
+		convey.Convey("valid bytes=<start>-", func() {
+			offset, ok := parseSingleRange("bytes=100-")
+			convey.So(ok, convey.ShouldBeTrue)
+			convey.So(offset, convey.ShouldEqual, 100)
+		})
+		convey.Convey("valid with spaces", func() {
+			offset, ok := parseSingleRange("  bytes=50-  ")
+			convey.So(ok, convey.ShouldBeTrue)
+			convey.So(offset, convey.ShouldEqual, 50)
+		})
+		convey.Convey("case insensitive prefix", func() {
+			offset, ok := parseSingleRange("BYTES=200-")
+			convey.So(ok, convey.ShouldBeTrue)
+			convey.So(offset, convey.ShouldEqual, 200)
+		})
+		convey.Convey("zero offset", func() {
+			offset, ok := parseSingleRange("bytes=0-")
+			convey.So(ok, convey.ShouldBeTrue)
+			convey.So(offset, convey.ShouldEqual, 0)
+		})
+		convey.Convey("suffix range not supported", func() {
+			_, ok := parseSingleRange("bytes=-500")
+			convey.So(ok, convey.ShouldBeFalse)
+		})
+		convey.Convey("missing prefix", func() {
+			_, ok := parseSingleRange("0-100")
+			convey.So(ok, convey.ShouldBeFalse)
+		})
+		convey.Convey("missing dash", func() {
+			_, ok := parseSingleRange("bytes=100")
+			convey.So(ok, convey.ShouldBeFalse)
+		})
+		convey.Convey("empty start", func() {
+			_, ok := parseSingleRange("bytes=-")
+			convey.So(ok, convey.ShouldBeFalse)
+		})
+		convey.Convey("negative offset", func() {
+			_, ok := parseSingleRange("bytes=-1-")
+			convey.So(ok, convey.ShouldBeFalse)
+		})
+		convey.Convey("non-numeric", func() {
+			_, ok := parseSingleRange("bytes=abc-")
+			convey.So(ok, convey.ShouldBeFalse)
+		})
+	})
+}
+
+func TestCountingReader(t *testing.T) {
+	convey.Convey("countingReader should count bytes", t, func() {
+		data := bytes.Repeat([]byte("A"), 100)
+		cr := &countingReader{reader: bytes.NewReader(data)}
+		buf := make([]byte, 50)
+		n, err := cr.Read(buf)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(n, convey.ShouldEqual, 50)
+		convey.So(cr.count, convey.ShouldEqual, 50)
+
+		n, err = cr.Read(buf)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(n, convey.ShouldEqual, 50)
+		convey.So(cr.count, convey.ShouldEqual, 100)
+	})
+
+	convey.Convey("countingReader should reject oversized reads", t, func() {
+		data := bytes.Repeat([]byte("B"), 200)
+		cr := &countingReader{reader: bytes.NewReader(data)}
+
+		cr.count = maxFileUploadSize - 50
+		buf := make([]byte, 100)
+		n, err := cr.Read(buf)
+		convey.So(err, convey.ShouldNotBeNil)
+		convey.So(strings.Contains(err.Error(), "exceeds max"), convey.ShouldBeTrue)
+		convey.So(n <= 100, convey.ShouldBeTrue)
+		convey.So(cr.count > maxFileUploadSize, convey.ShouldBeTrue)
+	})
+}
+
+func TestWriteFileTransferError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	convey.Convey("writeFileTransferError should map errors to HTTP status codes", t, func() {
+		convey.Convey("nil error does nothing", func() {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			writeFileTransferError(ctx, nil)
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+		})
+		convey.Convey("contains 'exceeds max' → 413", func() {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			writeFileTransferError(ctx, errors.New("upload size exceeds max 512MB"))
+			convey.So(w.Code, convey.ShouldEqual, http.StatusRequestEntityTooLarge)
+		})
+		convey.Convey("contains 'is required' → 400", func() {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			writeFileTransferError(ctx, errors.New("path is required"))
+			convey.So(w.Code, convey.ShouldEqual, http.StatusBadRequest)
+		})
+		convey.Convey("generic error → 500", func() {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			writeFileTransferError(ctx, errors.New("internal failure"))
+			convey.So(w.Code, convey.ShouldEqual, http.StatusInternalServerError)
+		})
+	})
+}
+
+func TestWriteMultipartReadError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	convey.Convey("writeMultipartReadError should map errors correctly", t, func() {
+		convey.Convey("nil error does nothing", func() {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			writeMultipartReadError(ctx, "inst1", nil)
+			convey.So(w.Code, convey.ShouldEqual, http.StatusOK)
+		})
+		convey.Convey("body too large → 413", func() {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			writeMultipartReadError(ctx, "inst1", errors.New("http: request body too large"))
+			convey.So(w.Code, convey.ShouldEqual, http.StatusRequestEntityTooLarge)
+		})
+		convey.Convey("generic multipart error → 400", func() {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			writeMultipartReadError(ctx, "inst1", io.ErrUnexpectedEOF)
+			convey.So(w.Code, convey.ShouldEqual, http.StatusBadRequest)
+		})
+	})
+}
+
+func TestIsFileNotFoundError(t *testing.T) {
+	convey.Convey("isFileNotFoundError should return false for nil", t, func() {
+		convey.So(isFileNotFoundError(nil), convey.ShouldBeFalse)
+	})
+	convey.Convey("isFileNotFoundError should return false for generic error", t, func() {
+		convey.So(isFileNotFoundError(errors.New("something else")), convey.ShouldBeFalse)
+	})
 }

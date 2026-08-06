@@ -743,27 +743,28 @@ type Extensions struct {
 
 // InstanceSpecification contains specification of a instance in etcd
 type InstanceSpecification struct {
-	InstanceID      string            `json:"instanceID" validate:"required"`
-	DataSystemHost  string            `json:"dataSystemHost" validate:"required"`
-	RequestID       string            `json:"requestID" valid:",optional"`
-	RuntimeID       string            `json:"runtimeID" valid:",optional"`
-	RuntimeAddress  string            `json:"runtimeAddress" valid:",optional"`
-	FunctionAgentID string            `json:"functionAgentID" valid:",optional"`
-	FunctionProxyID string            `json:"functionProxyID" valid:",optional"`
-	Function        string            `json:"function"`
-	RestartPolicy   string            `json:"restartPolicy" valid:",optional"`
-	Resources       Resources         `json:"resources"`
-	ActualUse       Resources         `json:"actualUse" valid:",optional"`
-	ScheduleOption  ScheduleOption    `json:"scheduleOption"`
-	CreateOptions   map[string]string `json:"createOptions"`
-	Labels          []string          `json:"labels"`
-	StartTime       string            `json:"startTime"`
-	InstanceStatus  InstanceStatus    `json:"instanceStatus"`
-	JobID           string            `json:"jobID"`
-	SchedulerChain  []string          `json:"schedulerChain" valid:",optional"`
-	ParentID        string            `json:"parentID"`
-	DeployTimes     int32             `json:"deployTimes"`
-	Extensions      Extensions        `json:"extensions" valid:",optional"`
+	InstanceID       string            `json:"instanceID" validate:"required"`
+	DataSystemHost   string            `json:"dataSystemHost" validate:"required"`
+	RequestID        string            `json:"requestID" valid:",optional"`
+	RuntimeID        string            `json:"runtimeID" valid:",optional"`
+	RuntimeAddress   string            `json:"runtimeAddress" valid:",optional"`
+	ProxyGrpcAddress string            `json:"proxyGrpcAddress" valid:",optional"`
+	FunctionAgentID  string            `json:"functionAgentID" valid:",optional"`
+	FunctionProxyID  string            `json:"functionProxyID" valid:",optional"`
+	Function         string            `json:"function"`
+	RestartPolicy    string            `json:"restartPolicy" valid:",optional"`
+	Resources        Resources         `json:"resources"`
+	ActualUse        Resources         `json:"actualUse" valid:",optional"`
+	ScheduleOption   ScheduleOption    `json:"scheduleOption"`
+	CreateOptions    map[string]string `json:"createOptions"`
+	Labels           []string          `json:"labels"`
+	StartTime        string            `json:"startTime"`
+	InstanceStatus   InstanceStatus    `json:"instanceStatus"`
+	JobID            string            `json:"jobID"`
+	SchedulerChain   []string          `json:"schedulerChain" valid:",optional"`
+	ParentID         string            `json:"parentID"`
+	DeployTimes      int32             `json:"deployTimes"`
+	Extensions       Extensions        `json:"extensions" valid:",optional"`
 }
 
 // InstanceSpecificationFG contains specification of instance in etcd for functionGraph

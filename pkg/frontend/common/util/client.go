@@ -21,10 +21,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/common/faas_common/utils"
@@ -587,4 +589,69 @@ func (c *defaultClient) IsHealth() bool {
 
 func (c *defaultClient) IsDsHealth() bool {
 	return c.clientLibruntime.IsDsHealth()
+}
+
+// FileTransferClient is an independent capability interface for streaming
+// files to/from a function instance's owning proxy. It is intentionally kept
+// off the Client and invokerLibruntime interfaces so that alternative
+// backends do not have to implement file transfer unless they advertise it.
+type FileTransferClient interface {
+	// UploadFile streams reader to the owning proxy of instanceID. The proxy
+	// writes the bytes to path inside the instance's filesystem sandbox.
+	UploadFile(ctx context.Context, instanceID string, path string,
+		reader io.Reader, tenantID string) (*frontend_proxy.FileTransferResponse, error)
+	// DownloadFile opens a server-streaming download for path at offset.
+	// The returned stream yields FileChunk messages; the caller reads until
+	// io.EOF and must close the stream when finished.
+	DownloadFile(ctx context.Context, instanceID string, path string,
+		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
+}
+
+// AsFileTransferClient returns a FileTransferClient backed by client when the
+// selected runtime backend advertises file transfer, otherwise nil. This
+// keeps the capability opt-in and backend-switch compatible without widening
+// the Client interface.
+func AsFileTransferClient(client Client) FileTransferClient {
+	if client == nil {
+		return nil
+	}
+	if tc, ok := client.(FileTransferClient); ok {
+		return tc
+	}
+	return nil
+}
+
+// fileTransferFallbackClient is a process-wide singleton for the Kernel
+// backend path where clientLibruntime does not implement FileTransferClient.
+// It reuses a single routingFrontendProxyInvokeClient (and its gRPC
+// connection pool) so concurrent uploads/downloads share connections
+// instead of creating a new pool per call.
+var fileTransferFallbackClient = &routingFrontendProxyInvokeClient{
+	resolver:         defaultFrontendProxyRouteResolver{},
+	clientFactory:    newFrontendProxyGRPCClientPool(),
+	frontendClientID: currentFrontendClientID(),
+}
+
+// UploadFile delegates to the underlying runtime when it implements file
+// transfer; otherwise it falls back to the process-wide
+// routingFrontendProxyInvokeClient which talks directly to function_proxy
+// over gRPC, independent of the configured invoke backend mode.
+func (c *defaultClient) UploadFile(ctx context.Context, instanceID string, path string,
+	reader io.Reader, tenantID string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	if tc, ok := c.clientLibruntime.(FileTransferClient); ok {
+		return tc.UploadFile(ctx, instanceID, path, reader, tenantID)
+	}
+	return fileTransferFallbackClient.UploadFile(ctx, instanceID, path, reader, tenantID)
+}
+
+// DownloadFile delegates to the underlying runtime when it implements file
+// transfer; otherwise it falls back to the process-wide singleton.
+func (c *defaultClient) DownloadFile(ctx context.Context, instanceID string, path string,
+	offset int64, tenantID string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	if tc, ok := c.clientLibruntime.(FileTransferClient); ok {
+		return tc.DownloadFile(ctx, instanceID, path, offset, tenantID)
+	}
+	return fileTransferFallbackClient.DownloadFile(ctx, instanceID, path, offset, tenantID)
 }
