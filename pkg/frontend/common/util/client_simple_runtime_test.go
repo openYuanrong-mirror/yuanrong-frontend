@@ -18,6 +18,7 @@ package util
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -27,6 +28,7 @@ import (
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/grpc/pb/common"
 	"frontend/pkg/common/faas_common/grpc/pb/core"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 )
 
 const (
@@ -118,6 +120,18 @@ func (f *fakeFrontendProxyInvokeClient) InvokeByInstanceID(req simpleRuntimeInvo
 
 func (f *fakeFrontendProxyInvokeClient) InvokeByInstanceIDRaw(simpleRuntimeRawInvokeRequest) ([]byte, error) {
 	return f.payload, f.err
+}
+
+func (f *fakeFrontendProxyInvokeClient) UploadFile(_ context.Context, _, _ string,
+	_ io.Reader, _ string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	return nil, f.err
+}
+
+func (f *fakeFrontendProxyInvokeClient) DownloadFile(_ context.Context, _, _ string,
+	_ int64, _ string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return nil, f.err
 }
 
 func (f *fakeFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreateRequest) (string, error) {

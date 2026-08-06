@@ -1234,7 +1234,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.reader.Read(p)
 	c.count += int64(n)
 	if c.count > maxFileUploadSize {
-		return n, fmt.Errorf("upload size exceeds max %d", maxFileUploadSize)
+		return n, fmt.Errorf("upload size exceeds max %d: %w", maxFileUploadSize, err)
 	}
 	return n, err
 }
@@ -1368,7 +1368,7 @@ func FileDownloadHandler(ctx *gin.Context) {
 	// 206 status up front; the proxy does not pre-declare total size, so the
 	// Content-Range uses the unknown-length form "bytes <start>-*".
 	ctx.Writer.Header().Set("Content-Type", "application/octet-stream")
-	ctx.Writer.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"",
+	ctx.Writer.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`,
 		filepath.Base(targetPath)))
 	ctx.Writer.Header().Set("Accept-Ranges", "bytes")
 	if hasRange {
@@ -1433,11 +1433,16 @@ func FileDownloadHandler(ctx *gin.Context) {
 // returns the start offset. Only single-range open-ended requests are
 // supported because the underlying proxy download is offset-based.
 func parseSingleRange(rangeHeader string) (int64, bool) {
-	const prefix = "bytes="
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(rangeHeader)), prefix) {
+	const (
+		prefix       = "bytes="
+		decimalBase  = 10
+		int64BitSize = 64
+	)
+	trimmed := strings.ToLower(strings.TrimSpace(rangeHeader))
+	if !strings.HasPrefix(trimmed, prefix) {
 		return 0, false
 	}
-	rest := strings.TrimSpace(rangeHeader[len(prefix):])
+	rest := strings.TrimSpace(trimmed[len(prefix):])
 	dash := strings.Index(rest, "-")
 	if dash < 0 {
 		return 0, false
@@ -1447,7 +1452,7 @@ func parseSingleRange(rangeHeader string) (int64, bool) {
 		// Suffix range "bytes=-N" is not supported by the offset-only proxy.
 		return 0, false
 	}
-	start, err := strconv.ParseInt(startStr, 10, 64)
+	start, err := strconv.ParseInt(startStr, decimalBase, int64BitSize)
 	if err != nil || start < 0 {
 		return 0, false
 	}

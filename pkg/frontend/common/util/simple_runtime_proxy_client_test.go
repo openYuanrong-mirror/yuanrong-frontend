@@ -135,6 +135,18 @@ func (f *fakeFrontendProxyServiceClient) KillInstance(ctx context.Context, in *f
 	return f.killResp, f.err
 }
 
+func (f *fakeFrontendProxyServiceClient) UploadFile(_ context.Context,
+	_ ...grpc.CallOption,
+) (frontend_proxy.FrontendProxyService_UploadFileClient, error) {
+	return nil, f.err
+}
+
+func (f *fakeFrontendProxyServiceClient) DownloadFile(_ context.Context,
+	_ *frontend_proxy.FileTransferRequest, _ ...grpc.CallOption,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return nil, f.err
+}
+
 func createResponseWithUnknownReadyCallResult(
 	t *testing.T,
 	callResult *core.CallResult,

@@ -424,16 +424,18 @@ func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instance
 				Path:       path,
 				Offset:     offset - int64(n),
 				Data:       chunkBuffer[:n],
-				IsLast:     readErr == io.EOF,
+				IsLast:     errors.Is(readErr, io.EOF),
 			}); err != nil {
 				return nil, err
 			}
 		}
-		if readErr == io.EOF {
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {
-			return nil, fmt.Errorf("frontend proxy upload file read failed: %w", readErr)
+			readErr = fmt.Errorf("frontend proxy upload file read failed: %w", readErr)
+			_, _ = stream.CloseAndRecv()
+			return nil, readErr
 		}
 	}
 	resp, err := stream.CloseAndRecv()
@@ -711,7 +713,8 @@ func resolveFileTransferProxyAddress(instanceID string) (string, error) {
 				return endpoint.Address, nil
 			}
 		}
-		if endpoint, ok := resolveFrontendProxyEndpointByRuntimeHost(instance.RuntimeAddress, frontendProxyCapabilityInvoke); ok {
+		if endpoint, ok := resolveFrontendProxyEndpointByRuntimeHost(
+			instance.RuntimeAddress, frontendProxyCapabilityInvoke); ok {
 			return endpoint.Address, nil
 		}
 	}
@@ -744,7 +747,8 @@ func (c *routingFrontendProxyInvokeClient) UploadFile(ctx context.Context, insta
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
 		return nil, err
 	}
-	resp, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).UploadFile(ctx, instanceID, path, reader, tenantID)
+	resp, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
+		UploadFile(ctx, instanceID, path, reader, tenantID)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
 		return nil, err
@@ -770,7 +774,8 @@ func (c *routingFrontendProxyInvokeClient) DownloadFile(ctx context.Context, ins
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
 		return nil, err
 	}
-	stream, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).DownloadFile(ctx, instanceID, path, offset, tenantID)
+	stream, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
+		DownloadFile(ctx, instanceID, path, offset, tenantID)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
 		return nil, err
