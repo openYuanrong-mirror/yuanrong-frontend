@@ -170,8 +170,11 @@ type CreateRequest struct {
 
 // RootfsSpec describes a structured sandbox rootfs request for the v1 API.
 type RootfsSpec struct {
-	Runtime     string                 `json:"runtime,omitempty"`
-	Type        string                 `json:"type,omitempty"`
+	Runtime string `json:"runtime,omitempty"`
+	Type    string `json:"type,omitempty"`
+	// Image is a legacy HTTP input alias. The rootfs deploy-option protocol
+	// consumed by FunctionSystem uses imageurl; buildRootfsOption normalizes
+	// this field to ImageURL and never forwards both fields.
 	Image       string                 `json:"image,omitempty"`
 	ImageURL    string                 `json:"imageurl,omitempty"`
 	Path        string                 `json:"path,omitempty"`
@@ -501,6 +504,14 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	}
 	if req.Namespace == "" {
 		req.Namespace = "default"
+	}
+	req.Runtime = strings.TrimSpace(req.Runtime)
+	req.Rootfs.Runtime = strings.TrimSpace(req.Rootfs.Runtime)
+	if req.Runtime != "" && req.Rootfs.Runtime != "" && req.Runtime != req.Rootfs.Runtime {
+		return "", nil, fmt.Errorf("runtime %q conflicts with rootfs.runtime %q", req.Runtime, req.Rootfs.Runtime)
+	}
+	if req.Runtime == "" {
+		req.Runtime = req.Rootfs.Runtime
 	}
 	if req.Runtime == "" {
 		req.Runtime = "runsc"
@@ -1613,25 +1624,73 @@ func ensureSandboxRequestID(ctx *gin.Context, traceID string) string {
 }
 
 func buildRootfsOption(spec RootfsSpec, fallbackImage string) (string, error) {
-	image := strings.TrimSpace(spec.ImageURL)
-	if image == "" {
-		image = strings.TrimSpace(spec.Image)
+	spec.Runtime = strings.TrimSpace(spec.Runtime)
+	spec.Type = strings.TrimSpace(spec.Type)
+	spec.Path = strings.TrimSpace(spec.Path)
+	spec.Image = strings.TrimSpace(spec.Image)
+	spec.ImageURL = strings.TrimSpace(spec.ImageURL)
+	fallbackImage = strings.TrimSpace(fallbackImage)
+
+	if spec.ImageURL != "" && spec.Image != "" && spec.ImageURL != spec.Image {
+		return "", fmt.Errorf("rootfs.image conflicts with rootfs.imageurl")
 	}
+	image := spec.ImageURL
 	if image == "" {
-		image = strings.TrimSpace(fallbackImage)
+		image = spec.Image
+	}
+	if image == "" && spec.Type != "local" && spec.Type != "s3" {
+		image = fallbackImage
 	}
 	if spec.Type == "" && image != "" {
 		spec.Type = "image"
 	}
-	if spec.Runtime == "" && (spec.Type != "" || spec.Path != "" || image != "") {
+	if spec.Runtime == "" {
 		spec.Runtime = "runsc"
 	}
-	if spec.Type == "image" {
+
+	switch spec.Type {
+	case "":
+		if spec.Path != "" || len(spec.StorageInfo) != 0 {
+			return "", fmt.Errorf("rootfs source fields require type")
+		}
+	case "image":
+		if image == "" {
+			return "", fmt.Errorf("image rootfs requires imageurl")
+		}
+		if spec.Path != "" || len(spec.StorageInfo) != 0 {
+			return "", fmt.Errorf("image rootfs cannot contain path or storageInfo")
+		}
+		spec.Image = ""
 		spec.ImageURL = image
+	case "local":
+		if spec.Path == "" {
+			return "", fmt.Errorf("local rootfs requires path")
+		}
+		if spec.Image != "" || spec.ImageURL != "" || len(spec.StorageInfo) != 0 {
+			return "", fmt.Errorf("local rootfs cannot contain image, imageurl or storageInfo")
+		}
+	case "s3":
+		if spec.Path != "" || spec.Image != "" || spec.ImageURL != "" {
+			return "", fmt.Errorf("s3 rootfs cannot contain path, image or imageurl")
+		}
+		for _, key := range []string{"endpoint", "bucket", "object"} {
+			value, ok := spec.StorageInfo[key].(string)
+			if !ok || strings.TrimSpace(value) == "" {
+				return "", fmt.Errorf("s3 rootfs requires non-empty storageInfo.%s", key)
+			}
+			spec.StorageInfo[key] = strings.TrimSpace(value)
+		}
+		for _, key := range []string{"accessKey", "secretKey"} {
+			if value, exists := spec.StorageInfo[key]; exists {
+				if _, ok := value.(string); !ok {
+					return "", fmt.Errorf("storageInfo.%s must be a string", key)
+				}
+			}
+		}
+	default:
+		return "", fmt.Errorf("unsupported rootfs type %q", spec.Type)
 	}
-	if spec.Type == "" && spec.Path == "" && spec.ImageURL == "" {
-		return "", nil
-	}
+
 	data, err := json.Marshal(spec)
 	if err != nil {
 		return "", err
