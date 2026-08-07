@@ -170,12 +170,8 @@ type CreateRequest struct {
 
 // RootfsSpec describes a structured sandbox rootfs request for the v1 API.
 type RootfsSpec struct {
-	Runtime string `json:"runtime,omitempty"`
-	Type    string `json:"type,omitempty"`
-	// Image is a legacy HTTP input alias. The rootfs deploy-option protocol
-	// consumed by FunctionSystem uses imageurl; buildRootfsOption normalizes
-	// this field to ImageURL and never forwards both fields.
-	Image       string                 `json:"image,omitempty"`
+	Runtime     string                 `json:"runtime,omitempty"`
+	Type        string                 `json:"type,omitempty"`
 	ImageURL    string                 `json:"imageurl,omitempty"`
 	Path        string                 `json:"path,omitempty"`
 	ReadOnly    *bool                  `json:"readonly,omitempty"`
@@ -1627,17 +1623,10 @@ func buildRootfsOption(spec RootfsSpec, fallbackImage string) (string, error) {
 	spec.Runtime = strings.TrimSpace(spec.Runtime)
 	spec.Type = strings.TrimSpace(spec.Type)
 	spec.Path = strings.TrimSpace(spec.Path)
-	spec.Image = strings.TrimSpace(spec.Image)
 	spec.ImageURL = strings.TrimSpace(spec.ImageURL)
 	fallbackImage = strings.TrimSpace(fallbackImage)
 
-	if spec.ImageURL != "" && spec.Image != "" && spec.ImageURL != spec.Image {
-		return "", fmt.Errorf("rootfs.image conflicts with rootfs.imageurl")
-	}
 	image := spec.ImageURL
-	if image == "" {
-		image = spec.Image
-	}
 	if image == "" && spec.Type != "local" && spec.Type != "s3" {
 		image = fallbackImage
 	}
@@ -1660,18 +1649,17 @@ func buildRootfsOption(spec RootfsSpec, fallbackImage string) (string, error) {
 		if spec.Path != "" || len(spec.StorageInfo) != 0 {
 			return "", fmt.Errorf("image rootfs cannot contain path or storageInfo")
 		}
-		spec.Image = ""
 		spec.ImageURL = image
 	case "local":
 		if spec.Path == "" {
 			return "", fmt.Errorf("local rootfs requires path")
 		}
-		if spec.Image != "" || spec.ImageURL != "" || len(spec.StorageInfo) != 0 {
-			return "", fmt.Errorf("local rootfs cannot contain image, imageurl or storageInfo")
+		if spec.ImageURL != "" || len(spec.StorageInfo) != 0 {
+			return "", fmt.Errorf("local rootfs cannot contain imageurl or storageInfo")
 		}
 	case "s3":
-		if spec.Path != "" || spec.Image != "" || spec.ImageURL != "" {
-			return "", fmt.Errorf("s3 rootfs cannot contain path, image or imageurl")
+		if spec.Path != "" || spec.ImageURL != "" {
+			return "", fmt.Errorf("s3 rootfs cannot contain path or imageurl")
 		}
 		for _, key := range []string{"endpoint", "bucket", "object"} {
 			value, ok := spec.StorageInfo[key].(string)

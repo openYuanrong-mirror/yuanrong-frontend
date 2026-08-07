@@ -1128,15 +1128,7 @@ func TestCreateV1HandlerUsesRRTForKataIsolationRuntime(t *testing.T) {
 	)
 }
 
-func TestCreateV1HandlerNormalizesLegacyRootfsImageAlias(t *testing.T) {
-	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
-		createInstance: func(_ api.FunctionMeta, _ []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
-			capturedInvokeOpt = invokeOpt
-			return "sandbox-rootfs-image-alias", nil
-		},
-	})
-
+func TestCreateV1HandlerRejectsRootfsImageAlias(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", strings.NewReader(`{
@@ -1145,12 +1137,8 @@ func TestCreateV1HandlerNormalizesLegacyRootfsImageAlias(t *testing.T) {
 
 	CreateV1Handler(ctx)
 
-	require.Equal(t, http.StatusOK, recorder.Code)
-	require.JSONEq(
-		t,
-		`{"runtime":"runsc","type":"image","imageurl":"ubuntu:22.04"}`,
-		capturedInvokeOpt.CustomExtensions["rootfs"],
-	)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "image rootfs requires imageurl")
 }
 
 func TestCreateV1HandlerPreservesRuntimeOnlyRootfsOverlay(t *testing.T) {
