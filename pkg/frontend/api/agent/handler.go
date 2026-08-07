@@ -965,7 +965,7 @@ func ListHandler(ctx *gin.Context) {
 		if ep, ok := lookupAgentInstanceEndpoint(s.InstanceID); ok {
 			b.NodeIP = extractNodeIP(ep.ProxyGrpcAddress)
 		}
-		b.SandboxIP = resolveSandboxIP(s.ContainerIP, s.SandboxType, b.NodeIP)
+		b.SandboxIP = s.ContainerIP
 		instances = append(instances, b)
 	}
 	ctx.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "instances": instances})
@@ -992,21 +992,9 @@ func GetHandler(ctx *gin.Context) {
 	if ep, ok := lookupAgentInstanceEndpoint(instanceID); ok {
 		d.NodeIP = extractNodeIP(ep.ProxyGrpcAddress)
 	}
-	d.SandboxIP = resolveSandboxIP(s.ContainerIP, s.SandboxType, d.NodeIP)
+	d.SandboxIP = s.ContainerIP
 	applyDetailCreateOptions(&d, s.CreateOptions)
 	ctx.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "instance": d})
-}
-
-// resolveSandboxIP returns the container/sandbox internal IP. docker's comes from
-// etcd ContainerIP (inspect); supervisor is host-networked, so it falls back to nodeIP.
-func resolveSandboxIP(containerIP, sandboxType, nodeIP string) string {
-	if containerIP != "" {
-		return containerIP
-	}
-	if sandboxType == agentSandboxTypeSupervisor {
-		return nodeIP
-	}
-	return ""
 }
 
 // flattenResources collapses the scalar-resource map (e.g. {"CPU":{"scalar":{"value":600,"limit":0}}})

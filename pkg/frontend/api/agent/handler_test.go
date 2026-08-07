@@ -1106,8 +1106,8 @@ func TestListHandlerReturnsAllInstances(t *testing.T) {
 	sup := resp.Instances[1]
 	require.Equal(t, "inst-sup-1", sup.InstanceID)
 	require.Equal(t, "10.0.0.6", sup.NodeIP)
-	// supervisor is host-networked: no containerIP in etcd, falls back to node IP.
-	require.Equal(t, "10.0.0.6", sup.SandboxIP)
+	// supervisor is host-networked: no containerIP in etcd, sandbox_ip stays empty.
+	require.Empty(t, sup.SandboxIP)
 	require.Equal(t, "supervisor", sup.SandboxType)
 }
 
