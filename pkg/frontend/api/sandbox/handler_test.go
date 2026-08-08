@@ -2395,3 +2395,97 @@ func testJWT(sub, role string) string {
 	)))
 	return header + "." + payload + ".signature"
 }
+
+func invokeCreateV1ForNetworkPolicyTest(
+	t *testing.T,
+	body string,
+) (*httptest.ResponseRecorder, *core.CreateRequest, bool) {
+	t.Helper()
+	var capturedCreateReq *core.CreateRequest
+	createCalled := false
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstanceRaw: func(
+			createReq *core.CreateRequest,
+			_ api.RawRequestOption,
+		) ([]byte, error) {
+			createCalled = true
+			capturedCreateReq = cloneCreateRequest(t, createReq)
+			return rawCreateNotify(0, ""), nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request, err := http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		strings.NewReader(body),
+	)
+	require.NoError(t, err)
+	ctx.Request = request
+
+	CreateV1Handler(ctx)
+	return recorder, capturedCreateReq, createCalled
+}
+
+func TestCreateV1HandlerPassesBlockNetworkPolicy(t *testing.T) {
+	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
+		t,
+		`{"network":{"blockNetwork":true}}`,
+	)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, called)
+	require.NotNil(t, captured)
+	require.JSONEq(
+		t,
+		`{"blockNetwork":true}`,
+		captured.GetCreateOptions()["network_policy"],
+	)
+}
+
+func TestCreateV1HandlerNormalizesDNSBlacklist(t *testing.T) {
+	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
+		t,
+		`{"network":{"dnsBlacklist":["GitHub.COM.","*.GitHub.com","github.com"]}}`,
+	)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, called)
+	require.NotNil(t, captured)
+	require.JSONEq(
+		t,
+		`{"dnsBlacklist":["github.com","*.github.com"]}`,
+		captured.GetCreateOptions()["network_policy"],
+	)
+}
+
+func TestCreateV1HandlerOmitsEmptyNetworkPolicy(t *testing.T) {
+	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
+		t,
+		`{"network":{}}`,
+	)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, called)
+	require.NotNil(t, captured)
+	_, exists := captured.GetCreateOptions()["network_policy"]
+	require.False(t, exists)
+}
+
+func TestCreateV1HandlerRejectsInvalidNetworkPolicy(t *testing.T) {
+	invalidBodies := []string{
+		`{"network":{"blockNetwork":true,"dnsBlacklist":["github.com"]}}`,
+		`{"network":{"dnsBlacklist":["github.*"]}}`,
+		`{"network":{"dnsBlacklist":["github..com"]}}`,
+	}
+	for _, body := range invalidBodies {
+		t.Run(body, func(t *testing.T) {
+			recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(t, body)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
+			require.False(t, called)
+			require.Nil(t, captured)
+		})
+	}
+}
