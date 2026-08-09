@@ -130,6 +130,7 @@ var waitForSandboxInstanceRunning = func(instanceID, functionID, resourceSpecNot
 var (
 	sandboxXPUTypePattern  = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 	sandboxXPUCountPattern = regexp.MustCompile(`^[0-9]+$`)
+	sandboxDNSLabelPattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
 )
 
 // CreateRequest holds the parameters for sandbox creation.
@@ -154,6 +155,7 @@ type CreateRequest struct {
 	ExtraConfig map[string]interface{}   `json:"extra_config"`
 	XPU         string                   `json:"xpu"`
 	StorageMb   *int64                   `json:"storageMb,omitempty"`
+	Network     *SandboxNetworkPolicy    `json:"network,omitempty"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -189,6 +191,12 @@ type TunnelSpec struct {
 	ProxyPort int  `json:"proxyPort,omitempty"`
 }
 
+// SandboxNetworkPolicy is the public creation-time network policy.
+type SandboxNetworkPolicy struct {
+	BlockNetwork bool     `json:"blockNetwork,omitempty"`
+	DNSBlacklist []string `json:"dnsBlacklist,omitempty"`
+}
+
 // CreateV1Request holds POST /api/sandbox/v1/sandboxes parameters.
 type CreateV1Request struct {
 	Name                   string                   `json:"name"`
@@ -210,6 +218,7 @@ type CreateV1Request struct {
 	StorageMb              *int64                   `json:"storageMb,omitempty"`
 	ScheduleAffinities     []api.Affinity           `json:"scheduleAffinities,omitempty"`
 	Tunnel                 TunnelSpec               `json:"tunnel,omitempty"`
+	Network                *SandboxNetworkPolicy    `json:"network,omitempty"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
 	portRouteKinds         map[int]string
@@ -523,6 +532,11 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if err != nil {
 		return "", nil, err
 	}
+	network, err := normalizeSandboxNetworkPolicy(req.Network)
+	if err != nil {
+		return "", nil, err
+	}
+	req.Network = network
 	prepareSandboxRRTHTTP(req)
 	return rootfs, prepareSandboxTunnel(req), nil
 }
@@ -580,6 +594,56 @@ func validateSandboxStorageMb(storageMb *int64) error {
 
 func newSandboxName() string {
 	return "sandbox-" + uuid.NewString()
+}
+
+func normalizeSandboxNetworkPolicy(policy *SandboxNetworkPolicy) (*SandboxNetworkPolicy, error) {
+	if policy == nil {
+		return nil, nil
+	}
+	if policy.BlockNetwork && len(policy.DNSBlacklist) > 0 {
+		return nil, fmt.Errorf("blockNetwork and dnsBlacklist cannot be combined")
+	}
+	normalized := make([]string, 0, len(policy.DNSBlacklist))
+	seen := make(map[string]struct{}, len(policy.DNSBlacklist))
+	for _, pattern := range policy.DNSBlacklist {
+		value, err := normalizeSandboxDNSPattern(pattern)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	if !policy.BlockNetwork && len(normalized) == 0 {
+		return nil, nil
+	}
+	return &SandboxNetworkPolicy{
+		BlockNetwork: policy.BlockNetwork,
+		DNSBlacklist: normalized,
+	}, nil
+}
+
+func normalizeSandboxDNSPattern(pattern string) (string, error) {
+	value := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(pattern), "."))
+	wildcard := strings.HasPrefix(value, "*.")
+	if wildcard {
+		value = strings.TrimPrefix(value, "*.")
+	}
+	if value == "" || strings.ContainsAny(value, "*?") || len(value) > 253 {
+		return "", fmt.Errorf("invalid DNS blacklist pattern %q", pattern)
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || strings.HasPrefix(label, "-") ||
+			strings.HasSuffix(label, "-") || !sandboxDNSLabelPattern.MatchString(label) {
+			return "", fmt.Errorf("invalid DNS blacklist pattern %q", pattern)
+		}
+	}
+	if wildcard {
+		return "*." + value, nil
+	}
+	return value, nil
 }
 
 func validateScheduleAffinities(affinities []api.Affinity) error {
@@ -652,6 +716,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		ExtraConfig:            req.ExtraConfig,
 		XPU:                    req.XPU,
 		StorageMb:              req.StorageMb,
+		Network:                req.Network,
 		ScheduleAffinities:     req.ScheduleAffinities,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
@@ -1390,6 +1455,13 @@ func fillSandboxCustomExtensions(
 			invokeOpts.CustomExtensions["extra_config"] = string(ecJSON)
 		} else {
 			log.GetLogger().Warnf("failed to marshal sandbox extra_config: %v", err)
+		}
+	}
+	if req.Network != nil {
+		if networkJSON, err := json.Marshal(req.Network); err == nil {
+			invokeOpts.CustomExtensions["network_policy"] = string(networkJSON)
+		} else {
+			log.GetLogger().Warnf("failed to marshal sandbox network policy: %v", err)
 		}
 	}
 }
