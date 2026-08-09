@@ -1106,8 +1106,11 @@ func TestCreateV1HandlerUsesRRTForKataIsolationRuntime(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	body := []byte(`{
-		"runtime":"kata",
-		"image":"ubuntu:22.04"
+		"rootfs":{
+			"runtime":"kata",
+			"type":"image",
+			"imageurl":"ubuntu:22.04"
+		}
 	}`)
 	var err error
 	ctx.Request, err = http.NewRequest(
@@ -1128,6 +1131,89 @@ func TestCreateV1HandlerUsesRRTForKataIsolationRuntime(t *testing.T) {
 	)
 }
 
+func TestCreateV1HandlerRejectsRootfsImageAlias(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", strings.NewReader(`{
+		"rootfs":{"type":"image","image":"ubuntu:22.04"}
+	}`))
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "image rootfs requires imageurl")
+}
+
+func TestCreateV1HandlerPreservesRuntimeOnlyRootfsOverlay(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(_ api.FunctionMeta, _ []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "sandbox-kata-runtime-only", nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", strings.NewReader(`{
+		"rootfs":{"runtime":"kata"}
+	}`))
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"runtime":"kata"}`, capturedInvokeOpt.CustomExtensions["rootfs"])
+}
+
+func TestCreateV1HandlerAcceptsDeprecatedTopLevelRuntime(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(_ api.FunctionMeta, _ []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "sandbox-nested-kata", nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", strings.NewReader(`{
+		"runtime":"kata"
+	}`))
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"runtime":"kata"}`, capturedInvokeOpt.CustomExtensions["rootfs"])
+}
+
+func TestCreateV1HandlerRejectsConflictingRuntimeFields(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", strings.NewReader(`{
+		"runtime":"kata",
+		"rootfs":{"runtime":"runsc"}
+	}`))
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "deprecated top-level runtime")
+	require.Contains(t, recorder.Body.String(), "conflicts with rootfs.runtime")
+}
+
+func TestCreateV1HandlerRejectsIncompleteRootfsSource(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", strings.NewReader(`{
+		"rootfs":{"type":"local"}
+	}`))
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "local rootfs requires path")
+}
+
 func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
 	var capturedCreateReq *core.CreateRequest
 	util.SetAPIClientLibruntime(&runtimeStub{
@@ -1143,7 +1229,6 @@ func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	body := []byte(`{
-			"runtime":"runsc",
 			"env":{"SANDBOX_ENV":"enabled"},
 			"mounts":[{
 				"type":"bind",
@@ -1162,6 +1247,7 @@ func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
 			}]
 		}],
 		"rootfs":{
+			"runtime":"runsc",
 			"type":"s3",
 			"storageInfo":{
 				"endpoint":"https://s3.example",
@@ -1507,7 +1593,6 @@ func TestCreateV1HandlerRejectsInvalidScheduleAffinity(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	body := []byte(`{
-		"runtime":"runsc",
 		"image":"ubuntu:22.04",
 		"scheduleAffinities":[{
 			"kind":9,
@@ -2065,8 +2150,11 @@ func TestCreateV1HandlerForwardsIsolationRuntimeWithoutOwningRegistry(t *testing
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	body, err := json.Marshal(CreateV1Request{
-		Runtime: "gvisor-next",
-		Image:   "ubuntu:22.04",
+		Rootfs: RootfsSpec{
+			Runtime:  "gvisor-next",
+			Type:     "image",
+			ImageURL: "ubuntu:22.04",
+		},
 	})
 	require.NoError(t, err)
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))

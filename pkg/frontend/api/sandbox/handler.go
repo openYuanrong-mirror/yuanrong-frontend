@@ -174,7 +174,6 @@ type CreateRequest struct {
 type RootfsSpec struct {
 	Runtime     string                 `json:"runtime,omitempty"`
 	Type        string                 `json:"type,omitempty"`
-	Image       string                 `json:"image,omitempty"`
 	ImageURL    string                 `json:"imageurl,omitempty"`
 	Path        string                 `json:"path,omitempty"`
 	ReadOnly    *bool                  `json:"readonly,omitempty"`
@@ -199,10 +198,12 @@ type SandboxNetworkPolicy struct {
 
 // CreateV1Request holds POST /api/sandbox/v1/sandboxes parameters.
 type CreateV1Request struct {
-	Name                   string                   `json:"name"`
-	Namespace              string                   `json:"namespace"`
-	Tenant                 string                   `json:"tenant"`
-	Runtime                string                   `json:"runtime"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	Tenant    string `json:"tenant"`
+	// LegacyRuntime accepts the deprecated top-level runtime field from old
+	// clients. New clients encode the isolation runtime as rootfs.runtime.
+	LegacyRuntime          string                   `json:"runtime,omitempty"`
 	Image                  string                   `json:"image"`
 	Rootfs                 RootfsSpec               `json:"rootfs"`
 	Ports                  []string                 `json:"ports"`
@@ -511,8 +512,20 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if req.Namespace == "" {
 		req.Namespace = "default"
 	}
-	if req.Runtime == "" {
-		req.Runtime = "runsc"
+	req.LegacyRuntime = strings.TrimSpace(req.LegacyRuntime)
+	req.Rootfs.Runtime = strings.TrimSpace(req.Rootfs.Runtime)
+	if req.LegacyRuntime != "" && req.Rootfs.Runtime != "" && req.LegacyRuntime != req.Rootfs.Runtime {
+		return "", nil, fmt.Errorf(
+			"deprecated top-level runtime %q conflicts with rootfs.runtime %q",
+			req.LegacyRuntime,
+			req.Rootfs.Runtime,
+		)
+	}
+	if req.Rootfs.Runtime == "" {
+		req.Rootfs.Runtime = req.LegacyRuntime
+	}
+	if req.Rootfs.Runtime == "" {
+		req.Rootfs.Runtime = "runsc"
 	}
 	if err := validateScheduleAffinities(req.ScheduleAffinities); err != nil {
 		return "", nil, err
@@ -527,7 +540,6 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if err := validateSandboxStorageMb(req.StorageMb); err != nil {
 		return "", nil, err
 	}
-	req.Rootfs.Runtime = req.Runtime
 	rootfs, err := buildRootfsOption(req.Rootfs, req.Image)
 	if err != nil {
 		return "", nil, err
@@ -1684,26 +1696,92 @@ func ensureSandboxRequestID(ctx *gin.Context, traceID string) string {
 	return requestID
 }
 
-func buildRootfsOption(spec RootfsSpec, fallbackImage string) (string, error) {
-	image := strings.TrimSpace(spec.ImageURL)
-	if image == "" {
-		image = strings.TrimSpace(spec.Image)
-	}
-	if image == "" {
-		image = strings.TrimSpace(fallbackImage)
+func normalizeRootfsSpec(spec RootfsSpec, fallbackImage string) (RootfsSpec, string) {
+	spec.Runtime = strings.TrimSpace(spec.Runtime)
+	spec.Type = strings.TrimSpace(spec.Type)
+	spec.Path = strings.TrimSpace(spec.Path)
+	spec.ImageURL = strings.TrimSpace(spec.ImageURL)
+	fallbackImage = strings.TrimSpace(fallbackImage)
+	image := spec.ImageURL
+	if image == "" && spec.Type != "local" && spec.Type != "s3" {
+		image = fallbackImage
 	}
 	if spec.Type == "" && image != "" {
 		spec.Type = "image"
 	}
-	if spec.Runtime == "" && (spec.Type != "" || spec.Path != "" || image != "") {
+	if spec.Runtime == "" {
 		spec.Runtime = "runsc"
 	}
-	if spec.Type == "image" {
-		spec.ImageURL = image
+	return spec, image
+}
+
+func validateRootfsSpec(spec *RootfsSpec, image string) error {
+	switch spec.Type {
+	case "":
+		if spec.Path != "" || len(spec.StorageInfo) != 0 {
+			return fmt.Errorf("rootfs source fields require type")
+		}
+	case "image":
+		return validateImageRootfs(spec, image)
+	case "local":
+		return validateLocalRootfs(spec)
+	case "s3":
+		return validateS3Rootfs(spec)
+	default:
+		return fmt.Errorf("unsupported rootfs type %q", spec.Type)
 	}
-	if spec.Type == "" && spec.Path == "" && spec.ImageURL == "" {
-		return "", nil
+	return nil
+}
+
+func validateImageRootfs(spec *RootfsSpec, image string) error {
+	if image == "" {
+		return fmt.Errorf("image rootfs requires imageurl")
 	}
+	if spec.Path != "" || len(spec.StorageInfo) != 0 {
+		return fmt.Errorf("image rootfs cannot contain path or storageInfo")
+	}
+	spec.ImageURL = image
+	return nil
+}
+
+func validateLocalRootfs(spec *RootfsSpec) error {
+	if spec.Path == "" {
+		return fmt.Errorf("local rootfs requires path")
+	}
+	if spec.ImageURL != "" || len(spec.StorageInfo) != 0 {
+		return fmt.Errorf("local rootfs cannot contain imageurl or storageInfo")
+	}
+	return nil
+}
+
+func validateS3Rootfs(spec *RootfsSpec) error {
+	if spec.Path != "" || spec.ImageURL != "" {
+		return fmt.Errorf("s3 rootfs cannot contain path or imageurl")
+	}
+	for _, key := range []string{"endpoint", "bucket", "object"} {
+		value, ok := spec.StorageInfo[key].(string)
+		if !ok || strings.TrimSpace(value) == "" {
+			return fmt.Errorf("s3 rootfs requires non-empty storageInfo.%s", key)
+		}
+		spec.StorageInfo[key] = strings.TrimSpace(value)
+	}
+	for _, key := range []string{"accessKey", "secretKey"} {
+		value, exists := spec.StorageInfo[key]
+		if exists {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("storageInfo.%s must be a string", key)
+			}
+		}
+	}
+	return nil
+}
+
+func buildRootfsOption(spec RootfsSpec, fallbackImage string) (string, error) {
+	spec, image := normalizeRootfsSpec(spec, fallbackImage)
+	if err := validateRootfsSpec(&spec, image); err != nil {
+		return "", err
+	}
+
 	data, err := json.Marshal(spec)
 	if err != nil {
 		return "", err
