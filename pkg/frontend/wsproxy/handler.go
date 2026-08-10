@@ -95,6 +95,22 @@ func dialSandboxTunnel(w http.ResponseWriter, r *http.Request) (tunnelContext, b
 	return dialInstanceTunnel(w, instanceID, port, tunnelAddress)
 }
 
+// DialSandboxTunnel is the exported entry point for sibling packages (e.g.
+// httpproxy) that need the same authenticated, resolved, authorized tunnel to
+// the in-sandbox AgentServer but drive the post-dial protocol themselves.
+// It runs the full dialSandboxTunnel pipeline (authenticate -> resolve ->
+// authorize -> dialTunnel), writing a clean 4xx/502 on any failure exactly
+// like the WS path, and returns the established net.Conn on success. The caller
+// owns the returned conn (must close it) and performs its own upper-layer
+// protocol handshake on top of this raw L4 byte stream.
+func DialSandboxTunnel(w http.ResponseWriter, r *http.Request) (net.Conn, bool) {
+	tc, ok := dialSandboxTunnel(w, r)
+	if !ok {
+		return nil, false
+	}
+	return tc.tunnelConn, true
+}
+
 // resolveAndAuthorize resolves the instance route and enforces the cross-tenant
 // guard (system tenant may reach any instance). Writes a clean HTTP status on
 // failure and returns ok=false.
@@ -306,6 +322,13 @@ func tokenFromSubprotocol(r *http.Request) string {
 		}
 	}
 	return ""
+}
+
+// ResolveTargetPort parses the ?port= query param (defaulting to the
+// AgentServer's 18092) and validates it. Exported so sibling packages (e.g.
+// httpproxy) reuse the same port resolution for their virtual WS dial URL.
+func ResolveTargetPort(r *http.Request) (int, error) {
+	return resolveTargetPort(r)
 }
 
 func resolveTargetPort(r *http.Request) (int, error) {

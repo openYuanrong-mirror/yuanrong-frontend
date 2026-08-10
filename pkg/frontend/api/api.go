@@ -42,6 +42,7 @@ import (
 	"frontend/pkg/frontend/common"
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/frontendsdkadapter/handler"
+	"frontend/pkg/frontend/httpproxy"
 	"frontend/pkg/frontend/middleware"
 	"frontend/pkg/frontend/posixws"
 	"frontend/pkg/frontend/webui"
@@ -240,6 +241,13 @@ func InitRoute(r *gin.Engine) {
 	// Agent WS passthrough: L4-tunnel external WebSocket connections through
 	// to an in-sandbox AgentServer (reuses sshproxy's function_proxy tcp.tunnel).
 	r.GET("/serverless/v1/ws", gin.WrapF(wsproxy.HandleWebSocket))
+
+	// HTTP passthrough: L4-tunnel external HTTP requests through to an
+	// in-sandbox HTTP server (reuses the same function_proxy tcp.tunnel as
+	// wsproxy). Frontend is a transparent byte pipe — the in-sandbox server
+	// produces the response. Peer to wsproxy (/serverless/v1/ws) for HTTP
+	// callers; all methods passthrough.
+	r.Any("/serverless/v1/http", gin.WrapF(httpproxy.HandleHTTP))
 
 	// Function invoke tool (requires authentication)
 	r.GET("/functions", gin.WrapF(webui.HandleInvokePage))
