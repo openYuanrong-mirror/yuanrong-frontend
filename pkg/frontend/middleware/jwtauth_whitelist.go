@@ -102,6 +102,15 @@ var defaultAuthWhitelist = []AuthWhitelistRule{
 		MatchType: "exact",
 		SkipAuth:  true,
 	},
+	// HTTP passthrough endpoint - authentication handled inside handler via
+	// the same wsproxy pipeline (DialSandboxTunnel reuses authenticateWebSocket).
+	// All methods passthrough (registered via r.Any).
+	{
+		Path:      "/serverless/v1/http",
+		Methods:   []string{},
+		MatchType: "exact",
+		SkipAuth:  true,
+	},
 	// Note: Other /terminal paths (e.g., /terminal) require JWT authentication
 }
 
