@@ -48,10 +48,6 @@ const (
 	logFileName = "frontend"
 )
 
-func configureRuntimeBackend() error {
-	return util.SetAPIClientRuntimeBackend(config.GetConfig().FunctionInvokeBackend, nil)
-}
-
 func main() {
 	defer func() {
 		log.GetLogger().Sync()
@@ -76,10 +72,7 @@ func main() {
 		logAndPrintError(fmt.Sprintf("init module config error: %s", err.Error()))
 		return
 	}
-	if err = configureRuntimeBackend(); err != nil {
-		logAndPrintError(fmt.Sprintf("invalid runtime backend config: %s", err.Error()))
-		return
-	}
+	util.InitializeDirectProxyRouting()
 	// Fix Critical #4: Load async invocation config
 	asyncinvocation.LoadConfigFromMain(config.GetConfig())
 	urnutils.SetSeparator(config.GetConfig().FunctionNameSeparator)

@@ -19,8 +19,10 @@ package v1
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -32,10 +34,10 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/smartystreets/goconvey/convey"
-	"github.com/valyala/fasthttp"
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/grpc/pb/function"
 	"frontend/pkg/common/faas_common/localauth"
 	"frontend/pkg/common/faas_common/logger/log"
@@ -49,7 +51,6 @@ import (
 	"frontend/pkg/frontend/common/util"
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/functionmeta"
-	"frontend/pkg/frontend/functiontask"
 	"frontend/pkg/frontend/instancemanager"
 	"frontend/pkg/frontend/invocation"
 	"frontend/pkg/frontend/leaseadaptor"
@@ -71,6 +72,49 @@ func constructFakeInvokeRequest(funcName, reqBody string, rw http.ResponseWriter
 }
 
 type fakeClient struct{}
+
+type directProxyInvokeStub struct {
+	err error
+}
+
+func (s *directProxyInvokeStub) Invoke(req util.DirectInvokeRequest) ([]byte, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if len(req.Args) < 2 {
+		return nil, errors.New("direct proxy test invoke requires call request argument")
+	}
+	callReq := &types.CallReq{Header: map[string]string{}}
+	if err := json.Unmarshal(req.Args[1], callReq); err != nil {
+		return nil, err
+	}
+	return json.Marshal(&types.CallResp{
+		InnerCode: strconv.Itoa(statuscode.InnerResponseSuccessCode),
+		Body:      callReq.Body,
+	})
+}
+
+func (*directProxyInvokeStub) CreateInstance(util.DirectCreateRequest) (string, error) {
+	return "", nil
+}
+
+func (*directProxyInvokeStub) CreateRaw(util.DirectRawRequest) ([]byte, error) { return nil, nil }
+
+func (*directProxyInvokeStub) InvokeRaw(util.DirectRawRequest) ([]byte, error) { return nil, nil }
+
+func (*directProxyInvokeStub) KillInstance(util.DirectKillRequest) error { return nil }
+
+func (*directProxyInvokeStub) UploadFile(
+	context.Context, string, string, io.Reader, string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	return nil, nil
+}
+
+func (*directProxyInvokeStub) DownloadFile(
+	context.Context, string, string, int64, string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return nil, nil
+}
 
 func (f *fakeClient) AcquireInstance(functionKey string, req commontype.AcquireOption) (*commontype.InstanceAllocationInfo, error) {
 	// TODO implement me
@@ -261,6 +305,8 @@ func fakeCaaSInvokeHandler(ctx *types.InvokeProcessContext) error {
 }
 
 func Test_InvokeHandler(t *testing.T) {
+	testConfig := newInvokeTestConfig()
+	testConfig.StreamEnable = false
 	patches := []*gomonkey.Patches{
 		gomonkey.ApplyFunc(util.NewClient, func() util.Client {
 			return &fakeClient{}
@@ -268,18 +314,11 @@ func Test_InvokeHandler(t *testing.T) {
 		gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(funcKey string) (*commontype.FuncSpec, bool) {
 			return &commontype.FuncSpec{FunctionKey: funcKey, FuncMetaData: commontype.FuncMetaData{Timeout: 10}}, true
 		}),
-		// new mock
 		gomonkey.ApplyFunc(config.GetConfig, func() *types.Config {
-			return &types.Config{
-				HTTPConfig: &types.FrontendHTTP{MaxRequestBodySize: 1},
-				MemoryEvaluatorConfig: &types.MemoryEvaluatorConfig{
-					RequestMemoryEvaluator: 2,
-				},
-				DefaultTenantLimitQuota: 1800,
-			}
+			return testConfig
 		}),
 		gomonkey.ApplyFunc(upgradecompatible.GetAccessFaaSSchedulerType, func() string {
-			return "libruntime"
+			return ""
 		}),
 		gomonkey.ApplyMethod(reflect.TypeOf(instancemanager.GetFaaSSchedulerInstanceManager()), "IsExist", func(_ *instancemanager.FaaSSchedulerInstanceManager) bool {
 			return true
@@ -287,7 +326,7 @@ func Test_InvokeHandler(t *testing.T) {
 		gomonkey.ApplyMethodFunc(leaseadaptor.GetInstanceManager(), "AcquireInstance", func(ctx *types.InvokeProcessContext, funcSpec *commontype.FuncSpec,
 			logger api.FormatLogger,
 		) (*commontype.InstanceAllocationInfo, snerror.SNError) {
-			return &commontype.InstanceAllocationInfo{}, nil
+			return &commontype.InstanceAllocationInfo{InstanceID: "instance1"}, nil
 		}),
 	}
 	defer func() {
@@ -296,6 +335,8 @@ func Test_InvokeHandler(t *testing.T) {
 			patch.Reset()
 		}
 	}()
+	restoreDirectClient := util.SetDirectProxyClientForTest(&directProxyInvokeStub{})
+	defer restoreDirectClient()
 	fgAdapter := &invocation.FGAdapter{}
 	responsehandler.Handler = fgAdapter.MakeResponseHandler()
 	middleware.Invoker = fgAdapter.MakeInvoker()
@@ -327,7 +368,7 @@ func Test_InvokeHandler(t *testing.T) {
 		convey.So(rw.Code, convey.ShouldEqual, http.StatusInternalServerError)
 	})
 
-	testFgStreamException(t, funcNameDemo, reqBody)
+	testFgStreamException(t, testConfig, funcNameDemo, reqBody)
 
 	convey.Convey("big body", t, func() {
 		rw := httptest.NewRecorder()
@@ -369,9 +410,10 @@ func Test_InvokeHandler(t *testing.T) {
 		convey.So(rw.Code, convey.ShouldEqual, 200)
 	})
 	convey.Convey("invoke failed", t, func() {
-		defer gomonkey.ApplyFunc(util.NewClient, func() util.Client {
-			return &fakeFailedClient{}
-		}).Reset()
+		restoreFailedClient := util.SetDirectProxyClientForTest(&directProxyInvokeStub{
+			err: errors.New("runtime initialization timed out after 3s"),
+		})
+		defer restoreFailedClient()
 		rw := httptest.NewRecorder()
 		ctx := constructFakeInvokeRequest(funcNameDemo, reqBody, rw)
 		InvokeHandler(ctx)
@@ -379,123 +421,6 @@ func Test_InvokeHandler(t *testing.T) {
 		t.Logf("body %s\n", msg)
 		convey.So(msg, convey.ShouldContainSubstring, "runtime initialization timed out after 3s")
 		convey.So(rw.Code, convey.ShouldEqual, 500)
-	})
-	convey.Convey("invoke for fg success", t, func() {
-		resp := &commontype.InstanceResponse{
-			InstanceAllocationInfo: commontype.InstanceAllocationInfo{
-				FuncKey:    "xxxxxxxxxxx/0@base@testpythonbase001/latest",
-				ThreadID:   "lease1-1",
-				InstanceID: "lease1", LeaseInterval: 100000,
-			},
-			ErrorCode:     constant.InsReqSuccessCode,
-			ErrorMessage:  "",
-			SchedulerTime: 0,
-		}
-		body, _ := json.Marshal(resp)
-		c := &fasthttp.Client{}
-		defer gomonkey.ApplyMethod(reflect.TypeOf(c),
-			"DoTimeout", func(c *fasthttp.Client, req *fasthttp.Request,
-				resp *fasthttp.Response, timeout time.Duration,
-			) error {
-				resp.Header.Set(constant.HeaderInnerCode, "0")
-				resp.Header.Set(constant.HeaderWorkerCost, "20")
-				resp.Header.Set(constant.HeaderCallNode, "node1")
-				resp.Header.Set(constant.HeaderCallInstance, "instance1")
-				resp.SetBody(body)
-				resp.SetStatusCode(200)
-				return nil
-			}).Reset()
-		defer gomonkey.ApplyMethod(reflect.TypeOf(functiontask.GetBusProxies()), "IsBusProxyHealthy",
-			func(_ *functiontask.BusProxies, _ string, _ string) bool {
-				return true
-			}).Reset()
-		defer gomonkey.ApplyFunc(config.GetConfig, func() *types.Config {
-			return &types.Config{
-				MemoryEvaluatorConfig: &types.MemoryEvaluatorConfig{
-					RequestMemoryEvaluator: 2,
-				},
-				DefaultTenantLimitQuota: 1800,
-				HTTPConfig: &types.FrontendHTTP{
-					WorkerInstanceReadTimeOut: 60,
-					MaxRequestBodySize:        1,
-				},
-				HTTPSConfig:     &tls.InternalHTTPSConfig{},
-				E2EMaxDelayTime: 60,
-				LocalAuth: &localauth.AuthConfig{
-					AKey:     "ak",
-					SKey:     "sk",
-					Duration: 5,
-				},
-				InvokeMaxRetryTimes: 3,
-				RetryConfig:         &types.RetryConfig{},
-			}
-		}).Reset()
-		rw := httptest.NewRecorder()
-		ctx := constructFakeInvokeRequest(funcNameDemo, reqBody, rw)
-		InvokeHandler(ctx)
-		convey.So(rw.Code, convey.ShouldEqual, 200)
-		convey.So(rw.Header().Get(constant.HeaderCallNode), convey.ShouldEqual, "")
-		convey.So(rw.Header().Get(constant.HeaderCallInstance), convey.ShouldEqual, "")
-		time.Sleep(150 * time.Millisecond)
-	})
-	convey.Convey("invoke for fg failed", t, func() {
-		resp := &commontype.InstanceResponse{
-			InstanceAllocationInfo: commontype.InstanceAllocationInfo{
-				FuncKey:    "xxxxxxxxxxx/0@base@testpythonbase001/latest",
-				ThreadID:   "lease1-1",
-				InstanceID: "lease1", LeaseInterval: 100000,
-			},
-			ErrorCode:     constant.InsReqSuccessCode,
-			ErrorMessage:  "",
-			SchedulerTime: 0,
-		}
-		body, _ := json.Marshal(resp)
-		defer gomonkey.ApplyMethod(reflect.TypeOf(functiontask.GetBusProxies()), "IsBusProxyHealthy",
-			func(_ *functiontask.BusProxies, _ string, _ string) bool {
-				return true
-			}).Reset()
-		c := &fasthttp.Client{}
-		defer gomonkey.ApplyMethod(reflect.TypeOf(c),
-			"DoTimeout", func(c *fasthttp.Client, req *fasthttp.Request,
-				resp *fasthttp.Response, timeout time.Duration,
-			) error {
-				resp.Header.Set(constant.HeaderInnerCode, "200500")
-				resp.Header.Set(constant.HeaderWorkerCost, "20")
-				resp.Header.Set(constant.HeaderCallNode, "node1")
-				resp.Header.Set(constant.HeaderCallInstance, "instance1")
-				resp.SetBody(body)
-				resp.SetStatusCode(200)
-				return nil
-			}).Reset()
-		defer gomonkey.ApplyFunc(config.GetConfig, func() *types.Config {
-			return &types.Config{
-				MemoryEvaluatorConfig: &types.MemoryEvaluatorConfig{
-					RequestMemoryEvaluator: 2,
-				},
-				DefaultTenantLimitQuota: 1800,
-				HTTPConfig: &types.FrontendHTTP{
-					WorkerInstanceReadTimeOut: 60,
-					MaxRequestBodySize:        1,
-				},
-				HTTPSConfig:     &tls.InternalHTTPSConfig{},
-				E2EMaxDelayTime: 60,
-				LocalAuth: &localauth.AuthConfig{
-					AKey:     "ak",
-					SKey:     "sk",
-					Duration: 5,
-				},
-				InvokeMaxRetryTimes: 2,
-				RetryConfig: &types.RetryConfig{
-					InstanceExceptionRetry: true,
-				},
-			}
-		}).Reset()
-		rw := httptest.NewRecorder()
-		ctx := constructFakeInvokeRequest(funcNameDemo, reqBody, rw)
-		InvokeHandler(ctx)
-		convey.So(rw.Code, convey.ShouldEqual, 200)
-		convey.So(rw.Header().Get(constant.HeaderInnerCode), convey.ShouldEqual, "0")
-		time.Sleep(150 * time.Millisecond)
 	})
 	convey.Convey("grace exit", t, func() {
 		middleware.GraceExit()
@@ -546,9 +471,10 @@ func TestExtractFunctionKey(t *testing.T) {
 	}
 }
 
-func testFgStreamException(t *testing.T, funcNameDemo string, reqBody string) {
+func testFgStreamException(t *testing.T, testConfig *types.Config, funcNameDemo string, reqBody string) {
 	convey.Convey("invoke for fg stream upload exception", t, func() {
-		defer gomonkey.ApplyFunc(config.GetConfig, mockFgStreamReqConfig()).Reset()
+		testConfig.StreamEnable = true
+		defer func() { testConfig.StreamEnable = false }()
 		defer gomonkey.ApplyFunc(stream.HTTPStreamInvokeHandler,
 			func(ctx interface{}, timeout interface{}) error {
 				return errors.New("mocked error")
@@ -565,29 +491,27 @@ func testFgStreamException(t *testing.T, funcNameDemo string, reqBody string) {
 	})
 }
 
-func mockFgStreamReqConfig() func() *types.Config {
-	return func() *types.Config {
-		return &types.Config{
-			MemoryEvaluatorConfig: &types.MemoryEvaluatorConfig{
-				RequestMemoryEvaluator: 2,
-			},
-			DefaultTenantLimitQuota: 1800,
-			HTTPConfig: &types.FrontendHTTP{
-				WorkerInstanceReadTimeOut: 60,
-				MaxRequestBodySize:        1,
-				MaxStreamRequestBodySize:  1,
-			},
-			HTTPSConfig:     &tls.InternalHTTPSConfig{},
-			E2EMaxDelayTime: 60,
-			LocalAuth: &localauth.AuthConfig{
-				AKey:     "ak",
-				SKey:     "sk",
-				Duration: 5,
-			},
-			InvokeMaxRetryTimes: 3,
-			RetryConfig:         &types.RetryConfig{},
-			StreamEnable:        true,
-		}
+func newInvokeTestConfig() *types.Config {
+	return &types.Config{
+		MemoryEvaluatorConfig: &types.MemoryEvaluatorConfig{
+			RequestMemoryEvaluator: 2,
+		},
+		DefaultTenantLimitQuota: 1800,
+		HTTPConfig: &types.FrontendHTTP{
+			WorkerInstanceReadTimeOut: 60,
+			MaxRequestBodySize:        1,
+			MaxStreamRequestBodySize:  1,
+		},
+		HTTPSConfig:     &tls.InternalHTTPSConfig{},
+		E2EMaxDelayTime: 60,
+		LocalAuth: &localauth.AuthConfig{
+			AKey:     "ak",
+			SKey:     "sk",
+			Duration: 5,
+		},
+		InvokeMaxRetryTimes: 3,
+		RetryConfig:         &types.RetryConfig{},
+		StreamEnable:        true,
 	}
 }
 

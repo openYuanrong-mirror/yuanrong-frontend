@@ -18,14 +18,12 @@
 package util
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
-	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
@@ -74,8 +72,6 @@ type invokerLibruntime interface {
 	GIncreaseRef(objectIDs []string, remoteClientID ...string) (failedIDs []string, err error)
 	GDecreaseRef(objectIDs []string, remoteClientID ...string) (failedIDs []string, err error)
 	GetAsync(objectID string, cb api.GetAsyncCallback)
-	GetEvent(objectID string, cb api.GetEventCallback)
-	DeleteGetEventCallback(objectID string)
 
 	GetFormatLogger() api.FormatLogger
 	GetCredential() api.Credential
@@ -90,28 +86,6 @@ var clientLibruntime invokerLibruntime
 // SetAPIClientLibruntime set the client provided by the runtime
 func SetAPIClientLibruntime(rt invokerLibruntime) {
 	clientLibruntime = rt
-}
-
-// SetAPIClientRuntimeBackend selects the ordinary function invocation path.
-// Proxy discovery remains independent because SSH tunnel routing also consumes it.
-func SetAPIClientRuntimeBackend(backendType int, rt invokerLibruntime) error {
-	switch backendType {
-	case constant.BackendTypeKernel:
-		SetAPIClientLibruntime(rt)
-	case constant.BackendTypeFrontendProxy:
-		SetAPIClientDirectRuntime(rt)
-	default:
-		return fmt.Errorf("unsupported function invoke backend %d", backendType)
-	}
-	return nil
-}
-
-// SetAPIClientDirectRuntime routes ordinary FaaS invoke calls directly
-// to function_proxy while preserving libruntime for lifecycle and legacy APIs.
-func SetAPIClientDirectRuntime(rt invokerLibruntime) {
-	clientLibruntime = newClientSimpleRuntimeWithProxyClientControlAndFallback(
-		newRoutingFrontendProxyInvokeClient(), rt, true)
-	UseFrontendProxyDiscoveryCache()
 }
 
 // InvokeRequest -
@@ -146,44 +120,30 @@ type InvokeRequest struct {
 	types.ResponseWriter
 }
 
-// SSEChan -
-type SSEChan struct {
-	Event    chan sseEvent
-	EventErr error
-	// WaitEvent 用于通知sse消息处理结束，防止主流程和getEvent回调阻塞等待
-	WaitEvent chan struct{}
-}
-
-type sseEvent struct {
-	Data []byte
-	Err  error
-}
-
 // Client is used to invoke an instance and wait for its response
 type Client interface {
-	AcquireInstance(functionKey string, req types.AcquireOption) (*types.InstanceAllocationInfo, error)
-	ReleaseInstance(allocation *types.InstanceAllocationInfo, abnormal bool)
-	Invoke(req InvokeRequest) ([]byte, error)
-	InvokeByName(req InvokeRequest) ([]byte, error)
-	CreateInstanceRaw(createReq []byte, option api.RawRequestOption) ([]byte, error)
-	InvokeInstanceRaw(invokeReq []byte, option api.RawRequestOption) ([]byte, error)
-	KillRaw(killReq []byte, option api.RawRequestOption) ([]byte, error)
-	CreateRuntimeInstance(funcMeta api.FunctionMeta, args []api.Arg,
-		invokeOpt api.InvokeOptions) (instanceID string, err error)
 	CreateInstanceByLibRt(funcMeta api.FunctionMeta, args []api.Arg,
 		invokeOpt api.InvokeOptions) (instanceID string, err error)
-	InvokeInstanceByLibRtAndGet(funcMeta api.FunctionMeta, instanceID string, args []api.Arg,
-		invokeOpt api.InvokeOptions) ([]byte, error)
-	KillInstance(funcMeta api.FunctionMeta, instanceID string, signal int, payload []byte,
-		invokeOpt api.InvokeOptions) (err error)
 	KillByLibRt(instanceID string, signal int, payload []byte) (err error)
 	IsHealth() bool
 	IsDsHealth() bool
 	GetActiveMasterAddr() string
 }
 
+// LeaseSchedulerClient is the libruntime-backed scheduler invocation seam.
+// Ordinary FaaS function invocation does not use it after an instance lease is
+// acquired; only scheduler/lease protocol calls belong here.
+type LeaseSchedulerClient interface {
+	Invoke(req InvokeRequest) ([]byte, error)
+}
+
 // NewClient return a client used to invoke other functions
 func NewClient() Client {
+	return newDefaultClientLibruntime(clientLibruntime)
+}
+
+// NewLeaseSchedulerClient returns the libruntime-backed scheduler client.
+func NewLeaseSchedulerClient() LeaseSchedulerClient {
 	return newDefaultClientLibruntime(clientLibruntime)
 }
 
@@ -274,88 +234,8 @@ func (c *defaultClient) getRes(objID string, req InvokeRequest) ([]byte, error) 
 	})
 	log.GetLogger().Debugf("invoke AcceptHeader: %s, requestId: %s, objID: %s, instanceId: %s",
 		req.AcceptHeader, req.RequestID, objID, req.InstanceID)
-	if req.AcceptHeader != httpconstant.AcceptEventStream {
-		<-wait
-		return res, resErr
-	}
-	sseChan := &SSEChan{
-		Event:     make(chan sseEvent, 100), // 使用100大小缓冲区，防止libruntime侧回写event消息阻塞
-		WaitEvent: make(chan struct{}, 1),
-	}
-	c.clientLibruntime.GetEvent(objID, func(result []byte, err error) {
-		log.GetLogger().Debugf("event msg: %s, size: %d, objID: %s", string(result), len(result), objID)
-		select {
-		case sseChan.Event <- sseEvent{Data: result, Err: err}:
-		case <-sseChan.WaitEvent:
-			return
-		}
-	})
-	stopSSEHandle := make(chan struct{}) // 用于反向通知sse消息处理结束，防止协程泄露
-	go c.handleEvent(objID, sseChan, req, stopSSEHandle)
-	defer close(stopSSEHandle)
-	select {
-	case <-req.ResponseWriter.ClientDisconnectChan():
-		return nil, fmt.Errorf("client disconnected during wait, stop sse request, objID: %s", objID)
-	case <-wait:
-		if resErr != nil {
-			log.GetLogger().Errorf("notify response error, objID: %s, err: %v", objID, resErr)
-			return res, resErr
-		}
-	case <-sseChan.WaitEvent:
-		if sseChan.EventErr != nil {
-			log.GetLogger().Errorf("handler sse event failed, objID: %s, err: %v", objID, sseChan.EventErr)
-			return nil, sseChan.EventErr
-		}
-		log.GetLogger().Debugf("finish handle sse event, requestId: %s, objID: %s, instanceId: %s",
-			req.RequestID, objID, req.InstanceID)
-		<-wait
-		return res, resErr
-	}
-	<-sseChan.WaitEvent
-	if sseChan.EventErr != nil {
-		log.GetLogger().Errorf("handler sse event failed, objID: %s, err: %v", objID, sseChan.EventErr)
-		return nil, sseChan.EventErr
-	}
-	log.GetLogger().Debugf("finish handle sse event, requestId: %s, objID: %s, instanceId: %s",
-		req.RequestID, objID, req.InstanceID)
-	return res, nil
-}
-
-func (c *defaultClient) handleEvent(objID string, sseChan *SSEChan, req InvokeRequest, stopSSEHandle chan struct{}) {
-	defer func() {
-		if err := recover(); err != nil {
-			log.GetLogger().Errorf("write response err: %v", err)
-		}
-		c.clientLibruntime.DeleteGetEventCallback(objID)
-		close(sseChan.WaitEvent)
-	}()
-	for {
-		select {
-		case <-req.ResponseWriter.ClientDisconnectChan():
-			sseChan.EventErr = fmt.Errorf("client disconnected during wait, stop sse request, objID: %s", objID)
-			return
-		case <-stopSSEHandle:
-			return
-		case event, ok := <-sseChan.Event:
-			if !ok {
-				log.GetLogger().Debugf("event channel closed, objID: %s", objID)
-				return
-			}
-			if event.Err != nil {
-				sseChan.EventErr = event.Err
-				return
-			}
-			data := event.Data
-			if bytes.Equal(data, []byte("yuanrong_event_EOF")) {
-				log.GetLogger().Debugf("event recive EOF, objID: %s", objID)
-				return
-			}
-			_, sseChan.EventErr = req.ResponseWriter.SSEWrite(data)
-			if sseChan.EventErr != nil {
-				return
-			}
-		}
-	}
+	<-wait
+	return res, resErr
 }
 
 func (c *defaultClient) GetActiveMasterAddr() string {
@@ -450,80 +330,8 @@ func (c *defaultClient) InvokeByName(req InvokeRequest) ([]byte, error) {
 	return c.getRes(objID, req)
 }
 
-func (c *defaultClient) CreateInstanceRaw(createReq []byte, option api.RawRequestOption) ([]byte, error) {
-	return c.CreateInstanceRawContext(context.Background(), createReq, option)
-}
-
-func (c *defaultClient) CreateInstanceRawContext(ctx context.Context, createReq []byte,
-	option api.RawRequestOption,
-) ([]byte, error) {
-	if contextual, ok := c.clientLibruntime.(interface {
-		CreateInstanceRawContext(context.Context, []byte, api.RawRequestOption) ([]byte, error)
-	}); ok {
-		return contextual.CreateInstanceRawContext(ctx, createReq, option)
-	}
-	return c.clientLibruntime.CreateInstanceRaw(createReq, option)
-}
-
-// CreateInstanceRawWithContext preserves the existing Client interface while
-// allowing Go-native raw lifecycle backends to inherit the caller context.
-// Legacy clients keep their established context-free rollback behavior.
-func CreateInstanceRawWithContext(ctx context.Context, client Client, createReq []byte,
-	option api.RawRequestOption,
-) ([]byte, error) {
-	if contextual, ok := client.(interface {
-		CreateInstanceRawContext(context.Context, []byte, api.RawRequestOption) ([]byte, error)
-	}); ok {
-		return contextual.CreateInstanceRawContext(ctx, createReq, option)
-	}
-	return client.CreateInstanceRaw(createReq, option)
-}
-
-func (c *defaultClient) InvokeInstanceRaw(invokeReq []byte, option api.RawRequestOption) ([]byte, error) {
-	return c.InvokeInstanceRawContext(context.Background(), invokeReq, option)
-}
-
-func (c *defaultClient) InvokeInstanceRawContext(ctx context.Context, invokeReq []byte,
-	option api.RawRequestOption,
-) ([]byte, error) {
-	if contextual, ok := c.clientLibruntime.(interface {
-		InvokeByInstanceIdRawContext(context.Context, []byte, api.RawRequestOption) ([]byte, error)
-	}); ok {
-		return contextual.InvokeByInstanceIdRawContext(ctx, invokeReq, option)
-	}
-	return c.clientLibruntime.InvokeByInstanceIdRaw(invokeReq, option)
-}
-
-// InvokeInstanceRawWithContext is the context-bearing raw invoke seam used by
-// HTTP and websocket entrypoints without widening the legacy Client contract.
-func InvokeInstanceRawWithContext(ctx context.Context, client Client, invokeReq []byte,
-	option api.RawRequestOption,
-) ([]byte, error) {
-	if contextual, ok := client.(interface {
-		InvokeInstanceRawContext(context.Context, []byte, api.RawRequestOption) ([]byte, error)
-	}); ok {
-		return contextual.InvokeInstanceRawContext(ctx, invokeReq, option)
-	}
-	return client.InvokeInstanceRaw(invokeReq, option)
-}
-
 func (c *defaultClient) KillByLibRt(instanceID string, signal int, payload []byte) error {
 	return c.clientLibruntime.Kill(instanceID, signal, payload, api.InvokeOptions{})
-}
-
-func (c *defaultClient) KillInstance(
-	funcMeta api.FunctionMeta,
-	instanceID string,
-	signal int,
-	payload []byte,
-	invokeOpt api.InvokeOptions,
-) error {
-	if typedRuntime, ok := c.clientLibruntime.(interface {
-		KillInstance(api.FunctionMeta, string, int, []byte, api.InvokeOptions) error
-	}); ok {
-		return typedRuntime.KillInstance(funcMeta, instanceID, signal, payload, invokeOpt)
-	}
-	return c.clientLibruntime.Kill(instanceID, signal, payload, invokeOpt)
 }
 
 func (c *defaultClient) CreateInstanceByLibRt(
@@ -531,56 +339,7 @@ func (c *defaultClient) CreateInstanceByLibRt(
 	args []api.Arg,
 	invokeOpt api.InvokeOptions,
 ) (string, error) {
-	return c.CreateRuntimeInstance(funcMeta, args, invokeOpt)
-}
-
-func (c *defaultClient) CreateRuntimeInstance(
-	funcMeta api.FunctionMeta,
-	args []api.Arg,
-	invokeOpt api.InvokeOptions,
-) (string, error) {
 	return c.clientLibruntime.CreateInstance(funcMeta, args, invokeOpt)
-}
-
-func (c *defaultClient) InvokeInstanceByLibRtAndGet(
-	funcMeta api.FunctionMeta,
-	instanceID string,
-	args []api.Arg,
-	invokeOpt api.InvokeOptions,
-) ([]byte, error) {
-	objID, err := c.clientLibruntime.InvokeByInstanceId(funcMeta, instanceID, args, invokeOpt)
-	if err != nil {
-		return nil, err
-	}
-	return c.getRes(objID, InvokeRequest{BypassDataSystem: invokeOpt.BypassDataSystem})
-}
-
-func (c *defaultClient) KillRaw(killReq []byte, option api.RawRequestOption) ([]byte, error) {
-	return c.KillRawContext(context.Background(), killReq, option)
-}
-
-func (c *defaultClient) KillRawContext(ctx context.Context, killReq []byte,
-	option api.RawRequestOption,
-) ([]byte, error) {
-	if contextual, ok := c.clientLibruntime.(interface {
-		KillRawContext(context.Context, []byte, api.RawRequestOption) ([]byte, error)
-	}); ok {
-		return contextual.KillRawContext(ctx, killReq, option)
-	}
-	return c.clientLibruntime.KillRaw(killReq, option)
-}
-
-// KillRawWithContext is the context-bearing raw kill seam. The compatibility
-// fallback remains explicit when the selected backend has no contextual API.
-func KillRawWithContext(ctx context.Context, client Client, killReq []byte,
-	option api.RawRequestOption,
-) ([]byte, error) {
-	if contextual, ok := client.(interface {
-		KillRawContext(context.Context, []byte, api.RawRequestOption) ([]byte, error)
-	}); ok {
-		return contextual.KillRawContext(ctx, killReq, option)
-	}
-	return client.KillRaw(killReq, option)
 }
 
 func (c *defaultClient) IsHealth() bool {
@@ -591,10 +350,7 @@ func (c *defaultClient) IsDsHealth() bool {
 	return c.clientLibruntime.IsDsHealth()
 }
 
-// FileTransferClient is an independent capability interface for streaming
-// files to/from a function instance's owning proxy. It is intentionally kept
-// off the Client and invokerLibruntime interfaces so that alternative
-// backends do not have to implement file transfer unless they advertise it.
+// FileTransferClient streams files through an instance's owning proxy.
 type FileTransferClient interface {
 	// UploadFile streams reader to the owning proxy of instanceID. The proxy
 	// writes the bytes to path inside the instance's filesystem sandbox.
@@ -605,53 +361,4 @@ type FileTransferClient interface {
 	// io.EOF and must close the stream when finished.
 	DownloadFile(ctx context.Context, instanceID string, path string,
 		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
-}
-
-// AsFileTransferClient returns a FileTransferClient backed by client when the
-// selected runtime backend advertises file transfer, otherwise nil. This
-// keeps the capability opt-in and backend-switch compatible without widening
-// the Client interface.
-func AsFileTransferClient(client Client) FileTransferClient {
-	if client == nil {
-		return nil
-	}
-	if tc, ok := client.(FileTransferClient); ok {
-		return tc
-	}
-	return nil
-}
-
-// fileTransferFallbackClient is a process-wide singleton for the Kernel
-// backend path where clientLibruntime does not implement FileTransferClient.
-// It reuses a single routingFrontendProxyInvokeClient (and its gRPC
-// connection pool) so concurrent uploads/downloads share connections
-// instead of creating a new pool per call.
-var fileTransferFallbackClient = &routingFrontendProxyInvokeClient{
-	resolver:         defaultFrontendProxyRouteResolver{},
-	clientFactory:    newFrontendProxyGRPCClientPool(),
-	frontendClientID: currentFrontendClientID(),
-}
-
-// UploadFile delegates to the underlying runtime when it implements file
-// transfer; otherwise it falls back to the process-wide
-// routingFrontendProxyInvokeClient which talks directly to function_proxy
-// over gRPC, independent of the configured invoke backend mode.
-func (c *defaultClient) UploadFile(ctx context.Context, instanceID string, path string,
-	reader io.Reader, tenantID string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	if tc, ok := c.clientLibruntime.(FileTransferClient); ok {
-		return tc.UploadFile(ctx, instanceID, path, reader, tenantID)
-	}
-	return fileTransferFallbackClient.UploadFile(ctx, instanceID, path, reader, tenantID)
-}
-
-// DownloadFile delegates to the underlying runtime when it implements file
-// transfer; otherwise it falls back to the process-wide singleton.
-func (c *defaultClient) DownloadFile(ctx context.Context, instanceID string, path string,
-	offset int64, tenantID string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	if tc, ok := c.clientLibruntime.(FileTransferClient); ok {
-		return tc.DownloadFile(ctx, instanceID, path, offset, tenantID)
-	}
-	return fileTransferFallbackClient.DownloadFile(ctx, instanceID, path, offset, tenantID)
 }

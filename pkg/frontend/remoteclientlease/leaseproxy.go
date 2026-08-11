@@ -158,7 +158,7 @@ func invokeFaasManager(traceID, remoteClientID, op string) *lease.LeaseResponse 
 	if config.GetConfig().RetryConfig != nil && config.GetConfig().RetryConfig.InstanceExceptionRetry {
 		msg.RetryTimes = config.GetConfig().InvokeMaxRetryTimes
 	}
-	respData, err := util.NewClient().Invoke(msg)
+	respData, err := util.NewLeaseSchedulerClient().Invoke(msg)
 	if err != nil {
 		log.GetLogger().Errorf("failed to send request, err: %s, traceID: %s", err.Error(), traceID)
 		err = setEventToEtcd(remoteClientID, op, traceID)

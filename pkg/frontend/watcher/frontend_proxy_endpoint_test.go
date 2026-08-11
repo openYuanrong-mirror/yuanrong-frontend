@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"frontend/pkg/common/faas_common/etcd3"
-	"frontend/pkg/frontend/common/util"
+	"frontend/pkg/frontend/proxyrouting"
 )
 
 func TestParseFrontendProxyEndpoint(t *testing.T) {
@@ -39,10 +39,10 @@ func TestParseFrontendProxyEndpoint(t *testing.T) {
 
 	require.True(t, ok)
 	require.Equal(t, "node-a", endpoint.NodeID)
-	require.Equal(t, "10.0.0.11:22769", endpoint.Address)
+	require.Equal(t, "10.0.0.11:22769", endpoint.GRPCAddress)
 	require.Equal(t, "10.0.0.11:22775", endpoint.TCPTunnelAddress)
-	require.True(t, endpoint.Capabilities["faas.create"])
-	require.True(t, endpoint.Capabilities["tcp.tunnel"])
+	require.True(t, endpoint.Capabilities[proxyrouting.CapabilityCreate])
+	require.True(t, endpoint.Capabilities[proxyrouting.CapabilityTCPTunnel])
 	require.Equal(t, "v1", endpoint.Version)
 }
 
@@ -54,31 +54,31 @@ func TestParseFrontendProxyEndpointRejectsUnhealthyRegistration(t *testing.T) {
 }
 
 func TestFrontendProxyEndpointHandlerAppliesPutAndDelete(t *testing.T) {
-	util.ReplaceFrontendProxyDiscoverySnapshot(nil)
-	t.Cleanup(func() { util.ReplaceFrontendProxyDiscoverySnapshot(nil) })
+	proxyrouting.ReplaceSnapshot(nil)
+	t.Cleanup(func() { proxyrouting.ReplaceSnapshot(nil) })
 	key := frontendProxyEndpointPrefix + "node-a"
 	frontendProxyEndpointHandler(&etcd3.Event{Type: etcd3.PUT, Key: key, Rev: 10, Value: []byte(`{
 		"proxyService":{"grpcAddress":"10.0.0.11:22769","tcpTunnelAddress":"10.0.0.11:22775",
 		"capabilities":["faas.invoke","tcp.tunnel"],"health":"healthy"}
 	}`)})
 
-	endpoint, ok := util.LookupFrontendProxyEndpoint("node-a", "faas.invoke")
+	endpoint, ok := proxyrouting.Lookup("node-a", proxyrouting.CapabilityInvoke)
 	require.True(t, ok)
-	require.Equal(t, "10.0.0.11:22769", endpoint.Address)
-	tunnelAddress, ok := util.LookupProxyTCPTunnelAddress("node-a")
+	require.Equal(t, "10.0.0.11:22769", endpoint.GRPCAddress)
+	tunnelEndpoint, ok := proxyrouting.Lookup("node-a", proxyrouting.CapabilityTCPTunnel)
 	require.True(t, ok)
-	require.Equal(t, "10.0.0.11:22775", tunnelAddress)
+	require.Equal(t, "10.0.0.11:22775", tunnelEndpoint.TCPTunnelAddress)
 
 	frontendProxyEndpointHandler(&etcd3.Event{Type: etcd3.DELETE, Key: key, Rev: 11})
-	_, ok = util.LookupFrontendProxyEndpoint("node-a", "faas.invoke")
+	_, ok = proxyrouting.Lookup("node-a", proxyrouting.CapabilityInvoke)
 	require.False(t, ok)
-	_, ok = util.LookupProxyTCPTunnelAddress("node-a")
+	_, ok = proxyrouting.Lookup("node-a", proxyrouting.CapabilityTCPTunnel)
 	require.False(t, ok)
 }
 
 func TestFrontendProxyEndpointHandlerIgnoresOlderRevision(t *testing.T) {
-	util.ReplaceFrontendProxyDiscoverySnapshot(nil)
-	t.Cleanup(func() { util.ReplaceFrontendProxyDiscoverySnapshot(nil) })
+	proxyrouting.ReplaceSnapshot(nil)
+	t.Cleanup(func() { proxyrouting.ReplaceSnapshot(nil) })
 	key := frontendProxyEndpointPrefix + "node-a"
 	registration := func(address string) []byte {
 		return []byte(`{"proxyService":{"grpcAddress":"` + address +
@@ -89,9 +89,9 @@ func TestFrontendProxyEndpointHandlerIgnoresOlderRevision(t *testing.T) {
 	frontendProxyEndpointHandler(&etcd3.Event{Type: etcd3.PUT, Key: key, Rev: 19,
 		Value: registration("10.0.0.19:22769")})
 
-	endpoint, ok := util.LookupFrontendProxyEndpoint("node-a", "faas.invoke")
+	endpoint, ok := proxyrouting.Lookup("node-a", proxyrouting.CapabilityInvoke)
 	require.True(t, ok)
-	require.Equal(t, "10.0.0.20:22769", endpoint.Address)
+	require.Equal(t, "10.0.0.20:22769", endpoint.GRPCAddress)
 }
 
 func TestFrontendProxyEndpointFilter(t *testing.T) {

@@ -27,13 +27,13 @@ import (
 
 // Processor handles create/invoke operations
 type Processor struct {
-	client util.Client
+	client util.FunctionSystemClient
 }
 
 // NewProcessor creates a new Processor instance
 func NewProcessor() *Processor {
 	return &Processor{
-		client: util.NewClient(),
+		client: util.GetFunctionSystemClient(),
 	}
 }
 
@@ -48,7 +48,7 @@ func (p *Processor) ProcessCreate(ctx context.Context, payload string, headers m
 		TraceParent: headers["X-Trace-Parent"],
 	}
 
-	resp, err := util.CreateInstanceRawWithContext(ctx, p.client, rawPayload, option)
+	resp, err := p.client.CreateRaw(ctx, rawPayload, option)
 	if err != nil {
 		return "", err
 	}
@@ -67,7 +67,7 @@ func (p *Processor) ProcessInvoke(ctx context.Context, payload string, headers m
 		TraceParent: headers["X-Trace-Parent"],
 	}
 
-	resp, err := util.InvokeInstanceRawWithContext(ctx, p.client, rawPayload, option)
+	resp, err := p.client.InvokeRaw(ctx, rawPayload, option)
 	if err != nil {
 		return "", err
 	}
@@ -80,7 +80,7 @@ func (p *Processor) ProcessCreateRaw(ctx context.Context, payload []byte, header
 	option := api.RawRequestOption{
 		TraceParent: headers["X-Trace-Parent"],
 	}
-	return util.CreateInstanceRawWithContext(ctx, p.client, payload, option)
+	return p.client.CreateRaw(ctx, payload, option)
 }
 
 // ProcessInvokeRaw handles invoke operation with raw binary payload (no base64)
@@ -88,5 +88,5 @@ func (p *Processor) ProcessInvokeRaw(ctx context.Context, payload []byte, header
 	option := api.RawRequestOption{
 		TraceParent: headers["X-Trace-Parent"],
 	}
-	return util.InvokeInstanceRawWithContext(ctx, p.client, payload, option)
+	return p.client.InvokeRaw(ctx, payload, option)
 }

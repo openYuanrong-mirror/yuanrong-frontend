@@ -109,7 +109,6 @@ type Config struct {
 	StreamEnable            bool                               `json:"streamEnable"  valid:"optional"`
 	StateDisable            bool                               `json:"stateDisable"  valid:"optional"`
 	BusinessType            int                                `json:"businessType"`
-	FunctionInvokeBackend   int                                `json:"functionInvokeBackend" valid:"optional"`
 	ComponentMTLSEnable     bool                               `json:"componentMTLSEnable" valid:"optional"`
 	SccConfig               crypto.SccConfig                   `json:"sccConfig" valid:"optional"`
 	Image                   string                             `json:"image" valid:"optional"`

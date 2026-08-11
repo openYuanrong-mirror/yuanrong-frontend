@@ -22,7 +22,7 @@ import (
 
 	"frontend/pkg/common/faas_common/etcd3"
 	"frontend/pkg/common/faas_common/logger/log"
-	"frontend/pkg/frontend/common/util"
+	"frontend/pkg/frontend/proxyrouting"
 )
 
 const frontendProxyEndpointPrefix = "/yr/busproxy/business/yrk/tenant/0/node/"
@@ -60,13 +60,13 @@ func frontendProxyEndpointHandler(event *etcd3.Event) {
 	case etcd3.PUT, etcd3.HISTORYUPDATE:
 		endpoint, ok := parseFrontendProxyEndpoint(nodeID, event.Value)
 		if !ok {
-			util.DeleteFrontendProxyEndpointAtRevision(nodeID, event.Rev)
+			proxyrouting.DeleteAtRevision(nodeID, event.Rev)
 			return
 		}
 		endpoint.Revision = event.Rev
-		util.UpsertFrontendProxyEndpoint(endpoint)
+		proxyrouting.Upsert(endpoint)
 	case etcd3.DELETE, etcd3.HISTORYDELETE:
-		util.DeleteFrontendProxyEndpointAtRevision(nodeID, event.Rev)
+		proxyrouting.DeleteAtRevision(nodeID, event.Rev)
 	case etcd3.SYNCED:
 		log.GetLogger().Infof("frontend proxy endpoint cache synced")
 	case etcd3.ERROR:
@@ -76,11 +76,11 @@ func frontendProxyEndpointHandler(event *etcd3.Event) {
 	}
 }
 
-func parseFrontendProxyEndpoint(nodeID string, value []byte) (util.FrontendProxyEndpoint, bool) {
+func parseFrontendProxyEndpoint(nodeID string, value []byte) (proxyrouting.Endpoint, bool) {
 	var registration frontendProxyRegistration
 	if err := json.Unmarshal(value, &registration); err != nil {
 		log.GetLogger().Warnf("failed to parse frontend proxy registration for node %s: %s", nodeID, err)
-		return util.FrontendProxyEndpoint{}, false
+		return proxyrouting.Endpoint{}, false
 	}
 	if registration.Node != "" {
 		nodeID = registration.Node
@@ -88,19 +88,19 @@ func parseFrontendProxyEndpoint(nodeID string, value []byte) (util.FrontendProxy
 	service := registration.ProxyService
 	if nodeID == "" || (service.GRPCAddress == "" && service.TCPTunnelAddress == "") ||
 		!strings.EqualFold(service.Health, "healthy") {
-		return util.FrontendProxyEndpoint{}, false
+		return proxyrouting.Endpoint{}, false
 	}
-	capabilities := make(map[string]bool, len(service.Capabilities))
+	capabilities := make(map[proxyrouting.Capability]bool, len(service.Capabilities))
 	for _, capability := range service.Capabilities {
 		if capability != "" {
-			capabilities[capability] = true
+			capabilities[proxyrouting.Capability(capability)] = true
 		}
 	}
 	if len(capabilities) == 0 {
-		return util.FrontendProxyEndpoint{}, false
+		return proxyrouting.Endpoint{}, false
 	}
-	return util.FrontendProxyEndpoint{
-		NodeID: nodeID, Address: service.GRPCAddress, TCPTunnelAddress: service.TCPTunnelAddress,
+	return proxyrouting.Endpoint{
+		NodeID: nodeID, GRPCAddress: service.GRPCAddress, TCPTunnelAddress: service.TCPTunnelAddress,
 		Capabilities: capabilities, Version: service.Version, Health: service.Health,
 	}, true
 }

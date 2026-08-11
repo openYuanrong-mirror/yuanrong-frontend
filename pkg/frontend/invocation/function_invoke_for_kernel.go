@@ -75,6 +75,31 @@ var (
 	}
 )
 
+type directProxyInvokeError struct {
+	code        int
+	message     string
+	retryable   bool
+	retryReason string
+}
+
+func (e *directProxyInvokeError) Code() int {
+	if e == nil {
+		return statuscode.FrontendStatusInternalError
+	}
+	return e.code
+}
+
+func (e *directProxyInvokeError) Error() string {
+	if e == nil {
+		return "direct proxy invoke failed with nil error"
+	}
+	return e.message
+}
+
+func (e *directProxyInvokeError) canRetryBeforeDispatch() bool {
+	return e != nil && e.retryable
+}
+
 func computeTimeout(originTimeout int64, beginTime time.Time) int64 {
 	costTime := time.Now().Sub(beginTime)
 	costTimeSecond := int64(math.Trunc(costTime.Seconds()))
@@ -344,7 +369,7 @@ func (k *kernelRequestHandler) invoke() error {
 			wisecloud.GetMetricsManager().InvokeStart(k.funcKey, k.resSpecKeyStr, req.InstanceID)
 		}
 
-		snError := invokeFunctionWithLibRuntime(k.ctx, *req, logger)
+		snError := invokeFunctionWithDirectProxy(k.ctx, *req, logger)
 		if k.downgrade {
 			wisecloud.GetMetricsManager().InvokeEnd(k.funcKey, k.resSpecKeyStr, req.InstanceID)
 		}
@@ -375,6 +400,19 @@ func (k *kernelRequestHandler) handleInvokeError(snError snerror.SNError, instan
 	bool, error) {
 	if snError == nil {
 		return false, nil
+	}
+	if directErr, ok := snError.(*directProxyInvokeError); ok {
+		if directErr.canRetryBeforeDispatch() {
+			logger.Warnf("direct proxy invoke failed before dispatch, reschedule, code: %d, reason: %s, message: %s",
+				directErr.Code(), directErr.retryReason, directErr.Error())
+			// The failure belongs to routing or transport rather than the instance. Return the lease normally,
+			// then let the bounded outer retry resolve the owner again.
+			k.ctx.ShouldRetry = true
+			return false, directErr
+		}
+		logger.Errorf("direct proxy invoke failed without safe retry, code: %d, reason: %s, message: %s",
+			directErr.Code(), directErr.retryReason, directErr.Error())
+		return false, directErr
 	}
 	if snError.Code() == constant.AcquireLeaseTrafficLimitErrorCode && k.legacyCurrentSchedulerInfo != nil {
 		k.ctx.TrafficLimited = true
@@ -456,40 +494,28 @@ func convertResSpecKey(ctx *types.InvokeProcessContext, funcSpec *commontype.Fun
 	return resspeckey.ConvertToResSpecKey(resSpec)
 }
 
-func invokeFunctionWithLibRuntime(ctx *types.InvokeProcessContext, request util.InvokeRequest,
+func invokeFunctionWithDirectProxy(ctx *types.InvokeProcessContext, request util.InvokeRequest,
 	logger api.FormatLogger) snerror.SNError {
 	logger.Infof("send request %v to grpc", request)
 
 	invokeStart := time.Now()
 	var notifyMsg []byte
 	var err error
-	if request.InstanceID != "" {
-		notifyMsg, err = util.NewClient().Invoke(request)
+	if request.InstanceID == "" {
+		err = fmt.Errorf("direct proxy invoke requires scheduler-owned instance id")
 	} else {
-		// legacy
-		notifyMsg, err = util.NewClient().InvokeByName(request)
+		var directReq util.DirectInvokeRequest
+		directReq, err = util.NewDirectInvokeRequest(request)
+		if err == nil {
+			notifyMsg, err = util.GetDirectProxyClient().Invoke(directReq)
+		}
 	}
 
 	invokeTotalTime := time.Since(invokeStart)
 	logger.Debugf("get response %s, err: %v", string(notifyMsg), err)
 
 	if err != nil {
-		if rtErr, ok := err.(api.ErrorInfo); ok {
-			logger.Errorf("invoke request, errCode: %d, error: %s, totalTime: %v",
-				rtErr.Code, rtErr.Error(), invokeTotalTime.Seconds())
-			if snErr := checkErrorMsg(rtErr.Error()); snErr != nil {
-				return snErr
-			}
-			return snerror.New(rtErr.Code, rtErr.Error())
-		}
-		if snError := checkInstanceResp(notifyMsg); snError != nil {
-			return snError
-		}
-		logger.Errorf("invoke GRPC request error: %s, totalTime: %v", err.Error(), invokeTotalTime.Seconds())
-		errMsg := fmt.Sprintf("invoke GRPC request error: %s", err.Error())
-		// todo 暂时保存，后续可以考虑取消JudgeRetry
-		httputil.JudgeRetry(err, ctx)
-		return snerror.New(statuscode.FrontendStatusInternalError, errMsg)
+		return handleDirectProxyInvokeError(ctx, notifyMsg, err, invokeTotalTime, logger)
 	}
 	respMsg, snErr := responsehandler.SetResponseInContext(ctx, notifyMsg)
 	if snErr != nil {
@@ -502,6 +528,35 @@ func invokeFunctionWithLibRuntime(ctx *types.InvokeProcessContext, request util.
 	logger.Infof("invoke end, totalTime: %f, executorTime: %f, userTime: %f", invokeTotalTime.Seconds(),
 		httputil.GetTimeFromResp(respMsg.ExecutorTime).Seconds(), httputil.GetTimeFromResp(respMsg.UserFuncTime).Seconds())
 	return nil
+}
+
+func handleDirectProxyInvokeError(ctx *types.InvokeProcessContext, notifyMsg []byte, err error,
+	invokeTotalTime time.Duration, logger api.FormatLogger,
+) snerror.SNError {
+	if metadata, ok := util.GetDirectProxyErrorMetadata(err); ok {
+		logger.Errorf("direct proxy invoke failed, code: %d, retryable: %t, reason: %s, error: %s, totalTime: %v",
+			metadata.Code, metadata.Retryable, metadata.RetryReason, err.Error(), invokeTotalTime.Seconds())
+		return &directProxyInvokeError{
+			code: metadata.Code, message: err.Error(), retryable: metadata.Retryable,
+			retryReason: metadata.RetryReason,
+		}
+	}
+	if rtErr, ok := err.(api.ErrorInfo); ok {
+		logger.Errorf("invoke request, errCode: %d, error: %s, totalTime: %v",
+			rtErr.Code, rtErr.Error(), invokeTotalTime.Seconds())
+		if snErr := checkErrorMsg(rtErr.Error()); snErr != nil {
+			return snErr
+		}
+		return snerror.New(rtErr.Code, rtErr.Error())
+	}
+	if snError := checkInstanceResp(notifyMsg); snError != nil {
+		return snError
+	}
+	logger.Errorf("invoke GRPC request error: %s, totalTime: %v", err.Error(), invokeTotalTime.Seconds())
+	errMsg := fmt.Sprintf("invoke GRPC request error: %s", err.Error())
+	// todo 暂时保存，后续可以考虑取消JudgeRetry
+	httputil.JudgeRetry(err, ctx)
+	return snerror.New(statuscode.FrontendStatusInternalError, errMsg)
 }
 
 func convert(ctx *types.InvokeProcessContext, funcSpec *commontype.FuncSpec,
