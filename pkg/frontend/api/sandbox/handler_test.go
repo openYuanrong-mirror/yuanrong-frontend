@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -40,6 +41,43 @@ const (
 	testInvokeFailureCode      = 2002
 	testMemoryLimit            = 4096
 )
+
+type eofTrackingBody struct {
+	reader *bytes.Reader
+	sawEOF bool
+}
+
+func (b *eofTrackingBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.sawEOF = true
+	}
+	return n, err
+}
+
+func (b *eofTrackingBody) Close() error {
+	return nil
+}
+
+type eofCheckingRecorder struct {
+	*httptest.ResponseRecorder
+	body           *eofTrackingBody
+	wroteBeforeEOF bool
+}
+
+func (r *eofCheckingRecorder) WriteHeader(statusCode int) {
+	if !r.body.sawEOF {
+		r.wroteBeforeEOF = true
+	}
+	r.ResponseRecorder.WriteHeader(statusCode)
+}
+
+func (r *eofCheckingRecorder) Write(p []byte) (int, error) {
+	if !r.body.sawEOF {
+		r.wroteBeforeEOF = true
+	}
+	return r.ResponseRecorder.Write(p)
+}
 
 type sandboxTimeoutTestCase struct {
 	name             string
@@ -1656,6 +1694,118 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	expectedScheduleMs := int64(customCreateTimeoutSeconds-sandboxScheduleBufferSeconds) * millisecondsPerSecond
 	require.Equal(t, expectedScheduleMs, capturedInvokeOpt.ScheduleTimeoutMs)
 	require.Equal(t, strconv.Itoa(customCreateTimeoutSeconds), capturedInvokeOpt.CreateOpt["call_timeout"])
+}
+
+func TestCreateV1HandlerReadsRequestBodyToEOFBeforeSSE(t *testing.T) {
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(api.FunctionMeta, []api.Arg, api.InvokeOptions) (string, error) {
+			return "sandbox-body-eof", nil
+		},
+	})
+	body, err := json.Marshal(CreateV1Request{
+		Name:      "sandbox-body-eof",
+		Namespace: "default",
+		Image:     "ubuntu:22.04",
+	})
+	require.NoError(t, err)
+	requestBody := &eofTrackingBody{reader: bytes.NewReader(body)}
+	recorder := &eofCheckingRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		body:             requestBody,
+	}
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", requestBody)
+	require.NoError(t, err)
+	ctx.Request.Header.Set("Accept", "text/event-stream")
+
+	CreateV1Handler(ctx)
+
+	require.True(t, requestBody.sawEOF)
+	require.False(t, recorder.wroteBeforeEOF)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "event: accepted")
+}
+
+func TestCreateV1HandlerReadsRequestBodyToEOFBeforeJSONResponse(t *testing.T) {
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(api.FunctionMeta, []api.Arg, api.InvokeOptions) (string, error) {
+			return "sandbox-json-body-eof", nil
+		},
+	})
+	body, err := json.Marshal(CreateV1Request{
+		Name:      "sandbox-json-body-eof",
+		Namespace: "default",
+		Image:     "ubuntu:22.04",
+	})
+	require.NoError(t, err)
+	requestBody := &eofTrackingBody{reader: bytes.NewReader(body)}
+	recorder := &eofCheckingRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		body:             requestBody,
+	}
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", requestBody)
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.True(t, requestBody.sawEOF)
+	require.False(t, recorder.wroteBeforeEOF)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotEqual(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+}
+
+func TestCreateV1HandlerRejectsOversizedBodyBeforeSSE(t *testing.T) {
+	createCalled := false
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(api.FunctionMeta, []api.Arg, api.InvokeOptions) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+	})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := strings.NewReader(strings.Repeat(" ", sandboxCreateRequestBodyLimit+1))
+	var err error
+	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", body)
+	require.NoError(t, err)
+	ctx.Request.Header.Set("Accept", "text/event-stream")
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, recorder.Code)
+	require.False(t, createCalled)
+	require.NotEqual(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+	require.NotContains(t, recorder.Body.String(), "event: accepted")
+	require.Contains(t, recorder.Body.String(), "request body exceeds 1048576 bytes")
+}
+
+func TestCreateV1HandlerRejectsTrailingJSONBeforeSSE(t *testing.T) {
+	createCalled := false
+	util.SetAPIClientLibruntime(&runtimeStub{
+		createInstance: func(api.FunctionMeta, []api.Arg, api.InvokeOptions) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+	})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	var err error
+	ctx.Request, err = http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		strings.NewReader(`{"image":"ubuntu:22.04"}{"unexpected":"document"}`),
+	)
+	require.NoError(t, err)
+	ctx.Request.Header.Set("Accept", "text/event-stream")
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.False(t, createCalled)
+	require.NotEqual(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+	require.NotContains(t, recorder.Body.String(), "event: accepted")
+	require.Contains(t, recorder.Body.String(), "invalid request body")
 }
 
 func TestCreateV1HandlerRejectsConcurrentExplicitNameWithDifferentRequestID(t *testing.T) {
