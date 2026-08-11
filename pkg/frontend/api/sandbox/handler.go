@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -98,6 +99,7 @@ const (
 	sandboxCreateStatusFailed      = "failed"
 	sandboxCreateReplayTTL         = 10 * time.Minute
 	sandboxCreateReplayMaxEntries  = 10000
+	sandboxCreateRequestBodyLimit  = 1 << 20
 	sandboxRawRequestIDLength      = 18
 	sandboxRawRequestSequence      = "00"
 	sandboxXPUFieldCount           = 3
@@ -480,8 +482,8 @@ func CreateV1Handler(ctx *gin.Context) {
 	traceID := ensureSandboxTrace(ctx)
 	requestID := ensureSandboxRequestID(ctx, traceID)
 	var req CreateV1Request
-	if err := ctx.ShouldBindJSON(&req); err != nil {
-		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err))
+	if status, err := readCreateV1Request(ctx, &req); err != nil {
+		app.SetCtxResponse(ctx, nil, status, err)
 		return
 	}
 	rootfs, tunnelInfo, err := prepareCreateV1Request(&req)
@@ -502,6 +504,24 @@ func CreateV1Handler(ctx *gin.Context) {
 	app.SetCtxResponse(
 		ctx, createV1Response(result.instanceID, sandboxCreateStatusRunning, requestID, tunnelInfo), http.StatusOK, nil,
 	)
+}
+
+func readCreateV1Request(ctx *gin.Context, req *CreateV1Request) (int, error) {
+	ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, sandboxCreateRequestBodyLimit)
+	body, err := io.ReadAll(ctx.Request.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return http.StatusRequestEntityTooLarge, fmt.Errorf(
+				"request body exceeds %d bytes", sandboxCreateRequestBodyLimit,
+			)
+		}
+		return http.StatusBadRequest, fmt.Errorf("failed to read request body: %v", err)
+	}
+	if err := json.Unmarshal(body, req); err != nil {
+		return http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err)
+	}
+	return 0, nil
 }
 
 func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
