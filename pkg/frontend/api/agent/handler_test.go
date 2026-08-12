@@ -18,6 +18,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ import (
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/common/util"
@@ -65,6 +67,45 @@ func stubInstanceFound(t *testing.T, instanceID string) *gomonkey.Patches {
 type runtimeStub struct {
 	createInstance func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error)
 	kill           func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error
+}
+
+func setAPIClientsForTest(t *testing.T, runtime *runtimeStub) {
+	t.Helper()
+	util.SetAPIClientLibruntime(runtime)
+	restore := util.SetDirectProxyClientForTest(&directRuntimeStub{runtime: runtime})
+	t.Cleanup(restore)
+}
+
+type directRuntimeStub struct{ runtime *runtimeStub }
+
+func (r *directRuntimeStub) Invoke(util.DirectInvokeRequest) ([]byte, error) { return nil, nil }
+
+func (r *directRuntimeStub) CreateInstance(req util.DirectCreateRequest) (string, error) {
+	funcMeta, args, options := req.AdaptedCreateValues()
+	return r.runtime.CreateInstance(funcMeta, args, options)
+}
+
+func (r *directRuntimeStub) CreateRaw(util.DirectRawRequest) ([]byte, error) { return nil, nil }
+func (r *directRuntimeStub) InvokeRaw(util.DirectRawRequest) ([]byte, error) { return nil, nil }
+
+func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
+	return r.runtime.Kill(req.InstanceID, req.Signal, req.Payload, req.AdaptedInvokeOptions())
+}
+
+func (r *directRuntimeStub) UploadFile(ctx context.Context, instanceID, path string, reader io.Reader,
+	tenantID string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	return r.runtime.UploadFile(ctx, instanceID, path, reader, tenantID)
+}
+
+func (r *directRuntimeStub) DownloadFile(ctx context.Context, instanceID, path string, offset int64,
+	tenantID string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return r.runtime.DownloadFile(ctx, instanceID, path, offset, tenantID)
+}
+
+func (r *runtimeStub) Invoke(util.InvokeRequest) ([]byte, error) {
+	return nil, nil
 }
 
 func (r *runtimeStub) CreateInstance(
@@ -104,6 +145,18 @@ func (r *runtimeStub) Kill(instanceID string, signal int, payload []byte, invoke
 		return r.kill(instanceID, signal, payload, invokeOpt)
 	}
 	return nil
+}
+
+func (r *runtimeStub) UploadFile(
+	context.Context, string, string, io.Reader, string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	return nil, nil
+}
+
+func (r *runtimeStub) DownloadFile(
+	context.Context, string, string, int64, string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return nil, nil
 }
 
 func (r *runtimeStub) CreateInstanceRaw(createReqRaw []byte, option api.RawRequestOption) ([]byte, error) {
@@ -244,7 +297,7 @@ func newAgentCreateRecorder(t *testing.T, req CreateAgentRequest) (*httptest.Res
 func TestCreateHandlerBuildsAgentFuncMetaFromURN(t *testing.T) {
 	var capturedFuncMeta api.FunctionMeta
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -291,7 +344,7 @@ func TestCreateHandlerBuildsAgentFuncMetaFromURN(t *testing.T) {
 
 func TestCreateHandlerReturnsInstanceIDDirectly(t *testing.T) {
 	defer stubFuncSpec(t).Reset()
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			return "0b6c6322-6533-4901-8000-00000000bb0b", nil
 		},
@@ -311,7 +364,7 @@ func TestCreateHandlerReturnsInstanceIDDirectly(t *testing.T) {
 }
 
 func TestCreateHandlerRejectsInvalidURN(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called for an invalid URN")
 			return "", nil
@@ -332,7 +385,7 @@ func TestCreateHandlerRejectsInvalidURN(t *testing.T) {
 }
 
 func TestCreateHandlerRejectsMissingRequiredFields(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called for an invalid request body")
 			return "", nil
@@ -354,7 +407,7 @@ func TestCreateHandlerRejectsMissingRequiredFields(t *testing.T) {
 func TestCreateHandlerSetsDetachedAndReservedCreateOptions(t *testing.T) {
 	defer stubFuncSpec(t).Reset()
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-opts", nil
@@ -395,7 +448,7 @@ func TestCreateHandlerSetsDetachedAndReservedCreateOptions(t *testing.T) {
 
 func TestCreateHandlerRegisteredSinksFuncMetaResources(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-res", nil
@@ -429,7 +482,7 @@ func TestCreateHandlerRegisteredSinksFuncMetaResources(t *testing.T) {
 func TestCreateHandlerMountsWorkspaceAndCustomMounts(t *testing.T) {
 	defer stubFuncSpec(t).Reset()
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-mounts", nil
@@ -466,7 +519,7 @@ func TestCreateHandlerMountsWorkspaceAndCustomMounts(t *testing.T) {
 
 func TestCreateHandlerRejectsUnsafeWorkspace(t *testing.T) {
 	defer stubFuncSpec(t).Reset()
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called for an unsafe workspace path")
 			return "", nil
@@ -488,7 +541,7 @@ func TestCreateHandlerRejectsUnsafeWorkspace(t *testing.T) {
 
 func TestCreateHandlerRejectsRelativeWorkspace(t *testing.T) {
 	defer stubFuncSpec(t).Reset()
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called for a relative workspace path")
 			return "", nil
@@ -511,7 +564,7 @@ func TestCreateHandlerRejectsRelativeWorkspace(t *testing.T) {
 func TestCreateHandlerSinksDynamicEnvVars(t *testing.T) {
 	defer stubFuncSpec(t).Reset()
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-env", nil
@@ -547,7 +600,7 @@ func TestCreateHandlerReturnsInstanceIDWhenCreateTimesOutAfterScheduling(t *test
 		waitForAgentInstanceRunning = oldWaitForRunning
 	}()
 
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			return "instance-created-late", api.ErrorInfo{
 				Code: agentCreateTimeoutCode,
@@ -582,7 +635,7 @@ func TestCreateHandlerReturns500WhenCreateFails(t *testing.T) {
 		waitForAgentInstanceRunning = oldWaitForRunning
 	}()
 
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			return "", fmt.Errorf("scheduler refused")
 		},
@@ -650,7 +703,7 @@ func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
 		capturedPayload    []byte
 		capturedInvokeOpt  api.InvokeOptions
 	)
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
 			capturedInstanceID = instanceID
 			capturedSignal = signal
@@ -682,7 +735,7 @@ func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
 	const instanceID = "agent-delete-fail"
 	defer stubInstanceFound(t, instanceID).Reset()
 
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
 			return fmt.Errorf("kill failed")
 		},
@@ -705,7 +758,7 @@ func TestDeleteHandlerReturns404ForNonExistentInstance(t *testing.T) {
 	// No stubInstanceFound patch: instance cache reports nil for unknown IDs,
 	// so a non-existent or already-deleted instanceID returns 404, not 200.
 	killCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		kill: func(string, int, []byte, api.InvokeOptions) error {
 			killCalled = true
 			return nil
@@ -751,7 +804,7 @@ func inlineRootfsReq() CreateAgentRequest {
 func TestCreateHandlerInlineBuildsFuncMeta(t *testing.T) {
 	var capturedFuncMeta api.FunctionMeta
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -783,7 +836,7 @@ func TestCreateHandlerInlineBuildsFuncMeta(t *testing.T) {
 
 func TestCreateHandlerInlineEmptyUserFallsBackToDefaultTarget(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-inline-nouser", nil
@@ -805,7 +858,7 @@ func TestCreateHandlerInlineEmptyUserFallsBackToDefaultTarget(t *testing.T) {
 
 func TestCreateHandlerInlineSupervisorToleratesEmptyImageURL(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-inline-supervisor", nil
@@ -825,7 +878,7 @@ func TestCreateHandlerInlineSupervisorToleratesEmptyImageURL(t *testing.T) {
 }
 
 func TestCreateHandlerInlineRejectsEmptyImageURLForDocker(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called when imageurl is empty for non-supervisor sandbox")
 			return "", nil
@@ -845,11 +898,11 @@ func TestCreateHandlerRegisteredSupervisorToleratesEmptyImageURL(t *testing.T) {
 	defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(funcKey string) (*types.FuncSpec, bool) {
 		return &types.FuncSpec{
 			FuncMetaData:   types.FuncMetaData{Runtime: "python3.11"},
-			RootfsSpecMeta:  types.RootfsSpecMeta{User: "agentos"}, // imageurl intentionally empty
-			SandboxType:     agentSandboxTypeSupervisor,
+			RootfsSpecMeta: types.RootfsSpecMeta{User: "agentos"}, // imageurl intentionally empty
+			SandboxType:    agentSandboxTypeSupervisor,
 		}, true
 	}).Reset()
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			return "instance-reg-supervisor", nil
 		},
@@ -869,12 +922,12 @@ func TestCreateHandlerRegisteredSupervisorToleratesEmptyImageURL(t *testing.T) {
 func TestCreateHandlerRegisteredRejectsEmptyImageURLForDocker(t *testing.T) {
 	defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(funcKey string) (*types.FuncSpec, bool) {
 		return &types.FuncSpec{
-			FuncMetaData:  types.FuncMetaData{Runtime: "python3.11"},
+			FuncMetaData:   types.FuncMetaData{Runtime: "python3.11"},
 			RootfsSpecMeta: types.RootfsSpecMeta{User: "agentos"}, // imageurl empty, sandboxType docker
 			SandboxType:    "docker",
 		}, true
 	}).Reset()
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called when registered funcSpec lacks imageurl for docker")
 			return "", nil
@@ -895,7 +948,7 @@ func TestCreateHandlerRegisteredRejectsEmptyImageURLForDocker(t *testing.T) {
 
 func TestCreateHandlerInlineSinksEnvVars(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-inline-env", nil
@@ -913,7 +966,7 @@ func TestCreateHandlerInlineSinksEnvVars(t *testing.T) {
 }
 
 func TestCreateHandlerRejectsMissingInlineAndUrn(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called when neither inline nor urn is set")
 			return "", nil
@@ -935,7 +988,7 @@ func TestCreateHandlerRejectsMissingInlineAndUrn(t *testing.T) {
 func TestCreateHandlerInlineOverridesUrn(t *testing.T) {
 	var capturedFuncMeta api.FunctionMeta
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -1009,7 +1062,7 @@ func sampleAgentSummaries() []execendpoint.Summary {
 				"DELEGATE_ENV_VAR": `{"FOO":"bar"}`,
 				"rootfs": `{"type":"image","imageurl":"yr-docker-runtime:v0","mounts":[` +
 					`{"source":"/data","target":"/data","readonly":false}]}`,
-				"network":          `{"portForwardings":[{"port":22,"protocol":"TCP"}]}`,
+				"network": `{"portForwardings":[{"port":22,"protocol":"TCP"}]}`,
 			},
 		},
 		{
@@ -1029,7 +1082,7 @@ func TestListHandlerReturnsAllInstances(t *testing.T) {
 	summaries := sampleAgentSummaries()
 	endpoints := map[string]execendpoint.Endpoint{
 		"inst-docker-1": {InstanceID: "inst-docker-1", ProxyGrpcAddress: "10.0.0.5:50051"},
-		"inst-sup-1":   {InstanceID: "inst-sup-1", ProxyGrpcAddress: "10.0.0.6:50051"},
+		"inst-sup-1":    {InstanceID: "inst-sup-1", ProxyGrpcAddress: "10.0.0.6:50051"},
 	}
 	defer stubListGetLookups(t, summaries, endpoints)()
 
@@ -1038,8 +1091,8 @@ func TestListHandlerReturnsAllInstances(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	var resp struct {
-		Code      int              `json:"code"`
-		Instances []InstanceBrief  `json:"instances"`
+		Code      int             `json:"code"`
+		Instances []InstanceBrief `json:"instances"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
 	require.Equal(t, http.StatusOK, resp.Code)
@@ -1104,8 +1157,8 @@ func TestGetHandlerReturnsSingleInstance(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	var resp struct {
-		Code     int             `json:"code"`
-		Instance InstanceDetail  `json:"instance"`
+		Code     int            `json:"code"`
+		Instance InstanceDetail `json:"instance"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
 	require.Equal(t, http.StatusOK, resp.Code)

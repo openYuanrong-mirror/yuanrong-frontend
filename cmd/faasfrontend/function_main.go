@@ -214,9 +214,8 @@ func HealthCheckHandlerLibruntime() (api.HealthType, error) {
 }
 
 func setupFaaSFrontendLibruntime(rt api.LibruntimeAPI, stopChLibrt <-chan struct{}) error {
-	if err := util.SetAPIClientRuntimeBackend(config.GetConfig().FunctionInvokeBackend, rt); err != nil {
-		return fmt.Errorf("invalid function invoke backend config: %w", err)
-	}
+	util.SetAPIClientLibruntime(rt)
+	util.InitializeDirectProxyRouting()
 	schedulerproxy.Proxy.RTAPI = rt
 	schedulerproxy.BlueProxy.RTAPI = rt
 	shutdown := func() {}

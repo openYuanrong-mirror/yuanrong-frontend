@@ -24,7 +24,6 @@
       "enabled": {auth_enabled}
     },
     "metaServiceAddress": "{meta_service_address}",
-    "functionInvokeBackend": {function_invoke_backend},
     "componentMTLSEnable": {sslEnable},
     "alarmConfig": {
       "enableAlarm": false,

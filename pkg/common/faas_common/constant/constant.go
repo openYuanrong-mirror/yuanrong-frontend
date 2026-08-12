@@ -32,13 +32,6 @@ const (
 )
 
 const (
-	// BackendTypeKernel keeps ordinary function invocation on libruntime.
-	BackendTypeKernel = iota
-	// BackendTypeFrontendProxy routes ordinary function invocation directly to function_proxy.
-	BackendTypeFrontendProxy
-)
-
-const (
 	// DeployModeContainer -
 	DeployModeContainer = "Container"
 	// DeployModeProcesses -

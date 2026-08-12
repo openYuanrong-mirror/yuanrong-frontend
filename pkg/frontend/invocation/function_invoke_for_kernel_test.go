@@ -17,9 +17,11 @@
 package invocation
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"strconv"
@@ -29,12 +31,14 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/smartystreets/goconvey/convey"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/etcd3"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/snerror"
@@ -42,6 +46,7 @@ import (
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/common/uuid"
 	"frontend/pkg/frontend/common/httpconstant"
+	"frontend/pkg/frontend/common/httputil"
 	"frontend/pkg/frontend/common/util"
 	"frontend/pkg/frontend/instancemanager"
 	"frontend/pkg/frontend/leaseadaptor"
@@ -219,6 +224,42 @@ func Test_needDownGrade(t *testing.T) {
 type fakeClient struct {
 }
 
+type fakeDirectProxyClient struct {
+	invoke func(util.DirectInvokeRequest) ([]byte, error)
+}
+
+func (f *fakeDirectProxyClient) Invoke(req util.DirectInvokeRequest) ([]byte, error) {
+	return f.invoke(req)
+}
+
+func (f *fakeDirectProxyClient) CreateInstance(util.DirectCreateRequest) (string, error) {
+	return "", nil
+}
+
+func (f *fakeDirectProxyClient) CreateRaw(util.DirectRawRequest) ([]byte, error) {
+	return nil, nil
+}
+
+func (f *fakeDirectProxyClient) InvokeRaw(util.DirectRawRequest) ([]byte, error) {
+	return nil, nil
+}
+
+func (f *fakeDirectProxyClient) KillInstance(util.DirectKillRequest) error {
+	return nil
+}
+
+func (f *fakeDirectProxyClient) UploadFile(
+	context.Context, string, string, io.Reader, string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	return nil, nil
+}
+
+func (f *fakeDirectProxyClient) DownloadFile(
+	context.Context, string, string, int64, string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return nil, nil
+}
+
 func (f *fakeClient) AcquireInstance(functionKey string, req types.AcquireOption) (*types.InstanceAllocationInfo, error) {
 	// TODO implement me
 	panic("implement me")
@@ -288,24 +329,16 @@ func (f *fakeClient) GetActiveMasterAddr() string {
 
 func Test_invokeByClient(t *testing.T) {
 	convey.Convey("Test_invokeByClient", t, func() {
-		c := &fakeClient{}
-		defer gomonkey.ApplyFunc(util.NewClient, func() util.Client {
-			return c
-		}).Reset()
-
 		invokeTrigger := false
 		invoekInstance := ""
-		defer gomonkey.ApplyMethod(reflect.TypeOf(c), "Invoke", func(_ *fakeClient, req util.InvokeRequest) ([]byte, error) {
-			invokeTrigger = true
-			invoekInstance = req.InstanceID
-			return nil, fmt.Errorf("")
-		}).Reset()
-
-		invokeByNameTrigger := false
-		defer gomonkey.ApplyMethod(reflect.TypeOf(c), "InvokeByName", func(_ *fakeClient, req util.InvokeRequest) ([]byte, error) {
-			invokeByNameTrigger = true
-			return nil, fmt.Errorf("")
-		}).Reset()
+		restoreDirectClient := util.SetDirectProxyClientForTest(&fakeDirectProxyClient{
+			invoke: func(req util.DirectInvokeRequest) ([]byte, error) {
+				invokeTrigger = true
+				invoekInstance = req.InstanceID
+				return nil, fmt.Errorf("")
+			},
+		})
+		defer restoreDirectClient()
 
 		ctx := &types2.InvokeProcessContext{
 			InvokeTimeout: 10,
@@ -314,16 +347,14 @@ func Test_invokeByClient(t *testing.T) {
 			InstanceID: "0",
 		}
 
-		invokeFunctionWithLibRuntime(ctx, req, log.GetLogger())
+		invokeFunctionWithDirectProxy(ctx, req, log.GetLogger())
 		convey.So(invokeTrigger, convey.ShouldBeTrue)
 		convey.So(invoekInstance, convey.ShouldEqual, "0")
-		convey.So(invokeByNameTrigger, convey.ShouldBeFalse)
 
 		invokeTrigger = false
 		req.InstanceID = ""
-		invokeFunctionWithLibRuntime(ctx, req, log.GetLogger())
+		invokeFunctionWithDirectProxy(ctx, req, log.GetLogger())
 		convey.So(invokeTrigger, convey.ShouldBeFalse)
-		convey.So(invokeByNameTrigger, convey.ShouldBeTrue)
 	})
 }
 
@@ -355,7 +386,7 @@ func Test_functionInvokeForKernel(t *testing.T) {
 		mockSchedulerProxyAdd("0")
 		mockSchedulerInstanceAdd("0")
 		var getreq util.InvokeRequest
-		defer gomonkey.ApplyFunc(invokeFunctionWithLibRuntime, func(_ *types2.InvokeProcessContext,
+		defer gomonkey.ApplyFunc(invokeFunctionWithDirectProxy, func(_ *types2.InvokeProcessContext,
 			req util.InvokeRequest) snerror.SNError {
 			getreq = req
 			return nil
@@ -406,7 +437,7 @@ func Test_functionInvokeForKernel_legacy(t *testing.T) {
 		mockSchedulerProxyAdd("0")
 		mockSchedulerInstanceAdd("0")
 		var getreq util.InvokeRequest
-		defer gomonkey.ApplyFunc(invokeFunctionWithLibRuntime, func(_ *types2.InvokeProcessContext,
+		defer gomonkey.ApplyFunc(invokeFunctionWithDirectProxy, func(_ *types2.InvokeProcessContext,
 			req util.InvokeRequest) snerror.SNError {
 			getreq = req
 			return nil
@@ -454,7 +485,9 @@ func Test_functionInvokeForKernel_retry(t *testing.T) {
 
 		mockSchedulerProxyAdd("0")
 		var getreq util.InvokeRequest
-		p := gomonkey.ApplyFunc(invokeFunctionWithLibRuntime, func(_ *types2.InvokeProcessContext, req util.InvokeRequest) snerror.SNError {
+		p := gomonkey.ApplyFunc(invokeFunctionWithDirectProxy, func(
+			_ *types2.InvokeProcessContext, req util.InvokeRequest,
+		) snerror.SNError {
 			getreq = req
 			return nil
 		})
@@ -489,7 +522,9 @@ func Test_functionInvokeForKernel_retry(t *testing.T) {
 		mockSchedulerInstanceAdd("0")
 		mockFunctionInstanceAdd("222")
 		defer mockFunctionInstanceRemove("222")
-		p = gomonkey.ApplyFunc(invokeFunctionWithLibRuntime, func(_ *types2.InvokeProcessContext, req util.InvokeRequest) snerror.SNError {
+		p = gomonkey.ApplyFunc(invokeFunctionWithDirectProxy, func(
+			_ *types2.InvokeProcessContext, req util.InvokeRequest,
+		) snerror.SNError {
 			times++
 			if times == 1 {
 				getreq1 = req
@@ -540,7 +575,9 @@ func Test_functionInvokeForKernel_retry_legacy(t *testing.T) {
 
 		mockSchedulerProxyAdd("0")
 		var getreq util.InvokeRequest
-		p := gomonkey.ApplyFunc(invokeFunctionWithLibRuntime, func(_ *types2.InvokeProcessContext, req util.InvokeRequest) snerror.SNError {
+		p := gomonkey.ApplyFunc(invokeFunctionWithDirectProxy, func(
+			_ *types2.InvokeProcessContext, req util.InvokeRequest,
+		) snerror.SNError {
 			getreq = req
 			return nil
 		})
@@ -576,7 +613,9 @@ func Test_functionInvokeForKernel_retry_legacy(t *testing.T) {
 		mockSchedulerInstanceAdd("0")
 		mockFunctionInstanceAdd("222")
 		defer mockFunctionInstanceRemove("222")
-		p = gomonkey.ApplyFunc(invokeFunctionWithLibRuntime, func(_ *types2.InvokeProcessContext, req util.InvokeRequest) snerror.SNError {
+		p = gomonkey.ApplyFunc(invokeFunctionWithDirectProxy, func(
+			_ *types2.InvokeProcessContext, req util.InvokeRequest,
+		) snerror.SNError {
 			times++
 			if times == 1 {
 				getreq1 = req
@@ -657,6 +696,48 @@ func TestInvokeInstanceNeedRetry(t *testing.T) {
 				})
 			}
 		})
+	})
+}
+
+func TestKernelRequestHandlerHandlesDirectProxyRetryBoundary(t *testing.T) {
+	originalHandler := responsehandler.Handler
+	responsehandler.Handler = (&FGAdapter{}).MakeResponseHandler()
+	defer func() { responsehandler.Handler = originalHandler }()
+
+	t.Run("pre dispatch error retries", func(t *testing.T) {
+		ctx := types2.CreateInvokeProcessContext()
+		handler := &kernelRequestHandler{ctx: ctx}
+		directErr := &directProxyInvokeError{
+			code:        statuscode.ErrInnerCommunication,
+			message:     "owner unavailable",
+			retryable:   true,
+			retryReason: "pre-dispatch",
+		}
+		retry, err := handler.handleInvokeError(directErr, "instance-a", log.GetLogger())
+
+		require.False(t, retry)
+		require.Same(t, directErr, err)
+		require.True(t, ctx.ShouldRetry)
+		require.Empty(t, handler.unexpectedInstances)
+		require.Empty(t, ctx.RespHeader)
+	})
+
+	t.Run("post dispatch error preserves code without retry", func(t *testing.T) {
+		ctx := types2.CreateInvokeProcessContext()
+		handler := &kernelRequestHandler{ctx: ctx}
+		directErr := &directProxyInvokeError{
+			code:        statuscode.ErrInstanceExitedCode,
+			message:     "runtime exited after dispatch",
+			retryReason: "post-dispatch-unknown",
+		}
+		retry, err := handler.handleInvokeError(directErr, "instance-a", log.GetLogger())
+
+		require.False(t, retry)
+		require.Same(t, directErr, err)
+		require.Empty(t, handler.unexpectedInstances)
+		httputil.HandleInvokeError(ctx, err)
+		require.Equal(t, strconv.Itoa(statuscode.ErrInstanceExitedCode),
+			ctx.RespHeader[constant.HeaderInnerCode])
 	})
 }
 

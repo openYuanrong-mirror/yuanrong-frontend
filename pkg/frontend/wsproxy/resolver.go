@@ -27,8 +27,7 @@ import (
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
-	"frontend/pkg/frontend/common/util"
-	"frontend/pkg/frontend/instancemanager"
+	"frontend/pkg/frontend/proxyrouting"
 )
 
 // routeWaitTimeout bounds how long resolveInstance waits for the instance
@@ -37,56 +36,21 @@ import (
 // handles with its routeWait.
 const routeWaitTimeout = 10 * time.Second
 
-// tunnelAddressWaitInterval is the poll cadence for the function_proxy
-// tcp.tunnel capability to appear in the proxy endpoint cache. Mirrors
-// sshproxy.proxyRoutePollInterval.
-const tunnelAddressWaitInterval = 100 * time.Millisecond
-
-// resolveInstance is the wsproxy analogue of sshproxy.resolveInstance, with
-// the SSH-specific bits stripped: it confirms the instance is RUNNING and
-// resolves the owning function_proxy's tcp.tunnel address. Unlike SSH it
-// does NOT check CreateOptions["host_user"] — the AgentServer has no SSH
-// login user, and the frontend authenticates the caller via JWT, not via
-// backend SSH keys. The tenant cross-check (instanceTenant != jwtSub) is
-// done by the handler before dialing, to keep the resolver a pure
-// routing primitive.
+// resolveInstance applies WebSocket-specific lifecycle validation after the
+// shared owner resolver has selected the owning proxy's TCP tunnel.
 func resolveInstance(ctx context.Context, instanceID string) (*types.InstanceSpecification, string, error) {
 	routeCtx, cancel := context.WithTimeout(ctx, routeWaitTimeout)
 	defer cancel()
-	instance, err := instancemanager.WaitInstanceByID(routeCtx, instanceID)
+	ownerRoute, err := proxyrouting.Wait(
+		routeCtx, instanceID, proxyrouting.CapabilityTCPTunnel, proxyrouting.TransportTCPTunnel)
 	if err != nil {
-		return nil, "", fmt.Errorf("wait for instance %s route: %w", instanceID, err)
+		return nil, "", err
 	}
+	instance := ownerRoute.Instance
 	if instance.InstanceStatus.Code != int32(constant.KernelInstanceStatusRunning) {
 		return nil, "", fmt.Errorf("instance %s is not running", instanceID)
 	}
-	if strings.TrimSpace(instance.FunctionProxyID) == "" {
-		return nil, "", fmt.Errorf("instance %s has no functionProxyID", instanceID)
-	}
-	tunnelAddress, err := waitProxyTCPTunnelAddress(routeCtx, instance.FunctionProxyID)
-	if err != nil {
-		return nil, "", fmt.Errorf("resolve TCP tunnel for instance %s: %w", instanceID, err)
-	}
-	return instance, tunnelAddress, nil
-}
-
-// waitProxyTCPTunnelAddress polls the proxy endpoint cache until the owning
-// function_proxy publishes a healthy tcp.tunnel address. Identical to
-// sshproxy.waitProxyTCPTunnelAddress — both consume the same
-// util.LookupProxyTCPTunnelAddress backed by the /sn/proxy watch.
-func waitProxyTCPTunnelAddress(ctx context.Context, functionProxyID string) (string, error) {
-	ticker := time.NewTicker(tunnelAddressWaitInterval)
-	defer ticker.Stop()
-	for {
-		if address, ok := util.LookupProxyTCPTunnelAddress(functionProxyID); ok {
-			return address, nil
-		}
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("proxy %s has no healthy tcp.tunnel endpoint: %w", functionProxyID, ctx.Err())
-		case <-ticker.C:
-		}
-	}
+	return instance, ownerRoute.Address, nil
 }
 
 // newRequestID is a per-tunnel correlation id surfaced in the tunnel header

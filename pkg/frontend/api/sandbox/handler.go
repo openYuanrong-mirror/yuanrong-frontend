@@ -1113,12 +1113,10 @@ func createSandboxInstanceRaw(
 		)
 		defer cancel()
 	}
-	respRaw, err := util.CreateInstanceRawWithContext(
-		createCtx,
-		util.NewClient(),
-		createReqRaw,
+	respRaw, err := util.GetDirectProxyClient().CreateRaw(util.NewDirectRawRequest(
+		createCtx, createReqRaw,
 		api.RawRequestOption{TraceParent: ctx.Request.Header.Get(constant.HeaderTraceParent)},
-	)
+	))
 	if err != nil {
 		return "", err
 	}
@@ -1530,6 +1528,7 @@ func fillSandboxCreateOptions(
 	}
 	invokeOpts.CreateOpt[constant.FunctionKeyNote] = funcID
 	invokeOpts.CreateOpt[constant.InstanceTypeNote] = sandboxInstanceType
+	invokeOpts.CreateOpt[constant.SchedulerManagedNote] = strconv.FormatBool(false)
 	invokeOpts.CreateOpt["call_timeout"] = fmt.Sprintf("%d", invokeOpts.Timeout)
 	invokeOpts.CreateOpt["init_call_timeout"] = fmt.Sprintf("%d", sandboxInitTimeoutSeconds)
 	invokeOpts.CreateOpt["GRACEFUL_SHUTDOWN_TIME"] = fmt.Sprintf("%d", sandboxGracefulShutdownSeconds)
@@ -1893,12 +1892,9 @@ func invokeSandboxAction(req invokeActionRequest) (interface{}, error) {
 		parent, cancel = context.WithTimeout(parent, time.Duration(req.timeout)*time.Second)
 		defer cancel()
 	}
-	respRaw, err := util.InvokeInstanceRawWithContext(
-		parent,
-		util.NewClient(),
-		invokeReqRaw,
-		api.RawRequestOption{TraceParent: req.traceParent},
-	)
+	respRaw, err := util.GetDirectProxyClient().InvokeRaw(util.NewDirectRawRequest(
+		parent, invokeReqRaw, api.RawRequestOption{TraceParent: req.traceParent},
+	))
 	if err != nil {
 		return nil, err
 	}
@@ -1918,8 +1914,10 @@ func parseSandboxRawInvokeResponse(raw []byte) (interface{}, error) {
 		}
 		return nil, api.ErrorInfo{Code: code, Err: errors.New(message)}
 	}
-	if len(notify.GetSmallObjects()) == 0 {
-		return nil, fmt.Errorf("sandbox raw invoke response contains no result")
+	if len(notify.GetSmallObjects()) != 1 {
+		return nil, fmt.Errorf(
+			"sandbox direct invoke requires exactly one inline result, got %d; ObjectRef and multiple results are not supported",
+			len(notify.GetSmallObjects()))
 	}
 	return decodeYRValue(notify.GetSmallObjects()[0].GetValue())
 }
@@ -2213,7 +2211,14 @@ func DeleteHandler(ctx *gin.Context) {
 		}
 	}
 
-	if err := util.NewClient().KillByLibRt(instanceID, sandboxKillInstanceSignal, []byte("sandbox deleted")); err != nil {
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	invokeOpts := api.InvokeOptions{TraceID: ctx.GetHeader(constant.HeaderTraceID)}
+	if err := util.GetDirectProxyClient().KillInstance(util.NewDirectKillRequest(
+		ctx.Request.Context(), instanceID, sandboxKillInstanceSignal, []byte("sandbox deleted"), tenantID, invokeOpts,
+	)); err != nil {
 		log.GetLogger().Errorf("failed to kill sandbox instance %s: %v", instanceID, err)
 		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to delete sandbox: %v", err))
 		return

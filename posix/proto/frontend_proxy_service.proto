@@ -33,6 +33,7 @@ option go_package = "frontend/pkg/common/faas_common/grpc/pb/frontend_proxy;fron
 // without exposing the full stream oneof to frontend.
 service FrontendProxyService {
   rpc InvokeInstance (InvokeInstanceRequest) returns (InvokeInstanceResponse) {}
+  rpc InvokeInstanceStream (InvokeInstanceRequest) returns (stream InvokeInstanceStreamResponse) {}
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceResponse) {}
   rpc KillInstance (KillInstanceRequest) returns (KillInstanceResponse) {}
   rpc UploadFile (stream FileChunk) returns (FileTransferResponse) {}
@@ -74,6 +75,16 @@ message InvokeInstanceResponse {
   // paths delivered asynchronously. Frontend may adapt it to its local result
   // store for compatibility with InvokeByInstanceId + GetAsync.
   core_service.CallResult callResult = 3;
+}
+
+// InvokeInstanceStreamResponse preserves the runtime event boundary. Event
+// frames are forwarded as opaque bytes in order and the stream terminates with
+// exactly one final response carrying the ordinary invoke/call-result status.
+message InvokeInstanceStreamResponse {
+  oneof payload {
+    bytes event = 1;
+    InvokeInstanceResponse final = 2;
+  }
 }
 
 message CreateInstanceRequest {

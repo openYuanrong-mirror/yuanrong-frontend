@@ -772,7 +772,12 @@ func createAgentInstance(
 	ctx *gin.Context, req CreateAgentRequest, funcMeta api.FunctionMeta, invokeOpts api.InvokeOptions,
 	args []api.Arg,
 ) {
-	instanceID, err := util.NewClient().CreateInstanceByLibRt(funcMeta, args, invokeOpts)
+	directReq, err := util.NewDirectCreateRequest(funcMeta, args, invokeOpts)
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
+	instanceID, err := util.GetDirectProxyClient().CreateInstance(directReq)
 	if err != nil {
 		if shouldTreatCreateTimeoutAsSuccess(instanceID, err) {
 			if waitForAgentInstanceRunning(instanceID, funcMeta.FuncID,
@@ -812,8 +817,16 @@ func DeleteHandler(ctx *gin.Context) {
 			gin.H{"code": 404, "message": fmt.Sprintf("instance not found: %s", instanceID)})
 		return
 	}
-	if err := util.NewClient().KillByLibRt(instanceID, agentKillInstanceSignal,
-		[]byte("agent deleted")); err != nil {
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	invokeOpts := api.InvokeOptions{
+		TraceID: ctx.GetHeader(constant.HeaderTraceID),
+	}
+	if err := util.GetDirectProxyClient().KillInstance(util.NewDirectKillRequest(
+		ctx.Request.Context(), instanceID, agentKillInstanceSignal, []byte("agent deleted"), tenantID, invokeOpts,
+	)); err != nil {
 		log.GetLogger().Errorf("failed to kill agent instance %s: %v", instanceID, err)
 		ctx.JSON(http.StatusInternalServerError,
 			gin.H{"code": 500, "message": fmt.Sprintf("failed to delete agent: %v", err)})
@@ -896,17 +909,17 @@ type InstanceBrief struct {
 
 // InstanceDetail is the verbose Get output: brief fields plus create configuration from createOptions.
 type InstanceDetail struct {
-	InstanceID  string `json:"instance_id"`
-	NodeIP      string `json:"node_ip,omitempty"`
-	SandboxIP   string `json:"sandbox_ip,omitempty"`
-	SandboxType string `json:"sandbox_type,omitempty"`
-	SandboxID   string `json:"sandbox_id,omitempty"`
-	Rootfs      *RootfsInfo `json:"rootfs,omitempty"`
-	HostUser    string      `json:"host_user,omitempty"`
-	Ports       []string    `json:"ports,omitempty"`
-	EnvVars     map[string]string `json:"env_vars,omitempty"`
+	InstanceID  string             `json:"instance_id"`
+	NodeIP      string             `json:"node_ip,omitempty"`
+	SandboxIP   string             `json:"sandbox_ip,omitempty"`
+	SandboxType string             `json:"sandbox_type,omitempty"`
+	SandboxID   string             `json:"sandbox_id,omitempty"`
+	Rootfs      *RootfsInfo        `json:"rootfs,omitempty"`
+	HostUser    string             `json:"host_user,omitempty"`
+	Ports       []string           `json:"ports,omitempty"`
+	EnvVars     map[string]string  `json:"env_vars,omitempty"`
 	Resources   map[string]float64 `json:"resources,omitempty"`
-	StartTime   string `json:"start_time,omitempty"`
+	StartTime   string             `json:"start_time,omitempty"`
 }
 
 // RootfsInfo mirrors createOptions["rootfs"] (image identity + nested bind mounts).
@@ -925,9 +938,9 @@ type MountInfo struct {
 
 // rootfsJSON mirrors the subset of createOptions["rootfs"] Get needs.
 type rootfsJSON struct {
-	Type     string             `json:"type"`
-	ImageURL string             `json:"imageurl"`
-	Mounts   []json.RawMessage  `json:"mounts"`
+	Type     string            `json:"type"`
+	ImageURL string            `json:"imageurl"`
+	Mounts   []json.RawMessage `json:"mounts"`
 }
 
 // networkJSON mirrors createOptions["network"] (built by applyAgentPorts).
@@ -1096,16 +1109,9 @@ func waitForAgentInstanceExist(instanceID string) (*types.InstanceSpecification,
 	return instancemanager.WaitInstanceByID(ctx, instanceID)
 }
 
-// fileTransferClient resolves a FileTransferClient from util.NewClient(). It
-// returns nil and a 503 when the selected backend does not advertise file
-// transfer, so callers can map the unsupported case to a clean HTTP error.
+// fileTransferClient returns the fixed direct-proxy file transfer client.
 func fileTransferClient() (util.FileTransferClient, error) {
-	client := util.NewClient()
-	transferClient := util.AsFileTransferClient(client)
-	if transferClient == nil {
-		return nil, fmt.Errorf("selected runtime backend does not support file transfer")
-	}
-	return transferClient, nil
+	return util.GetDirectProxyClient(), nil
 }
 
 // isFileNotFoundError reports whether err indicates the file/path does not

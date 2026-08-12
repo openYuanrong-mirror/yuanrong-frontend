@@ -51,6 +51,7 @@ import (
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/instancemanager"
+	"frontend/pkg/frontend/proxyrouting"
 )
 
 var frontendProxyRequestSeq atomic.Uint64
@@ -74,6 +75,7 @@ const (
 	defaultFrontendProxyTimeout                         = 60 * time.Second
 	frontendProxyKeepaliveTimeout                       = 10 * time.Second
 	frontendProxyFileTransferChunkSize                  = 4 * 1024 * 1024
+	frontendProxyKillMaxAttempts                        = 2
 	runtimeRequestIDLength                              = 18
 	createReadyCallResultFieldNumber   protowire.Number = 4
 	runtimeNotifyRequestIDField        protowire.Number = 1
@@ -118,20 +120,20 @@ type frontendRouteLifecycleEvent struct {
 	ReplayAttempted    bool   `json:"replayAttempted"`
 }
 
-func observeFrontendRouteLifecycle(req simpleRuntimeKillRequest, outcome string,
-	change instancemanager.RouteOnlyInstanceChange,
+func observeFrontendRouteLifecycle(req simpleRuntimeKillRequest, requestID, outcome string,
+	change instancemanager.RouteOnlyInstanceChange, replayAttempted bool,
 ) {
 	event := frontendRouteLifecycleEvent{
 		Operation:          "kill",
 		Outcome:            outcome,
 		CleanupOutcome:     "route-hint-cleared",
-		RequestID:          req.requestID,
+		RequestID:          requestID,
 		TraceID:            firstNonEmpty(req.options.TraceID, req.options.CustomExtensions[traceParentExtensionKey]),
 		InstanceID:         req.instanceID,
 		OwningProxyID:      change.Before.FunctionProxyID,
 		RoutePresentBefore: change.Before.Present,
 		RoutePresentAfter:  change.After.Present,
-		ReplayAttempted:    false,
+		ReplayAttempted:    replayAttempted,
 	}
 	if encoded, err := json.Marshal(event); err == nil {
 		log.GetLogger().Infof("frontend_route_lifecycle %s", encoded)
@@ -190,33 +192,128 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceID(req simpleRuntimeInvo
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, newDirectProxyPostDispatchError("invoke transport", err)
 	}
+	return decodeFrontendProxyInvokeResponse(req.funcMeta, resp)
+}
+
+func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceIDStream(
+	req simpleRuntimeInvokeRequest,
+	responseWriter types.ResponseWriter,
+) ([]byte, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("frontend proxy grpc client is nil")
+	}
+	if responseWriter == nil {
+		return nil, fmt.Errorf("frontend proxy streaming invoke response writer is nil")
+	}
+	requestID := newFrontendProxyRuntimeRequestID()
+	baseCtx, cancel := simpleRuntimeInvokeContext(req.options)
+	defer cancel()
+	ctx, cancelStream := context.WithCancel(baseCtx)
+	defer cancelStream()
+	go func() {
+		select {
+		case <-responseWriter.ClientDisconnectChan():
+			cancelStream()
+		case <-ctx.Done():
+		}
+	}()
+	invokeArgs, releaseInvokeArgs := convertSimpleRuntimeInvokeArgsForRPC(req.funcMeta, req.args)
+	defer releaseInvokeArgs()
+	stream, err := c.client.InvokeInstanceStream(ctx, &frontend_proxy.InvokeInstanceRequest{
+		Context: &frontend_proxy.FrontendRequestContext{
+			FrontendClientID: c.frontendClientID,
+			TenantID:         firstArgTenantID(req.args),
+			RequestID:        requestID,
+			TraceID:          req.options.TraceID,
+		},
+		Invoke: &core.InvokeRequest{
+			Function:      req.funcMeta.FuncID,
+			Args:          invokeArgs,
+			InstanceID:    req.instanceID,
+			RequestID:     requestID,
+			TraceID:       req.options.TraceID,
+			InvokeOptions: convertSimpleRuntimeInvokeOptions(req.options),
+		},
+	})
+	if err != nil {
+		return nil, newDirectProxyPostDispatchError("invoke stream transport", err)
+	}
+	return receiveFrontendProxyInvokeStream(stream, responseWriter, req.funcMeta, cancelStream)
+}
+
+func receiveFrontendProxyInvokeStream(
+	stream grpc.ServerStreamingClient[frontend_proxy.InvokeInstanceStreamResponse],
+	responseWriter types.ResponseWriter,
+	funcMeta api.FunctionMeta,
+	cancel context.CancelFunc,
+) ([]byte, error) {
+	for {
+		frame, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			return nil, newDirectProxyPostDispatchError(
+				"invoke stream receive", fmt.Errorf("stream ended without final response"),
+			)
+		}
+		if recvErr != nil {
+			return nil, newDirectProxyPostDispatchError("invoke stream receive", recvErr)
+		}
+		switch payload := frame.GetPayload().(type) {
+		case *frontend_proxy.InvokeInstanceStreamResponse_Event:
+			if _, err := responseWriter.SSEWrite(payload.Event); err != nil {
+				cancel()
+				return nil, err
+			}
+		case *frontend_proxy.InvokeInstanceStreamResponse_Final:
+			if payload.Final == nil {
+				return nil, newDirectProxyPostDispatchError(
+					"invoke stream decode", fmt.Errorf("final response is nil"),
+				)
+			}
+			return decodeFrontendProxyInvokeResponse(funcMeta, payload.Final)
+		default:
+			return nil, newDirectProxyPostDispatchError(
+				"invoke stream decode", fmt.Errorf("received empty frame"),
+			)
+		}
+	}
+}
+
+func decodeFrontendProxyInvokeResponse(
+	funcMeta api.FunctionMeta,
+	resp *frontend_proxy.InvokeInstanceResponse,
+) ([]byte, error) {
 	if resp == nil {
-		return nil, fmt.Errorf("frontend proxy invoke response is nil")
+		return nil, newDirectProxyPostDispatchError("invoke decode", fmt.Errorf("response is nil"))
 	}
 	if err := checkFrontendProxyStatus("invoke", resp.GetStatus()); err != nil {
+		if _, classified := GetDirectProxyErrorMetadata(err); !classified {
+			return nil, newDirectProxyPostDispatchError("invoke decode", err)
+		}
 		return nil, err
 	}
 	callResult := resp.GetCallResult()
 	if callResult == nil {
-		return nil, fmt.Errorf("frontend proxy invoke missing call result")
+		return nil, newDirectProxyPostDispatchError("invoke decode", fmt.Errorf("missing call result"))
 	}
 	if callResult.GetCode() != common.ErrorCode_ERR_NONE {
 		return nil, frontendProxyBusinessError("invoke call result", callResult.GetCode(), callResult.GetMessage())
 	}
 	smallObjects := callResult.GetSmallObjects()
-	if len(smallObjects) == 0 {
-		return nil, fmt.Errorf("frontend proxy invoke call result has no small object payload")
+	if len(smallObjects) != 1 {
+		return nil, newDirectProxyPostDispatchError("invoke decode", fmt.Errorf(
+			"frontend proxy invoke requires exactly one inline result, got %d; ObjectRef and multiple results are not supported",
+			len(smallObjects)))
 	}
-	return normalizeSimpleRuntimeInvokePayload(req.funcMeta, smallObjects[0].GetValue()), nil
+	return normalizeSimpleRuntimeInvokePayload(funcMeta, smallObjects[0].GetValue()), nil
 }
 
 func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreateRequest) (string, error) {
 	if c.client == nil {
 		return "", fmt.Errorf("frontend proxy grpc client is nil")
 	}
-	requestID := fmt.Sprintf("frontend-proxy-create-%d", frontendProxyRequestSeq.Add(1))
+	requestID := newFrontendProxyRuntimeRequestID()
 	ctx, cancel := simpleRuntimeInvokeContext(req.options)
 	defer cancel()
 	resp, err := c.client.CreateInstance(ctx, &frontend_proxy.CreateInstanceRequest{
@@ -228,7 +325,7 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreat
 		},
 		Create: &core.CreateRequest{
 			Function:      req.funcMeta.FuncID,
-			Args:          convertSimpleRuntimeArgs(req.args),
+			Args:          convertSimpleRuntimeCreateArgs(req.funcMeta, req.args),
 			RequestID:     requestID,
 			TraceID:       req.options.TraceID,
 			CreateOptions: convertSimpleRuntimeCreateOptions(req.options),
@@ -254,9 +351,14 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreat
 	if instanceID == "" {
 		return "", fmt.Errorf("frontend proxy create response missing instance id")
 	}
-	if routeAddress := resp.GetRouteAddress(); routeAddress != "" {
-		instancemanager.RecordRouteOnlyInstance(req.funcMeta.FuncID, instanceID, routeAddress)
+	ownerProxyID := strings.TrimSpace(resp.GetRouteAddress())
+	if ownerProxyID == "" {
+		return "", fmt.Errorf("frontend proxy create response missing final owner proxy node id")
 	}
+	if proxyrouting.IsHostPort(ownerProxyID) {
+		return "", fmt.Errorf("frontend proxy create owner must be a proxy node id, got address %q", ownerProxyID)
+	}
+	instancemanager.RecordRouteOnlyInstance(req.funcMeta.FuncID, instanceID, ownerProxyID)
 	return instanceID, nil
 }
 
@@ -268,8 +370,11 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntimeRa
 	if err := proto.Unmarshal(req.create, createReq); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal frontend proxy create request: %w", err)
 	}
+	if err := validateDirectProxyCoreArgs(createReq.GetArgs()); err != nil {
+		return nil, fmt.Errorf("direct proxy raw create: %w", err)
+	}
 	externalRequestID := createReq.GetRequestID()
-	requestID := newFrontendProxyLifecycleCorrelationID("create")
+	requestID := newFrontendProxyRuntimeRequestID()
 	createReq.RequestID = requestID
 	applyRawRequestOptionsToCreate(createReq, req.options)
 	ctx, cancel := rawSimpleRuntimeContext(req.ctx, req.options)
@@ -287,6 +392,15 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntimeRa
 	if err != nil {
 		return nil, err
 	}
+	return decodeFrontendProxyRawCreateResponse(resp, createReq, externalRequestID, requestID)
+}
+
+func decodeFrontendProxyRawCreateResponse(
+	resp *frontend_proxy.CreateInstanceResponse,
+	createReq *core.CreateRequest,
+	externalRequestID string,
+	requestID string,
+) ([]byte, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("frontend proxy create response is nil")
 	}
@@ -305,8 +419,15 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntimeRa
 	}
 	if createResp := resp.GetCreate(); createResp != nil {
 		instanceID := firstNonEmpty(createResp.GetInstanceID(), callResult.GetInstanceID())
-		if routeAddress := resp.GetRouteAddress(); routeAddress != "" && instanceID != "" {
-			instancemanager.RecordRouteOnlyInstance(createReq.GetFunction(), instanceID, routeAddress)
+		ownerProxyID := strings.TrimSpace(resp.GetRouteAddress())
+		if instanceID != "" && ownerProxyID == "" {
+			return nil, fmt.Errorf("frontend proxy create response missing final owner proxy node id")
+		}
+		if proxyrouting.IsHostPort(ownerProxyID) {
+			return nil, fmt.Errorf("frontend proxy create owner must be a proxy node id, got address %q", ownerProxyID)
+		}
+		if instanceID != "" {
+			instancemanager.RecordRouteOnlyInstance(createReq.GetFunction(), instanceID, ownerProxyID)
 		}
 	}
 	return marshalRuntimeNotifyFromCallResultWithRequestID(callResult, firstNonEmpty(externalRequestID, requestID))
@@ -316,7 +437,7 @@ func (c *grpcFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKillReq
 	if c.client == nil {
 		return fmt.Errorf("frontend proxy grpc client is nil")
 	}
-	requestID := firstNonEmpty(req.requestID, fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1)))
+	requestID := fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1))
 	ctx, cancel := simpleRuntimeInvokeContextWithParent(req.ctx, req.options)
 	defer cancel()
 	resp, err := c.client.KillInstance(ctx, &frontend_proxy.KillInstanceRequest{
@@ -345,7 +466,7 @@ func (c *grpcFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKillReq
 		return frontendProxyBusinessError("kill", killResp.GetCode(), killResp.GetMessage())
 	}
 	change := instancemanager.RemoveRouteOnlyInstanceWithSnapshot(req.instanceID)
-	observeFrontendRouteLifecycle(req, "success", change)
+	observeFrontendRouteLifecycle(req, requestID, "success", change, false)
 	return nil
 }
 
@@ -357,8 +478,11 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRuntimeR
 	if err := proto.Unmarshal(req.invoke, invokeReq); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal frontend proxy invoke request: %w", err)
 	}
+	if err := validateDirectProxyCoreArgs(invokeReq.GetArgs()); err != nil {
+		return nil, fmt.Errorf("direct proxy raw invoke: %w", err)
+	}
 	externalRequestID := invokeReq.GetRequestID()
-	requestID := newFrontendProxyLifecycleCorrelationID("invoke")
+	requestID := newFrontendProxyRuntimeRequestID()
 	invokeReq.RequestID = requestID
 	applyRawRequestOptionsToInvoke(invokeReq, req.options)
 	ctx, cancel := rawSimpleRuntimeContext(req.ctx, req.options)
@@ -386,6 +510,16 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRuntimeR
 		return nil, err
 	}
 	return nil, fmt.Errorf("frontend proxy invoke missing call result")
+}
+
+func validateDirectProxyCoreArgs(args []*common.Arg) error {
+	for i, arg := range args {
+		if arg == nil || arg.GetType() != common.Arg_VALUE || len(arg.GetNestedRefs()) != 0 {
+			return fmt.Errorf(
+				"argument %d uses ObjectRef or nested refs, which the direct proxy inline-data API does not support", i)
+		}
+	}
+	return nil
 }
 
 // UploadFile streams the contents of reader to the owning frontend proxy of
@@ -524,14 +658,39 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceID(req simpleRuntimeI
 	}
 	address, err := c.resolver.ResolveFrontendProxyAddress(req)
 	if err != nil {
-		return nil, err
+		return nil, newDirectProxyPreDispatchError("owner resolution", err)
 	}
 	serviceClient, err := c.clientFactory.ClientForAddress(address)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return nil, err
+		return nil, newDirectProxyPreDispatchError("client acquisition", err)
 	}
 	payload, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).InvokeByInstanceID(req)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, err
+	}
+	return payload, nil
+}
+
+func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDStream(
+	req simpleRuntimeInvokeRequest,
+	responseWriter types.ResponseWriter,
+) ([]byte, error) {
+	if c == nil || c.resolver == nil || c.clientFactory == nil {
+		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
+	}
+	address, err := c.resolver.ResolveFrontendProxyAddress(req)
+	if err != nil {
+		return nil, newDirectProxyPreDispatchError("owner resolution", err)
+	}
+	serviceClient, err := c.clientFactory.ClientForAddress(address)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, newDirectProxyPreDispatchError("client acquisition", err)
+	}
+	payload, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
+		InvokeByInstanceIDStream(req, responseWriter)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
 		return nil, err
@@ -545,24 +704,20 @@ func (c *routingFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCr
 	}
 	tried := make(map[string]struct{})
 	var lastErr error
+	selectCtx, cancelSelect := simpleRuntimeInvokeContext(req.options)
+	defer cancelSelect()
 	for {
-		endpoint, ok := resolveNextFrontendProxyEndpoint(frontendProxyCapabilityCreate)
-		if !ok {
+		endpoint, selectErr := proxyrouting.Select(selectCtx, proxyrouting.CapabilityCreate, tried)
+		if selectErr != nil {
 			if lastErr != nil {
 				return "", lastErr
 			}
-			return "", fmt.Errorf("no frontend proxy endpoint supports capability %s", frontendProxyCapabilityCreate)
+			return "", selectErr
 		}
-		if _, ok := tried[endpoint.Address]; ok {
-			if lastErr != nil {
-				return "", lastErr
-			}
-			return "", fmt.Errorf("no untried frontend proxy endpoint supports capability %s", frontendProxyCapabilityCreate)
-		}
-		tried[endpoint.Address] = struct{}{}
-		serviceClient, err := c.clientFactory.ClientForAddress(endpoint.Address)
+		tried[endpoint.GRPCAddress] = struct{}{}
+		serviceClient, err := c.clientFactory.ClientForAddress(endpoint.GRPCAddress)
 		if err != nil {
-			evictFrontendProxyClientOnError(c.clientFactory, endpoint.Address, err)
+			evictFrontendProxyClientOnError(c.clientFactory, endpoint.GRPCAddress, err)
 			lastErr = err
 			continue
 		}
@@ -572,7 +727,7 @@ func (c *routingFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCr
 				lastErr = err
 				continue
 			}
-			evictFrontendProxyClientOnError(c.clientFactory, endpoint.Address, err)
+			evictFrontendProxyClientOnError(c.clientFactory, endpoint.GRPCAddress, err)
 			return "", err
 		}
 		return instanceID, nil
@@ -586,23 +741,17 @@ func (c *routingFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntim
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
-		endpoint, ok := resolveNextFrontendProxyEndpoint(frontendProxyCapabilityCreate)
-		if !ok {
+		endpoint, selectErr := proxyrouting.Select(req.ctx, proxyrouting.CapabilityCreate, tried)
+		if selectErr != nil {
 			if lastErr != nil {
 				return nil, lastErr
 			}
-			return nil, fmt.Errorf("no frontend proxy endpoint supports capability %s", frontendProxyCapabilityCreate)
+			return nil, selectErr
 		}
-		if _, ok := tried[endpoint.Address]; ok {
-			if lastErr != nil {
-				return nil, lastErr
-			}
-			return nil, fmt.Errorf("no untried frontend proxy endpoint supports capability %s", frontendProxyCapabilityCreate)
-		}
-		tried[endpoint.Address] = struct{}{}
-		serviceClient, err := c.clientFactory.ClientForAddress(endpoint.Address)
+		tried[endpoint.GRPCAddress] = struct{}{}
+		serviceClient, err := c.clientFactory.ClientForAddress(endpoint.GRPCAddress)
 		if err != nil {
-			evictFrontendProxyClientOnError(c.clientFactory, endpoint.Address, err)
+			evictFrontendProxyClientOnError(c.clientFactory, endpoint.GRPCAddress, err)
 			lastErr = err
 			continue
 		}
@@ -612,7 +761,7 @@ func (c *routingFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntim
 				lastErr = err
 				continue
 			}
-			evictFrontendProxyClientOnError(c.clientFactory, endpoint.Address, err)
+			evictFrontendProxyClientOnError(c.clientFactory, endpoint.GRPCAddress, err)
 			return nil, err
 		}
 		return notify, nil
@@ -623,32 +772,34 @@ func (c *routingFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKill
 	if c == nil || c.clientFactory == nil {
 		return fmt.Errorf("frontend proxy lifecycle routing client is not initialized")
 	}
-	address := resolveProxyAddressByKill(req)
-	if !isHostPort(address) {
-		if endpoint, ok := resolveSoleFrontendProxyEndpoint(frontendProxyCapabilityKill); ok {
-			address = endpoint.Address
+	for attempt := 0; attempt < frontendProxyKillMaxAttempts; attempt++ {
+		route, err := resolveDirectProxyOwner(
+			req.ctx, req.instanceID, proxyrouting.CapabilityKill, proxyrouting.TransportGRPC)
+		if err != nil {
+			return err
+		}
+		address := route.Address
+		serviceClient, err := c.clientFactory.ClientForAddress(address)
+		if err != nil {
+			evictFrontendProxyClientOnError(c.clientFactory, address, err)
+			return err
+		}
+		err = newGRPCFrontendProxyLifecycleClient(serviceClient, c.frontendClientID).KillInstance(req)
+		if err == nil {
+			return nil
+		}
+		if !isFrontendProxyRouteStaleStatus(err) {
+			evictFrontendProxyClientOnError(c.clientFactory, address, err)
+			return err
+		}
+		change := instancemanager.RemoveRouteOnlyInstanceWithSnapshot(req.instanceID)
+		willRetry := attempt == 0
+		observeFrontendRouteLifecycle(req, "", "route-stale", change, willRetry)
+		if !willRetry {
+			return err
 		}
 	}
-	if !isHostPort(address) {
-		return fmt.Errorf("frontend proxy kill route is not configured for instance %s", req.instanceID)
-	}
-	serviceClient, err := c.clientFactory.ClientForAddress(address)
-	if err != nil {
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return err
-	}
-	if err := newGRPCFrontendProxyLifecycleClient(serviceClient, c.frontendClientID).KillInstance(req); err != nil {
-		if isFrontendProxyRouteStaleStatus(err) {
-			// A stale owner response is a refresh hint, not permission to replay a
-			// kill whose dispatch outcome may be unknown. Drop only the local
-			// route-only hint so a later caller can resolve fresh watcher state.
-			change := instancemanager.RemoveRouteOnlyInstanceWithSnapshot(req.instanceID)
-			observeFrontendRouteLifecycle(req, "route-stale", change)
-		}
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return err
-	}
-	return nil
+	return fmt.Errorf("frontend proxy kill retry exhausted")
 }
 
 func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRuntimeRawInvokeRequest) ([]byte, error) {
@@ -659,27 +810,12 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRunti
 	if err := proto.Unmarshal(req.invoke, invokeReq); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal frontend proxy invoke route request: %w", err)
 	}
-	requestRoute := ""
-	if invokeReq.GetInvokeOptions() != nil {
-		requestRoute = invokeReq.GetInvokeOptions().GetCustomTag()[frontendProxyRouteKey]
+	route, err := resolveDirectProxyOwner(
+		req.ctx, invokeReq.GetInstanceID(), proxyrouting.CapabilityInvoke, proxyrouting.TransportGRPC)
+	if err != nil {
+		return nil, err
 	}
-	// Raw function-system requests can carry an old YR_ROUTE from their serialized
-	// request. Prefer the frontend watcher cache for the current owning proxy when
-	// it is available; fall back to the request route only when the instance route
-	// is not known locally. Do not retry after an invoke is sent, because unknown
-	// status requests may not be safe to replay.
-	address := resolveProxyAddressByRawInvoke(invokeReq)
-	if !isHostPort(address) {
-		address = resolveFrontendProxyAddressFromRoute(requestRoute)
-	}
-	if !isHostPort(address) {
-		if endpoint, ok := resolveSoleFrontendProxyEndpoint(frontendProxyCapabilityInvoke); ok {
-			address = endpoint.Address
-		}
-	}
-	if !isHostPort(address) {
-		return nil, fmt.Errorf("frontend proxy invoke route is not configured for instance %s", invokeReq.GetInstanceID())
-	}
+	address := route.Address
 	serviceClient, err := c.clientFactory.ClientForAddress(address)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
@@ -693,43 +829,6 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRunti
 	return notify, nil
 }
 
-// resolveFileTransferProxyAddress resolves the owning frontend proxy gRPC
-// address for instanceID. It mirrors the invoke route resolution: the instance
-// watcher cache is preferred, and when the owning proxy is published by node
-// id the proxy_discovery cache (LookupFrontendProxyEndpoint) resolves the
-// concrete host:port. It falls back to the sole published invoke endpoint
-// before failing so single-proxy rollouts keep working.
-func resolveFileTransferProxyAddress(instanceID string) (string, error) {
-	if instanceID == "" {
-		return "", fmt.Errorf("frontend proxy file transfer requires non-empty instance id")
-	}
-	instance := instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID)
-	if instance != nil {
-		if isHostPort(instance.FunctionProxyID) && !frontendProxyAddressIsSuspect(instance.FunctionProxyID) {
-			return instance.FunctionProxyID, nil
-		}
-		if instance.FunctionProxyID != "" {
-			if endpoint, ok := LookupFrontendProxyEndpoint(instance.FunctionProxyID, frontendProxyCapabilityInvoke); ok {
-				return endpoint.Address, nil
-			}
-		}
-		if endpoint, ok := resolveFrontendProxyEndpointByRuntimeHost(
-			instance.RuntimeAddress, frontendProxyCapabilityInvoke); ok {
-			return endpoint.Address, nil
-		}
-	}
-	if endpoint, ok := LookupFrontendProxyEndpoint(instanceID, frontendProxyCapabilityInvoke); ok {
-		return endpoint.Address, nil
-	}
-	if endpoint, ok := resolveSoleFrontendProxyEndpoint(frontendProxyCapabilityInvoke); ok {
-		return endpoint.Address, nil
-	}
-	if instance != nil && isHostPort(instance.ProxyGrpcAddress) {
-		return instance.ProxyGrpcAddress, nil
-	}
-	return "", fmt.Errorf("frontend proxy file transfer route is not configured for instance %s", instanceID)
-}
-
 // UploadFile resolves the owning proxy for instanceID, acquires a pooled gRPC
 // client, and streams reader to the proxy via the client-streaming UploadFile RPC.
 func (c *routingFrontendProxyInvokeClient) UploadFile(ctx context.Context, instanceID string, path string,
@@ -738,10 +837,12 @@ func (c *routingFrontendProxyInvokeClient) UploadFile(ctx context.Context, insta
 	if c == nil || c.clientFactory == nil {
 		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
 	}
-	address, err := resolveFileTransferProxyAddress(instanceID)
+	route, err := resolveDirectProxyOwner(
+		ctx, instanceID, proxyrouting.CapabilityFileTransfer, proxyrouting.TransportGRPC)
 	if err != nil {
 		return nil, err
 	}
+	address := route.Address
 	serviceClient, err := c.clientFactory.ClientForAddress(address)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
@@ -765,10 +866,12 @@ func (c *routingFrontendProxyInvokeClient) DownloadFile(ctx context.Context, ins
 	if c == nil || c.clientFactory == nil {
 		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
 	}
-	address, err := resolveFileTransferProxyAddress(instanceID)
+	route, err := resolveDirectProxyOwner(
+		ctx, instanceID, proxyrouting.CapabilityFileTransfer, proxyrouting.TransportGRPC)
 	if err != nil {
 		return nil, err
 	}
+	address := route.Address
 	serviceClient, err := c.clientFactory.ClientForAddress(address)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
@@ -786,211 +889,18 @@ func (c *routingFrontendProxyInvokeClient) DownloadFile(ctx context.Context, ins
 type defaultFrontendProxyRouteResolver struct{}
 
 func (defaultFrontendProxyRouteResolver) ResolveFrontendProxyAddress(req simpleRuntimeInvokeRequest) (string, error) {
-	route := req.options.CreateOpt[frontendProxyRouteKey]
-	// Prefer frontend's current instance cache over request-scoped route tags.
-	// The cache is updated by the instance watcher and represents the current
-	// owning proxy; a request tag can be absent or stale after reschedule/failover.
-	if address := resolveProxyAddressByInstance(req); address != "" {
-		return address, nil
+	route, err := resolveDirectProxyOwner(
+		req.ctx, req.instanceID, proxyrouting.CapabilityInvoke, proxyrouting.TransportGRPC)
+	if err != nil {
+		return "", err
 	}
-	if route == "" {
-		return "", fmt.Errorf("frontend proxy route %s is empty for instance %s", frontendProxyRouteKey, req.instanceID)
-	}
-	if address := resolveFrontendProxyAddressFromRoute(route); address != "" {
-		return address, nil
-	}
-	return "", fmt.Errorf("frontend proxy route %q is not resolvable for instance %s", route, req.instanceID)
+	return route.Address, nil
 }
 
-func resolveFrontendProxyAddressFromRoute(route string) string {
-	return resolveFrontendProxyAddressFromRouteWithCapability(route, frontendProxyCapabilityInvoke)
-}
-
-func resolveFrontendProxyAddressFromRouteWithCapability(route string, capability string) string {
-	if isHostPort(route) {
-		if frontendProxyAddressIsSuspect(route) {
-			return ""
-		}
-		return route
-	}
-	if endpoint, ok := resolveFrontendProxyEndpointByNode(route, capability); ok {
-		return endpoint.Address
-	}
-	return ""
-}
-
-func resolveFrontendProxyEndpointByNode(nodeID string, capability string) (frontendProxyEndpoint, bool) {
-	return lookupFrontendProxyEndpointByNode(nodeID, capability)
-}
-
-func lookupFrontendProxyEndpointByNode(nodeID string, capability string) (frontendProxyEndpoint, bool) {
-	discovery := currentFrontendProxyDiscovery()
-	if discovery == nil {
-		return frontendProxyEndpoint{}, false
-	}
-	endpoint, ok := discovery.GetByNode(nodeID, capability)
-	if !ok || !isHostPort(endpoint.Address) {
-		return frontendProxyEndpoint{}, false
-	}
-	return endpoint, true
-}
-
-func resolveSoleFrontendProxyEndpoint(capability string) (frontendProxyEndpoint, bool) {
-	return lookupSoleFrontendProxyEndpoint(capability)
-}
-
-func lookupSoleFrontendProxyEndpoint(capability string) (frontendProxyEndpoint, bool) {
-	discovery := currentFrontendProxyDiscovery()
-	if discovery == nil {
-		return frontendProxyEndpoint{}, false
-	}
-	endpoint, ok := discovery.GetSoleEndpoint(capability)
-	if !ok || !isHostPort(endpoint.Address) {
-		return frontendProxyEndpoint{}, false
-	}
-	return endpoint, true
-}
-
-func resolveNextFrontendProxyEndpoint(capability string) (frontendProxyEndpoint, bool) {
-	return lookupNextFrontendProxyEndpoint(capability)
-}
-
-func lookupNextFrontendProxyEndpoint(capability string) (frontendProxyEndpoint, bool) {
-	discovery := currentFrontendProxyDiscovery()
-	if discovery == nil {
-		return frontendProxyEndpoint{}, false
-	}
-	endpoint, ok := discovery.GetNextEndpoint(capability)
-	if !ok || !isHostPort(endpoint.Address) {
-		return frontendProxyEndpoint{}, false
-	}
-	return endpoint, true
-}
-
-func resolveProxyAddressByInstance(req simpleRuntimeInvokeRequest) string {
-	if req.instanceID == "" {
-		return ""
-	}
-	var instance *types.InstanceSpecification
-	if req.funcMeta.FuncID != "" {
-		instance = instancemanager.GetGlobalInstanceScheduler().GetInstanceByID(req.funcMeta.FuncID, req.instanceID)
-	}
-	if instance == nil {
-		instance = instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(req.instanceID)
-	}
-	return proxyAddressFromInstanceForCapability(instance, frontendProxyCapabilityInvoke)
-}
-
-func resolveProxyAddressByKill(req simpleRuntimeKillRequest) string {
-	if req.instanceID == "" {
-		return ""
-	}
-	var instance *types.InstanceSpecification
-	if instance == nil {
-		instance = instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(req.instanceID)
-	}
-	if address := proxyAddressFromInstanceForCapability(instance, frontendProxyCapabilityKill); address != "" {
-		return address
-	}
-	if req.options.CreateOpt != nil {
-		return resolveFrontendProxyAddressFromRouteWithCapability(req.options.CreateOpt[frontendProxyRouteKey],
-			frontendProxyCapabilityKill)
-	}
-	return ""
-}
-
-func resolveProxyAddressByRawInvoke(req *core.InvokeRequest) string {
-	if req == nil || req.GetInstanceID() == "" {
-		return ""
-	}
-	var instance *types.InstanceSpecification
-	if req.GetFunction() != "" {
-		instance = instancemanager.GetGlobalInstanceScheduler().GetInstanceByID(req.GetFunction(), req.GetInstanceID())
-	}
-	if instance == nil {
-		instance = instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(req.GetInstanceID())
-	}
-	return proxyAddressFromInstance(instance)
-}
-
-func isHostPort(address string) bool {
-	host, port, err := net.SplitHostPort(address)
-	return err == nil && strings.TrimSpace(host) != "" && strings.TrimSpace(port) != ""
-}
-
-func proxyAddressFromInstance(instance *types.InstanceSpecification) string {
-	return proxyAddressFromInstanceForCapability(instance, frontendProxyCapabilityInvoke)
-}
-
-func proxyAddressFromInstanceForCapability(instance *types.InstanceSpecification, capability string) string {
-	if instance == nil {
-		return ""
-	}
-	if isHostPort(instance.FunctionProxyID) {
-		if frontendProxyAddressIsSuspect(instance.FunctionProxyID) {
-			return ""
-		}
-		return instance.FunctionProxyID
-	}
-	if endpoint, ok := resolveFrontendProxyEndpointByNode(instance.FunctionProxyID, capability); ok {
-		return endpoint.Address
-	}
-	// If discovery already knows this owning proxy node but it is not eligible
-	// for this frontend capability, do not bypass rollout with another endpoint.
-	if frontendProxyNodeExistsInDiscovery(instance.FunctionProxyID) {
-		return ""
-	}
-	// Some scheduler allocation responses do not carry RouteAddress, while the
-	// instance watcher still provides the runtime address. Match that runtime's
-	// node IP against the published proxy discovery endpoint instead of guessing
-	// the legacy static gRPC port. Process-mode proxy ports are dynamic.
-	if endpoint, ok := resolveFrontendProxyEndpointByRuntimeHost(instance.RuntimeAddress, capability); ok {
-		return endpoint.Address
-	}
-	if frontendProxyRuntimeHostExists(instance.RuntimeAddress) {
-		return ""
-	}
-	return ""
-}
-
-func frontendProxyRuntimeHostExists(runtimeAddress string) bool {
-	host, _, err := net.SplitHostPort(runtimeAddress)
-	if err != nil || host == "" {
-		return false
-	}
-	discovery, ok := currentFrontendProxyDiscovery().(frontendProxyDiscoveryByHost)
-	if !ok {
-		return false
-	}
-	_, found := discovery.GetByHost(host, "")
-	return found
-}
-
-func resolveFrontendProxyEndpointByRuntimeHost(runtimeAddress string, capability string) (frontendProxyEndpoint, bool) {
-	host, _, err := net.SplitHostPort(runtimeAddress)
-	if err != nil || host == "" {
-		return frontendProxyEndpoint{}, false
-	}
-	discovery, ok := currentFrontendProxyDiscovery().(frontendProxyDiscoveryByHost)
-	if !ok {
-		return frontendProxyEndpoint{}, false
-	}
-	if endpoint, found := discovery.GetByHost(host, capability); found {
-		return endpoint, true
-	}
-	return frontendProxyEndpoint{}, false
-}
-
-func frontendProxyNodeExistsInDiscovery(nodeID string) bool {
-	if nodeID == "" {
-		return false
-	}
-	discovery := currentFrontendProxyDiscovery()
-	if discovery == nil {
-		return false
-	}
-	_, ok := discovery.GetByNode(nodeID, "")
-	return ok
+func resolveDirectProxyOwner(ctx context.Context, instanceID string, capability proxyrouting.Capability,
+	transport proxyrouting.Transport,
+) (proxyrouting.OwnerRoute, error) {
+	return proxyrouting.Wait(ctx, instanceID, capability, transport)
 }
 
 type frontendProxyGRPCClientPool struct {
@@ -1063,7 +973,7 @@ func evictFrontendProxyClientOnError(factory frontendProxyServiceClientFactory, 
 	if ok {
 		evictor.EvictAddress(address)
 	}
-	MarkFrontendProxyEndpointSuspect(address)
+	proxyrouting.MarkSuspect(address)
 }
 
 func isFrontendProxyTransportError(err error) bool {
@@ -1115,10 +1025,6 @@ func rawSimpleRuntimeContext(parent context.Context, _ api.RawRequestOption) (co
 		parent = context.Background()
 	}
 	return context.WithCancel(parent)
-}
-
-func newFrontendProxyLifecycleCorrelationID(operation string) string {
-	return fmt.Sprintf("frontend-proxy-%s-%s", operation, uuid.NewString())
 }
 
 func newFrontendProxyRuntimeRequestID() string {
@@ -1246,6 +1152,13 @@ type frontendProxyBusinessErr struct {
 	message   string
 }
 
+func (e *frontendProxyBusinessErr) directProxyErrorMetadata() DirectProxyErrorMetadata {
+	if e == nil {
+		return DirectProxyErrorMetadata{}
+	}
+	return DirectProxyErrorMetadata{Code: int(e.code)}
+}
+
 func (e *frontendProxyBusinessErr) Error() string {
 	if e == nil {
 		return "frontend proxy failed with nil business error"
@@ -1267,6 +1180,17 @@ func (e *frontendProxyStatusErr) Error() string {
 		message += fmt.Sprintf(", retryReason: %s", e.retryReason)
 	}
 	return message
+}
+
+func (e *frontendProxyStatusErr) directProxyErrorMetadata() DirectProxyErrorMetadata {
+	if e == nil {
+		return DirectProxyErrorMetadata{}
+	}
+	return DirectProxyErrorMetadata{
+		Code:        int(e.code),
+		Retryable:   e.retryable,
+		RetryReason: e.retryReason,
+	}
 }
 
 func frontendProxyStatusError(operation string, status *frontend_proxy.FrontendProxyStatus) error {
@@ -1474,6 +1398,22 @@ func convertSimpleRuntimeInvokeArgs(funcMeta api.FunctionMeta, args []api.Arg) [
 	return withMetadata
 }
 
+func convertSimpleRuntimeCreateArgs(funcMeta api.FunctionMeta, args []api.Arg) []*common.Arg {
+	converted := convertSimpleRuntimeArgs(args)
+	if funcMeta.Api == api.PosixApi {
+		return converted
+	}
+	// Libruntime used to prepend MetaData before sending a non-POSIX create.
+	// The direct Proxy path must preserve that runtime wire contract itself.
+	withMetadata := make([]*common.Arg, 0, len(converted)+1)
+	withMetadata = append(withMetadata, &common.Arg{
+		Type:  common.Arg_VALUE,
+		Value: buildSimpleRuntimeCreateMetadata(funcMeta),
+	})
+	withMetadata = append(withMetadata, converted...)
+	return withMetadata
+}
+
 func convertSimpleRuntimeInvokeArgsForRPC(funcMeta api.FunctionMeta, args []api.Arg) ([]*common.Arg, func()) {
 	converted := convertSimpleRuntimeArgs(args)
 	release := func() {}
@@ -1584,6 +1524,16 @@ func acquireSimpleRuntimeValueBuffer(required int) ([]byte, *sync.Pool) {
 func buildSimpleRuntimeInvokeMetadata(funcMeta api.FunctionMeta) []byte {
 	var metadata []byte
 	metadata = appendProtoVarint(metadata, 1, uint64(1)) // libruntime.InvokeFunction
+	metadata = appendProtoBytes(metadata, functionMetaModuleNameField, buildSimpleRuntimeFunctionMeta(funcMeta))
+	metadata = appendProtoBytes(metadata, functionMetaClassNameField, buildSimpleRuntimeInvocationMeta())
+	return metadata
+}
+
+func buildSimpleRuntimeCreateMetadata(funcMeta api.FunctionMeta) []byte {
+	var metadata []byte
+	// InvokeType.CreateInstance is protobuf enum value zero and is therefore
+	// represented by the field's default value. FunctionMeta remains required
+	// by the runtime initializer.
 	metadata = appendProtoBytes(metadata, functionMetaModuleNameField, buildSimpleRuntimeFunctionMeta(funcMeta))
 	metadata = appendProtoBytes(metadata, functionMetaClassNameField, buildSimpleRuntimeInvocationMeta())
 	return metadata

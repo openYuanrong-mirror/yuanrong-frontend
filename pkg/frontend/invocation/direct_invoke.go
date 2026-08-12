@@ -42,7 +42,7 @@ func InvokeResolvedInstance(ctx *types.InvokeProcessContext, instanceID string) 
 		zap.Any("requestId", ctx.RequestID),
 		zap.Any("instanceID", instanceID),
 	)
-	if snErr := invokeFunctionWithLibRuntime(ctx, *req, logger); snErr != nil {
+	if snErr := invokeFunctionWithDirectProxy(ctx, *req, logger); snErr != nil {
 		httputil.HandleInvokeError(ctx, snErr)
 		return snErr
 	}

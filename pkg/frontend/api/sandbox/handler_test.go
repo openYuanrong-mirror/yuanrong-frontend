@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package sandbox
 
 import (
@@ -26,6 +42,7 @@ import (
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/grpc/pb/common"
 	"frontend/pkg/common/faas_common/grpc/pb/core"
+	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/grpc/pb/runtime"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/job"
@@ -105,6 +122,50 @@ type runtimeStub struct {
 	) (string, error)
 	getAsync func(objectID string, cb api.GetAsyncCallback)
 	kill     func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error
+}
+
+func setAPIClientsForTest(t *testing.T, runtime *runtimeStub) {
+	t.Helper()
+	util.SetAPIClientLibruntime(runtime)
+	restore := util.SetDirectProxyClientForTest(&directRuntimeStub{runtime: runtime})
+	t.Cleanup(restore)
+}
+
+type directRuntimeStub struct{ runtime *runtimeStub }
+
+func (r *directRuntimeStub) Invoke(util.DirectInvokeRequest) ([]byte, error) { return nil, nil }
+
+func (r *directRuntimeStub) CreateInstance(req util.DirectCreateRequest) (string, error) {
+	funcMeta, args, options := req.AdaptedCreateValues()
+	return r.runtime.CreateInstance(funcMeta, args, options)
+}
+
+func (r *directRuntimeStub) CreateRaw(req util.DirectRawRequest) ([]byte, error) {
+	return r.runtime.CreateInstanceRawContext(req.Context, req.Payload, req.AdaptedRawOption())
+}
+
+func (r *directRuntimeStub) InvokeRaw(req util.DirectRawRequest) ([]byte, error) {
+	return r.runtime.InvokeByInstanceIdRaw(req.Payload, req.AdaptedRawOption())
+}
+
+func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
+	return r.runtime.Kill(req.InstanceID, req.Signal, req.Payload, req.AdaptedInvokeOptions())
+}
+
+func (r *directRuntimeStub) UploadFile(ctx context.Context, instanceID, path string, reader io.Reader,
+	tenantID string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	return r.runtime.UploadFile(ctx, instanceID, path, reader, tenantID)
+}
+
+func (r *directRuntimeStub) DownloadFile(ctx context.Context, instanceID, path string, offset int64,
+	tenantID string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return r.runtime.DownloadFile(ctx, instanceID, path, offset, tenantID)
+}
+
+func (r *runtimeStub) Invoke(util.InvokeRequest) ([]byte, error) {
+	return nil, nil
 }
 
 func (r *runtimeStub) CreateInstance(
@@ -201,6 +262,18 @@ func (r *runtimeStub) CreateInstanceRawContext(
 		return nil, err
 	}
 	return r.createInstanceRawContext(ctx, &createReq, option)
+}
+
+func (r *runtimeStub) UploadFile(
+	context.Context, string, string, io.Reader, string,
+) (*frontend_proxy.FileTransferResponse, error) {
+	return nil, nil
+}
+
+func (r *runtimeStub) DownloadFile(
+	context.Context, string, string, int64, string,
+) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return nil, nil
 }
 
 func invokeOptionsFromRawCreate(createReq *core.CreateRequest) api.InvokeOptions {
@@ -333,7 +406,22 @@ func TestParseSandboxRawInvokeResponse(t *testing.T) {
 		decoded, err := parseSandboxRawInvokeResponse(rawInvokeNotify(0, "", nil))
 
 		require.Nil(t, decoded)
-		require.EqualError(t, err, "sandbox raw invoke response contains no result")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "requires exactly one inline result, got 0")
+	})
+
+	t.Run("multiple inline results are rejected instead of truncating", func(t *testing.T) {
+		notify := &runtime.NotifyRequest{
+			SmallObjects: []*common.SmallObject{{Value: []byte("first")}, {Value: []byte("second")}},
+		}
+		raw, err := proto.Marshal(notify)
+		require.NoError(t, err)
+
+		decoded, err := parseSandboxRawInvokeResponse(raw)
+
+		require.Nil(t, decoded)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "requires exactly one inline result, got 2")
 	})
 }
 
@@ -347,7 +435,7 @@ func TestCreateSandboxInstanceRawUsesIndependentTimeoutContext(t *testing.T) {
 		WithContext(requestCtx)
 
 	const createTimeoutSeconds = 2
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRawContext: func(
 			createCtx context.Context,
 			_ *core.CreateRequest,
@@ -493,7 +581,7 @@ func TestCreateHandlerPropagatesHeaderTenantID(t *testing.T) {
 
 	var capturedInvokeOpt api.InvokeOptions
 	var capturedFuncMeta api.FunctionMeta
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -539,7 +627,7 @@ func TestCreateHandlerFallsBackToBodyTenant(t *testing.T) {
 
 	var capturedInvokeOpt api.InvokeOptions
 	var capturedFuncMeta api.FunctionMeta
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -580,7 +668,7 @@ func TestCreateHandlerFallsBackToBodyTenant(t *testing.T) {
 
 func TestCreateHandlerAttributesTenantFromTokenClaim(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(_ api.FunctionMeta, _ []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-from-token", nil
@@ -628,7 +716,7 @@ func TestCreateHandlerReturnsInstanceIDWhenCreateTimesOutAfterScheduling(t *test
 		waitForSandboxInstanceRunning = oldWaitForSandboxInstanceRunning
 	}()
 
-	installCreateTimeoutRuntimeStub()
+	installCreateTimeoutRuntimeStub(t)
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -649,8 +737,8 @@ func TestCreateHandlerReturnsInstanceIDWhenCreateTimesOutAfterScheduling(t *test
 	assertCreateTimeoutResponse(t, recorder, waitCalled)
 }
 
-func installCreateTimeoutRuntimeStub() {
-	util.SetAPIClientLibruntime(&runtimeStub{
+func installCreateTimeoutRuntimeStub(t *testing.T) {
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			return "instance-created-late", api.ErrorInfo{
 				Code: createTimeoutSuccessCode,
@@ -738,7 +826,7 @@ func TestDefaultSandboxFunctionIDUsesRustService(t *testing.T) {
 func TestCreateHandlerUsesRequestedRuntime(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
 	var capturedFuncMeta api.FunctionMeta
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -769,7 +857,7 @@ func TestCreateHandlerUsesRequestedRuntime(t *testing.T) {
 }
 
 func TestCreateHandlerRejectsUnsupportedRuntime(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called for unsupported runtime")
 			return "", nil
@@ -807,7 +895,7 @@ func TestCreateHandlerAddsSchedulerCreateOptions(t *testing.T) {
 	}()
 
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-with-options", nil
@@ -839,6 +927,7 @@ func assertSchedulerCreateOptions(t *testing.T, capturedInvokeOpt api.InvokeOpti
 	require.Equal(t, "detached", capturedInvokeOpt.CustomExtensions["lifecycle"])
 	require.Equal(t, sandboxConcurrency, capturedInvokeOpt.CustomExtensions["Concurrency"])
 	require.Equal(t, "reserved", capturedInvokeOpt.CreateOpt[constant.InstanceTypeNote])
+	require.Equal(t, "false", capturedInvokeOpt.CreateOpt[constant.SchedulerManagedNote])
 	_, hasStaticOwner := capturedInvokeOpt.CreateOpt["resource.owner"]
 	require.False(t, hasStaticOwner)
 	require.Equal(t, fmt.Sprintf("%d", sandboxCreateTimeoutSeconds), capturedInvokeOpt.CreateOpt["call_timeout"])
@@ -867,7 +956,7 @@ func TestCreateHandlerPassesRootfsToSandboxCustomExtensions(t *testing.T) {
 	}()
 
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-with-rootfs", nil
@@ -904,7 +993,7 @@ func TestCreateHandlerAcceptsImageAliasForRootfs(t *testing.T) {
 	}()
 
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "instance-with-image", nil
@@ -941,7 +1030,7 @@ func TestCreateHandlerPassesPortForwardingsToNetworkCreateOption(t *testing.T) {
 	}()
 
 	var capturedCreateReq *core.CreateRequest
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,
@@ -981,7 +1070,7 @@ func TestCreateHandlerPassesPortForwardingsToNetworkCreateOption(t *testing.T) {
 }
 
 func TestCreateHandlerRejectsInvalidPortForwarding(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			t.Fatalf("createInstance should not be called for invalid port forwarding")
 			return "", nil
@@ -1019,7 +1108,7 @@ func TestCreateHandlerBuildsBuiltinDetachedSandboxRequest(t *testing.T) {
 
 	var capturedCreateReq *core.CreateRequest
 	var capturedRawOption api.RawRequestOption
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			option api.RawRequestOption,
@@ -1081,13 +1170,14 @@ func assertBuiltinDetachedSandboxRequest(
 	_, hasStaticOwner := capturedCreateReq.GetCreateOptions()["resource.owner"]
 	require.False(t, hasStaticOwner)
 	require.Equal(t, sandboxInstanceType, capturedCreateReq.GetCreateOptions()[constant.InstanceTypeNote])
+	require.Equal(t, "false", capturedCreateReq.GetCreateOptions()[constant.SchedulerManagedNote])
 	require.Empty(t, capturedCreateReq.GetCreateOptions()[constant.SchedulerIDNote])
 }
 
 func TestCreateV1HandlerDefaultsAndReturnsSandboxID(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
 	var capturedCreateReq *core.CreateRequest
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(createReq *core.CreateRequest, _ api.RawRequestOption) ([]byte, error) {
 			capturedCreateReq = createReq
 			capturedInvokeOpt = invokeOptionsFromRawCreate(createReq)
@@ -1133,7 +1223,7 @@ func TestCreateV1HandlerDefaultsAndReturnsSandboxID(t *testing.T) {
 func TestCreateV1HandlerUsesRRTForKataIsolationRuntime(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
 	var capturedFuncMeta api.FunctionMeta
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -1184,7 +1274,7 @@ func TestCreateV1HandlerRejectsRootfsImageAlias(t *testing.T) {
 
 func TestCreateV1HandlerPreservesRuntimeOnlyRootfsOverlay(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(_ api.FunctionMeta, _ []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "sandbox-kata-runtime-only", nil
@@ -1205,7 +1295,7 @@ func TestCreateV1HandlerPreservesRuntimeOnlyRootfsOverlay(t *testing.T) {
 
 func TestCreateV1HandlerAcceptsDeprecatedTopLevelRuntime(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(_ api.FunctionMeta, _ []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "sandbox-nested-kata", nil
@@ -1254,7 +1344,7 @@ func TestCreateV1HandlerRejectsIncompleteRootfsSource(t *testing.T) {
 
 func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
 	var capturedCreateReq *core.CreateRequest
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,
@@ -1355,7 +1445,7 @@ func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
 
 func TestCreateV1HandlerConvertsNormalizedXPUToFunctionSystemResource(t *testing.T) {
 	var capturedCreateReq *core.CreateRequest
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,
@@ -1400,7 +1490,7 @@ func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 	const storageMb int64 = 153600
 
 	var capturedCreateReq *core.CreateRequest
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,
@@ -1460,7 +1550,7 @@ func TestCreateV1HandlerRejectsInvalidStorage(t *testing.T) {
 	for _, body := range invalidBodies {
 		t.Run(body, func(t *testing.T) {
 			createCalled := false
-			util.SetAPIClientLibruntime(&runtimeStub{
+			setAPIClientsForTest(t, &runtimeStub{
 				createInstanceRaw: func(
 					_ *core.CreateRequest,
 					_ api.RawRequestOption,
@@ -1490,7 +1580,7 @@ func TestCreateV1HandlerRejectsInvalidStorage(t *testing.T) {
 
 func TestCreateV1HandlerEscapesXPUModelAsRegexLiteral(t *testing.T) {
 	var capturedCreateReq *core.CreateRequest
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,
@@ -1532,7 +1622,7 @@ func TestParseSandboxXPUDerivesUppercaseFunctionSystemPrefix(t *testing.T) {
 
 func TestCreateV1HandlerUsesFunctionSystemWildcardWhenXPUModelIsEmpty(t *testing.T) {
 	var capturedCreateReq *core.CreateRequest
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,
@@ -1589,7 +1679,7 @@ func TestCreateV1HandlerRejectsInvalidXPU(t *testing.T) {
 	for _, value := range invalidValues {
 		t.Run(value, func(t *testing.T) {
 			createCalled := false
-			util.SetAPIClientLibruntime(&runtimeStub{
+			setAPIClientsForTest(t, &runtimeStub{
 				createInstanceRaw: func(
 					_ *core.CreateRequest,
 					_ api.RawRequestOption,
@@ -1621,7 +1711,7 @@ func TestCreateV1HandlerRejectsInvalidXPU(t *testing.T) {
 
 func TestCreateV1HandlerRejectsInvalidScheduleAffinity(t *testing.T) {
 	createCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			createCalled = true
 			return "sandbox-invalid-affinity", nil
@@ -1659,7 +1749,7 @@ func TestCreateV1HandlerRejectsInvalidScheduleAffinity(t *testing.T) {
 
 func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "sandbox-sse", nil
@@ -1697,7 +1787,7 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 }
 
 func TestCreateV1HandlerReadsRequestBodyToEOFBeforeSSE(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(api.FunctionMeta, []api.Arg, api.InvokeOptions) (string, error) {
 			return "sandbox-body-eof", nil
 		},
@@ -1727,7 +1817,7 @@ func TestCreateV1HandlerReadsRequestBodyToEOFBeforeSSE(t *testing.T) {
 }
 
 func TestCreateV1HandlerReadsRequestBodyToEOFBeforeJSONResponse(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(api.FunctionMeta, []api.Arg, api.InvokeOptions) (string, error) {
 			return "sandbox-json-body-eof", nil
 		},
@@ -1812,7 +1902,7 @@ func TestCreateV1HandlerRejectsConcurrentExplicitNameWithDifferentRequestID(t *t
 	var createCalls atomic.Int32
 	createStarted := make(chan struct{})
 	releaseCreate := make(chan struct{})
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			if createCalls.Add(1) == 1 {
 				close(createStarted)
@@ -1877,7 +1967,7 @@ func TestCreateV1HandlerRejectsConcurrentExplicitNameWithDifferentRequestID(t *t
 
 func TestCreateV1HandlerReplaysCompletedCreateByRequestID(t *testing.T) {
 	var createCalls atomic.Int32
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			createCalls.Add(1)
 			return "sandbox-request-replay", nil
@@ -1912,7 +2002,7 @@ func TestCreateV1HandlerReplaysCompletedCreateByRequestID(t *testing.T) {
 
 func TestCreateV1HandlerRejectsRequestIDBodyConflict(t *testing.T) {
 	var createCalls atomic.Int32
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			createCalls.Add(1)
 			return "sandbox-request-conflict", nil
@@ -1964,7 +2054,7 @@ func TestCreateV1HandlerRejectsExplicitNameAlreadyInSandboxRouterCache(t *testin
 	defer execendpoint.Default().Delete(instance)
 
 	var createCalls atomic.Int32
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			createCalls.Add(1)
 			return instance, nil
@@ -2000,7 +2090,7 @@ func TestCreateV1HandlerRejectsExplicitNameAlreadyInSandboxRouterCache(t *testin
 func TestCreateV1HandlerReplaysUnnamedCreateByRequestID(t *testing.T) {
 	var createCalls atomic.Int32
 	var createdInstanceID string
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,
@@ -2193,7 +2283,7 @@ func TestCreateV1HandlerSSEDoesNotReportUnconfirmedTimeoutAsRunning(t *testing.T
 	}
 	defer func() { waitForSandboxInstanceRunning = oldWaitForSandboxInstanceRunning }()
 
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			return "sandbox-timeout", api.ErrorInfo{Code: 3002, Err: fmt.Errorf("create instance timeout")}
 		},
@@ -2221,7 +2311,7 @@ func TestCreateV1HandlerSSEDoesNotReportUnconfirmedTimeoutAsRunning(t *testing.T
 
 func TestCreateV1HandlerFrontendOwnsTunnelSetup(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedInvokeOpt = invokeOpt
 			return "default/sandbox_demo.1", nil
@@ -2289,7 +2379,7 @@ func assertTunnelResponse(t *testing.T, recorder *httptest.ResponseRecorder) {
 func TestCreateV1HandlerForwardsIsolationRuntimeWithoutOwningRegistry(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
 	var capturedFuncMeta api.FunctionMeta
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
@@ -2392,7 +2482,7 @@ type invokeV1Capture struct {
 func setupInvokeV1RuntimeStub(t *testing.T) *invokeV1Capture {
 	t.Helper()
 	capture := &invokeV1Capture{}
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		invokeInstanceRaw: func(
 			invokeReq *core.InvokeRequest,
 			option api.RawRequestOption,
@@ -2460,12 +2550,12 @@ func TestDeleteHandlerDeletesSandboxInstance(t *testing.T) {
 		capturedSignal     int
 		capturedPayload    []byte
 	)
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
 			capturedInstanceID = instanceID
 			capturedSignal = signal
 			capturedPayload = append([]byte(nil), payload...)
-			require.Equal(t, api.InvokeOptions{}, invokeOpt)
+			require.NotEmpty(t, invokeOpt.TraceID)
 			return nil
 		},
 	})
@@ -2494,7 +2584,7 @@ func TestDeleteHandlerDeletesSandboxInstance(t *testing.T) {
 }
 
 func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
 			return fmt.Errorf("kill failed")
 		},
@@ -2551,7 +2641,7 @@ func TestDeleteHandlerAllowsPlaceholderTokenWhenAuthDisabled(t *testing.T) {
 
 	targetInstance := "sandbox-delete-auth-disabled"
 	killCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{kill: func(instanceID string, _ int, _ []byte, _ api.InvokeOptions) error {
+	setAPIClientsForTest(t, &runtimeStub{kill: func(instanceID string, _ int, _ []byte, _ api.InvokeOptions) error {
 		killCalled = true
 		require.Equal(t, targetInstance, instanceID)
 		return nil
@@ -2573,7 +2663,7 @@ func TestDeleteHandlerAllowsPlaceholderTokenWhenAuthDisabled(t *testing.T) {
 func TestDeleteHandlerRejectsCrossTenant(t *testing.T) {
 	targetInstance := setupDeleteTenantSummary(t)
 	killCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{kill: func(string, int, []byte, api.InvokeOptions) error {
+	setAPIClientsForTest(t, &runtimeStub{kill: func(string, int, []byte, api.InvokeOptions) error {
 		killCalled = true
 		return nil
 	}})
@@ -2586,7 +2676,7 @@ func TestDeleteHandlerRejectsCrossTenant(t *testing.T) {
 func TestDeleteHandlerAllowsSameTenant(t *testing.T) {
 	targetInstance := setupDeleteTenantSummary(t)
 	killCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{kill: func(instanceID string, _ int, _ []byte, _ api.InvokeOptions) error {
+	setAPIClientsForTest(t, &runtimeStub{kill: func(instanceID string, _ int, _ []byte, _ api.InvokeOptions) error {
 		killCalled = true
 		require.Equal(t, targetInstance, instanceID)
 		return nil
@@ -2600,7 +2690,7 @@ func TestDeleteHandlerAllowsSameTenant(t *testing.T) {
 func TestDeleteHandlerEnforcesHeaderWithoutMiddleware(t *testing.T) {
 	targetInstance := setupDeleteTenantSummary(t)
 	killCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{kill: func(string, int, []byte, api.InvokeOptions) error {
+	setAPIClientsForTest(t, &runtimeStub{kill: func(string, int, []byte, api.InvokeOptions) error {
 		killCalled = true
 		return nil
 	}})
@@ -2614,7 +2704,7 @@ func TestDeleteHandlerEnforcesHeaderWithoutMiddleware(t *testing.T) {
 func TestDeleteHandlerAllowsSystemTenantDeveloper(t *testing.T) {
 	targetInstance := setupDeleteTenantSummary(t)
 	killCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{kill: func(instanceID string, _ int, _ []byte, _ api.InvokeOptions) error {
+	setAPIClientsForTest(t, &runtimeStub{kill: func(instanceID string, _ int, _ []byte, _ api.InvokeOptions) error {
 		killCalled = true
 		require.Equal(t, targetInstance, instanceID)
 		return nil
@@ -2641,7 +2731,7 @@ func invokeCreateV1ForNetworkPolicyTest(
 	t.Helper()
 	var capturedCreateReq *core.CreateRequest
 	createCalled := false
-	util.SetAPIClientLibruntime(&runtimeStub{
+	setAPIClientsForTest(t, &runtimeStub{
 		createInstanceRaw: func(
 			createReq *core.CreateRequest,
 			_ api.RawRequestOption,

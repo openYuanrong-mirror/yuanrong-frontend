@@ -31,8 +31,7 @@ import (
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
-	"frontend/pkg/frontend/common/util"
-	"frontend/pkg/frontend/instancemanager"
+	"frontend/pkg/frontend/proxyrouting"
 )
 
 type server struct {
@@ -42,10 +41,9 @@ type server struct {
 }
 
 const (
-	hostUserCreateOption   = "host_user"
-	backendHandshakeWait   = 10 * time.Second
-	proxyRoutePollInterval = 100 * time.Millisecond
-	channelCopyDirections  = 2
+	hostUserCreateOption  = "host_user"
+	backendHandshakeWait  = 10 * time.Second
+	channelCopyDirections = 2
 )
 
 type backendConnection struct {
@@ -217,39 +215,19 @@ func (s *server) dialBackend(instance *types.InstanceSpecification, tunnelAddres
 func (s *server) resolveInstance(target route) (*types.InstanceSpecification, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.config.routeWait)
 	defer cancel()
-	instance, err := instancemanager.WaitInstanceByID(ctx, target.InstanceID)
+	ownerRoute, err := proxyrouting.Wait(
+		ctx, target.InstanceID, proxyrouting.CapabilityTCPTunnel, proxyrouting.TransportTCPTunnel)
 	if err != nil {
-		return nil, "", fmt.Errorf("wait for instance %s route: %w", target.InstanceID, err)
+		return nil, "", err
 	}
+	instance := ownerRoute.Instance
 	if instance.InstanceStatus.Code != int32(constant.KernelInstanceStatusRunning) {
 		return nil, "", fmt.Errorf("instance %s is not running", target.InstanceID)
 	}
 	if strings.TrimSpace(instance.CreateOptions[hostUserCreateOption]) == "" {
 		return nil, "", fmt.Errorf("instance %s has no host_user create option", target.InstanceID)
 	}
-	if strings.TrimSpace(instance.FunctionProxyID) == "" {
-		return nil, "", fmt.Errorf("instance %s has no functionProxyID", target.InstanceID)
-	}
-	tunnelAddress, err := waitProxyTCPTunnelAddress(ctx, instance.FunctionProxyID)
-	if err != nil {
-		return nil, "", fmt.Errorf("resolve TCP tunnel for instance %s: %w", target.InstanceID, err)
-	}
-	return instance, tunnelAddress, nil
-}
-
-func waitProxyTCPTunnelAddress(ctx context.Context, functionProxyID string) (string, error) {
-	ticker := time.NewTicker(proxyRoutePollInterval)
-	defer ticker.Stop()
-	for {
-		if address, ok := util.LookupProxyTCPTunnelAddress(functionProxyID); ok {
-			return address, nil
-		}
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("proxy %s has no healthy tcp.tunnel endpoint: %w", functionProxyID, ctx.Err())
-		case <-ticker.C:
-		}
-	}
+	return instance, ownerRoute.Address, nil
 }
 
 type requestSender interface {
