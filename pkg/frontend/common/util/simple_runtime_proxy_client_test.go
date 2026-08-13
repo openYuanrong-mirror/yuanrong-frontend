@@ -450,7 +450,6 @@ func TestLookupProxyTCPTunnelAddressRejectsUnspecifiedHost(t *testing.T) {
 func requireFaaSInvokeRequest(t *testing.T, fakeService *fakeFrontendProxyServiceClient, payload, got []byte) {
 	t.Helper()
 	require.Equal(t, payload, got)
-	require.Same(t, &payload[0], &got[0])
 	require.NotNil(t, fakeService.req)
 	require.Equal(t, "frontend-1", fakeService.req.Context.FrontendClientID)
 	require.Equal(t, "tenant-1", fakeService.req.Context.TenantID)
@@ -474,16 +473,17 @@ func requireFaaSInvokeRequest(t *testing.T, fakeService *fakeFrontendProxyServic
 	require.Equal(t, "proxy-a", fakeService.req.Invoke.InvokeOptions.CustomTag["YR_ROUTE"])
 }
 
-func TestGRPCFrontendProxyInvokeClientBuildsRequestAndReturnsSmallObjectPayload(t *testing.T) {
-	payload := []byte("proxy-small-result")
+func TestGRPCFrontendProxyInvokeClientBuildsRequestAndReturnsMessagePayload(t *testing.T) {
+	payload := []byte("proxy-message-result")
 	fakeService := &fakeFrontendProxyServiceClient{
 		resp: &frontend_proxy.InvokeInstanceResponse{
 			Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
 			CallResult: &core.CallResult{
-				Code: common.ErrorCode_ERR_NONE,
+				Code:    common.ErrorCode_ERR_NONE,
+				Message: string(payload),
 				SmallObjects: []*common.SmallObject{{
 					Id:    "return-object-1",
-					Value: payload,
+					Value: append(make([]byte, 16), []byte("wrong-buffer-view")...),
 				}},
 			},
 		},
@@ -519,11 +519,8 @@ func TestGRPCFrontendProxyInvokeClientStreamsEventsAndReturnsFinalPayload(t *tes
 			{Payload: &frontend_proxy.InvokeInstanceStreamResponse_Final{Final: &frontend_proxy.InvokeInstanceResponse{
 				Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
 				CallResult: &core.CallResult{
-					Code: common.ErrorCode_ERR_NONE,
-					SmallObjects: []*common.SmallObject{{
-						Id:    "return-object-1",
-						Value: payload,
-					}},
+					Code:    common.ErrorCode_ERR_NONE,
+					Message: string(payload),
 				},
 			}}},
 		}},
@@ -549,9 +546,8 @@ func TestGRPCFrontendProxyInvokeClientCarriesSSEAcceptHeader(t *testing.T) {
 	fakeService := &fakeFrontendProxyServiceClient{
 		stream: &fakeInvokeInstanceStreamClient{frames: []*frontend_proxy.InvokeInstanceStreamResponse{
 			{Payload: &frontend_proxy.InvokeInstanceStreamResponse_Final{Final: &frontend_proxy.InvokeInstanceResponse{
-				Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
-				CallResult: &core.CallResult{Code: common.ErrorCode_ERR_NONE,
-					SmallObjects: []*common.SmallObject{{Value: payload}}},
+				Status:     &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+				CallResult: &core.CallResult{Code: common.ErrorCode_ERR_NONE, Message: string(payload)},
 			}}},
 		}},
 	}
@@ -577,14 +573,8 @@ func TestGRPCFrontendProxyInvokeClientStripsFaaSResultMetaPrefix(t *testing.T) {
 	payload := []byte(simpleRuntimeFaaSMetaPrefix + `{"body":"ok","innerCode":"0"}`)
 	fakeService := &fakeFrontendProxyServiceClient{
 		resp: &frontend_proxy.InvokeInstanceResponse{
-			Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
-			CallResult: &core.CallResult{
-				Code: common.ErrorCode_ERR_NONE,
-				SmallObjects: []*common.SmallObject{{
-					Id:    "return-object-1",
-					Value: payload,
-				}},
-			},
+			Status:     &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			CallResult: &core.CallResult{Code: common.ErrorCode_ERR_NONE, Message: string(payload)},
 		},
 	}
 	client := newGRPCFrontendProxyInvokeClient(fakeService, "frontend-1")
@@ -596,21 +586,14 @@ func TestGRPCFrontendProxyInvokeClientStripsFaaSResultMetaPrefix(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, []byte(`{"body":"ok","innerCode":"0"}`), got)
-	require.Same(t, &payload[len(simpleRuntimeFaaSMetaPrefix)], &got[0])
 }
 
 func TestGRPCFrontendProxyInvokeClientKeepsPosixResultMetaPrefix(t *testing.T) {
 	payload := []byte(simpleRuntimeFaaSMetaPrefix + `{"body":"ok","innerCode":"0"}`)
 	fakeService := &fakeFrontendProxyServiceClient{
 		resp: &frontend_proxy.InvokeInstanceResponse{
-			Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
-			CallResult: &core.CallResult{
-				Code: common.ErrorCode_ERR_NONE,
-				SmallObjects: []*common.SmallObject{{
-					Id:    "return-object-1",
-					Value: payload,
-				}},
-			},
+			Status:     &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			CallResult: &core.CallResult{Code: common.ErrorCode_ERR_NONE, Message: string(payload)},
 		},
 	}
 	client := newGRPCFrontendProxyInvokeClient(fakeService, "frontend-1")
@@ -622,7 +605,6 @@ func TestGRPCFrontendProxyInvokeClientKeepsPosixResultMetaPrefix(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
-	require.Same(t, &payload[0], &got[0])
 }
 
 func TestConvertSimpleRuntimeInvokeArgsPrefixesFaaSUserValuesOnly(t *testing.T) {
@@ -1592,14 +1574,8 @@ func TestRoutingFrontendProxyInvokeClientResolvesRouteAndInvokesService(t *testi
 	payload := []byte("route-payload")
 	fakeService := &fakeFrontendProxyServiceClient{
 		resp: &frontend_proxy.InvokeInstanceResponse{
-			Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
-			CallResult: &core.CallResult{
-				Code: common.ErrorCode_ERR_NONE,
-				SmallObjects: []*common.SmallObject{{
-					Id:    "return-object-1",
-					Value: payload,
-				}},
-			},
+			Status:     &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			CallResult: &core.CallResult{Code: common.ErrorCode_ERR_NONE, Message: string(payload)},
 		},
 	}
 	factory := &fakeFrontendProxyClientFactory{client: fakeService}

@@ -300,13 +300,12 @@ func decodeFrontendProxyInvokeResponse(
 	if callResult.GetCode() != common.ErrorCode_ERR_NONE {
 		return nil, frontendProxyBusinessError("invoke call result", callResult.GetCode(), callResult.GetMessage())
 	}
-	smallObjects := callResult.GetSmallObjects()
-	if len(smallObjects) != 1 {
-		return nil, newDirectProxyPostDispatchError("invoke decode", fmt.Errorf(
-			"frontend proxy invoke requires exactly one inline result, got %d; ObjectRef and multiple results are not supported",
-			len(smallObjects)))
-	}
-	return normalizeSimpleRuntimeInvokePayload(funcMeta, smallObjects[0].GetValue()), nil
+	// Direct frontend invokes do not set ReturnObjectIDs, so runtime uses its
+	// returnByMsg contract. SmallObjects, when present, are an implementation
+	// detail whose value may be either a complete DataObject buffer or a data
+	// view depending on the executor. CallResult.message is the stable data
+	// region exposed by the historical libruntime path.
+	return normalizeSimpleRuntimeInvokePayload(funcMeta, []byte(callResult.GetMessage())), nil
 }
 
 func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreateRequest) (string, error) {
