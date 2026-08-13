@@ -48,7 +48,7 @@ type DirectInvokeRequest struct {
 	InvokeTag                                            map[string]string
 	InvokeTimeout                                        int64
 	RetryTimes                                           int
-	ForceInvoke, IsInterrupted                           bool
+	ForceInvoke, IsInterrupted, BypassDataSystem         bool
 	AcceptHeader, SessionCtxID                           string
 	InstanceSession                                      *types.InstanceSessionConfig
 	Args                                                 [][]byte
@@ -92,7 +92,8 @@ func NewDirectInvokeRequest(req InvokeRequest) (DirectInvokeRequest, error) {
 		Function: req.Function, InstanceID: req.InstanceID, TraceID: req.TraceID, TraceParent: req.TraceParent,
 		TenantID: req.TenantID, InvokeTag: req.InvokeTag, InvokeTimeout: req.InvokeTimeout,
 		RetryTimes: req.RetryTimes, ForceInvoke: req.ForceInvoke, IsInterrupted: req.IsInterrupted,
-		AcceptHeader: req.AcceptHeader, SessionCtxID: req.SessionCtxID, InstanceSession: req.InstanceSession,
+		BypassDataSystem: req.BypassDataSystem,
+		AcceptHeader:     req.AcceptHeader, SessionCtxID: req.SessionCtxID, InstanceSession: req.InstanceSession,
 		Args: inlineArgs, ResponseWriter: req.ResponseWriter,
 	}, nil
 }
@@ -229,6 +230,7 @@ func (c *directProxyClient) Invoke(req DirectInvokeRequest) ([]byte, error) {
 	invokeOpts.CreateOpt = nil
 	invokeOpts.RetryTimes = req.RetryTimes
 	invokeOpts.ForceInvoke = req.ForceInvoke
+	invokeOpts.BypassDataSystem = req.BypassDataSystem
 	routeCtx, cancelRoute := simpleRuntimeInvokeContext(invokeOpts)
 	defer cancelRoute()
 	proxyReq := simpleRuntimeInvokeRequest{

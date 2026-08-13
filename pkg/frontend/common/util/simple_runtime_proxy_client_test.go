@@ -56,6 +56,7 @@ const (
 	testLargePayloadBytes      = 1 << 20
 	testCorrelationCount       = 2
 	testTypedKillSignal        = 15
+	testRouteResolutionTimeout = 20 * time.Millisecond
 )
 
 type fakeFrontendProxyServiceClient struct {
@@ -281,6 +282,12 @@ func consumeProtoVarintField(t *testing.T, payload []byte, target protowire.Numb
 }
 
 func addInstanceRouteForTest(t *testing.T, functionKey, instanceID, functionProxyID string) func() {
+	return addInstanceRouteForStatusTest(t, functionKey, instanceID, functionProxyID,
+		constant.KernelInstanceStatusRunning)
+}
+
+func addInstanceRouteForStatusTest(t *testing.T, functionKey, instanceID, functionProxyID string,
+	status constant.InstanceStatus) func() {
 	t.Helper()
 	function := functionKey
 	if len(strings.Split(functionKey, "/")) != testFunctionSegmentCount {
@@ -295,8 +302,7 @@ func addInstanceRouteForTest(t *testing.T, functionKey, instanceID, functionProx
 			constant.ResourceSpecNote: `{"cpu":100,"memory":100}`,
 		},
 		InstanceStatus: types.InstanceStatus{
-			Code: int32(constant.KernelInstanceStatusRunning),
-			Msg:  "running",
+			Code: int32(status),
 		},
 	}
 	value, err := json.Marshal(insSpec)
@@ -508,6 +514,23 @@ func TestGRPCFrontendProxyInvokeClientBuildsRequestAndReturnsMessagePayload(t *t
 
 	require.NoError(t, err)
 	requireFaaSInvokeRequest(t, fakeService, payload, got)
+}
+
+func TestConvertSimpleRuntimeInvokeOptionsUsesExistingRuntimeProtocol(t *testing.T) {
+	got := convertSimpleRuntimeInvokeOptions(api.InvokeOptions{
+		CustomExtensions: map[string]string{"tag-a": "value-a"},
+		InstanceSession:  &api.InstanceSessionConfig{SessionID: "session-a"},
+		IsInterrupted:    true,
+		ForceInvoke:      true,
+		BypassDataSystem: true,
+	})
+
+	require.Equal(t, "value-a", got.CustomTag["tag-a"])
+	require.Equal(t, "session-a", got.CustomTag["YR_AGENT_SESSION_ID"])
+	require.Equal(t, "true", got.CustomTag["IS_INTERRUPTED"])
+	require.Contains(t, got.CustomTag, "ENABLE_FORCE_INVOKE")
+	require.Empty(t, got.CustomTag["ENABLE_FORCE_INVOKE"])
+	require.True(t, got.BypassDatasystem)
 }
 
 func TestGRPCFrontendProxyInvokeClientStreamsEventsAndReturnsFinalPayload(t *testing.T) {
@@ -1647,6 +1670,37 @@ func TestDefaultFrontendProxyRouteResolverUsesInstanceCacheWhenRouteMissing(t *t
 	require.Equal(t, "10.0.0.12:22769", address)
 }
 
+func TestDefaultFrontendProxyRouteResolverOnlyRoutesEvictingInstanceForForceInvoke(t *testing.T) {
+	discovery := newMemoryFrontendProxyDiscovery()
+	discovery.ReplaceSnapshot([]frontendProxyEndpoint{{
+		NodeID: "proxy-evicting", Address: "10.0.0.13:22769",
+		Capabilities: map[string]bool{frontendProxyCapabilityInvoke: true},
+	}})
+	restoreDiscovery := setFrontendProxyDiscoveryForTest(discovery)
+	defer restoreDiscovery()
+	restoreInstance := addInstanceRouteForStatusTest(t, "func-key", "instance-evicting",
+		"proxy-evicting", constant.KernelInstanceStatusEvicting)
+	defer restoreInstance()
+
+	require.Nil(t, instancemanager.GetGlobalInstanceScheduler().
+		GetInstanceByID("func-key", "instance-evicting"))
+	require.NotNil(t, instancemanager.GetEvictingInstanceByID("instance-evicting"))
+
+	normalCtx, cancelNormal := context.WithTimeout(context.Background(), testRouteResolutionTimeout)
+	defer cancelNormal()
+	_, err := (defaultFrontendProxyRouteResolver{}).ResolveFrontendProxyAddress(simpleRuntimeInvokeRequest{
+		ctx: normalCtx, instanceID: "instance-evicting",
+	})
+	require.True(t, errors.Is(err, context.DeadlineExceeded))
+
+	address, err := (defaultFrontendProxyRouteResolver{}).ResolveFrontendProxyAddress(simpleRuntimeInvokeRequest{
+		ctx: context.Background(), instanceID: "instance-evicting",
+		options: api.InvokeOptions{ForceInvoke: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.13:22769", address)
+}
+
 func TestDefaultFrontendProxyRouteResolverPrefersInstanceCacheOverRequestRoute(t *testing.T) {
 	discovery := newMemoryFrontendProxyDiscovery()
 	discovery.ReplaceSnapshot([]frontendProxyEndpoint{
@@ -2463,6 +2517,34 @@ func TestGRPCFrontendProxyInvokeClientStatusErrorIncludesRetryHint(t *testing.T)
 	require.Equal(t, int(common.ErrorCode_ERR_INNER_SYSTEM_ERROR), metadata.Code)
 	require.True(t, metadata.Retryable)
 	require.Equal(t, "route-stale", metadata.RetryReason)
+}
+
+func TestGRPCFrontendProxyInvokeClientKeepsRuntimeFailureOutOfProxyStatus(t *testing.T) {
+	fakeService := &fakeFrontendProxyServiceClient{
+		resp: &frontend_proxy.InvokeInstanceResponse{
+			Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			CallResult: &core.CallResult{
+				Code:    common.ErrorCode_ERR_INSTANCE_EXITED,
+				Message: "runtime exited during invoke",
+			},
+		},
+	}
+	client := newGRPCFrontendProxyInvokeClient(fakeService, "frontend-1")
+
+	_, err := client.InvokeByInstanceID(simpleRuntimeInvokeRequest{
+		ctx:        context.Background(),
+		funcMeta:   api.FunctionMeta{FuncID: "func-key", Api: api.FaaSApi},
+		instanceID: "instance-1",
+	})
+
+	require.Error(t, err)
+	var businessErr *frontendProxyBusinessErr
+	require.True(t, errors.As(err, &businessErr))
+	require.Equal(t, common.ErrorCode_ERR_INSTANCE_EXITED, businessErr.code)
+	metadata, ok := GetDirectProxyErrorMetadata(err)
+	require.True(t, ok)
+	require.False(t, metadata.Retryable)
+	require.Empty(t, metadata.RetryReason)
 }
 
 func TestGRPCFrontendProxyInvokeClientMalformedResponseIsPostDispatchFailure(t *testing.T) {

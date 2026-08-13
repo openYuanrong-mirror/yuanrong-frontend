@@ -51,6 +51,11 @@ type routeOnlyInstance struct {
 
 var routeOnlyInstances sync.Map // key: instanceID, value: *routeOnlyInstance
 
+// evictingInstances only retains owner-routing metadata for instances that are
+// in graceful eviction. These instances must not return to the ordinary
+// scheduler, but ForceInvoke requests still need their owner route.
+var evictingInstances sync.Map // key: instanceID, value: *types.InstanceSpecification
+
 // RouteOnlyInstanceSnapshot is a payload-free, read-only view of the minimal
 // route hint maintained by the frontend-proxy path. It is intentionally not an
 // authentication or full instance-lifecycle record.
@@ -82,9 +87,21 @@ func GetGlobalInstanceScheduler() *FunctionInstancesMap {
 
 // WaitInstanceByID waits until the etcd-watcher-backed cache contains instanceID.
 func WaitInstanceByID(ctx context.Context, instanceID string) (*types.InstanceSpecification, error) {
+	return waitInstanceByID(ctx, instanceID, false)
+}
+
+// WaitInstanceByIDForForceInvoke also accepts an instance in graceful
+// eviction. It is intentionally separate from WaitInstanceByID so ordinary
+// calls cannot route to an evicting instance.
+func WaitInstanceByIDForForceInvoke(ctx context.Context, instanceID string) (*types.InstanceSpecification, error) {
+	return waitInstanceByID(ctx, instanceID, true)
+}
+
+func waitInstanceByID(ctx context.Context, instanceID string,
+	includeEvicting bool) (*types.InstanceSpecification, error) {
 	for {
 		instanceUpdates.Lock()
-		if instance := GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID); instance != nil {
+		if instance := getInstanceByID(instanceID, includeEvicting); instance != nil {
 			instanceUpdates.Unlock()
 			return instance, nil
 		}
@@ -98,6 +115,49 @@ func WaitInstanceByID(ctx context.Context, instanceID string) (*types.InstanceSp
 				continue
 			}
 		}
+	}
+}
+
+func getInstanceByID(instanceID string, includeEvicting bool) *types.InstanceSpecification {
+	if instance := GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID); instance != nil {
+		return instance
+	}
+	if includeEvicting {
+		return GetEvictingInstanceByID(instanceID)
+	}
+	return nil
+}
+
+// GetEvictingInstanceByID returns an owner-routing record for ForceInvoke.
+func GetEvictingInstanceByID(instanceID string) *types.InstanceSpecification {
+	value, ok := evictingInstances.Load(instanceID)
+	if !ok {
+		return nil
+	}
+	instance, _ := value.(*types.InstanceSpecification)
+	return instance
+}
+
+func recordEvictingInstance(instance *types.InstanceSpecification) {
+	if instance == nil || instance.InstanceID == "" {
+		return
+	}
+	route := &types.InstanceSpecification{
+		InstanceID:      instance.InstanceID,
+		Function:        instance.Function,
+		FunctionProxyID: instance.FunctionProxyID,
+		InstanceStatus:  instance.InstanceStatus,
+	}
+	evictingInstances.Store(instance.InstanceID, route)
+	notifyInstanceUpdate()
+}
+
+func removeEvictingInstance(instanceID string) {
+	if instanceID == "" {
+		return
+	}
+	if _, loaded := evictingInstances.LoadAndDelete(instanceID); loaded {
+		notifyInstanceUpdate()
 	}
 }
 

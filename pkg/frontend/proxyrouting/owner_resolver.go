@@ -49,13 +49,31 @@ func Resolve(instanceID string, capability Capability, transport Transport) (Own
 
 // Wait waits until the instance and a healthy owner route are both available.
 func Wait(ctx context.Context, instanceID string, capability Capability, transport Transport) (OwnerRoute, error) {
+	return wait(ctx, instanceID, capability, transport, false)
+}
+
+// WaitForInvoke additionally resolves an evicting instance when forceInvoke is
+// set. Other owner-routed operations continue to use Wait and Running instances.
+func WaitForInvoke(ctx context.Context, instanceID string, capability Capability, transport Transport,
+	forceInvoke bool) (OwnerRoute, error) {
+	return wait(ctx, instanceID, capability, transport, forceInvoke)
+}
+
+func wait(ctx context.Context, instanceID string, capability Capability, transport Transport,
+	includeEvicting bool) (OwnerRoute, error) {
 	if ctx == nil {
 		return OwnerRoute{}, fmt.Errorf("instance owner route requires non-nil context")
 	}
 	if strings.TrimSpace(instanceID) == "" {
 		return OwnerRoute{}, fmt.Errorf("instance owner route requires non-empty instance id")
 	}
-	instance, err := instancemanager.WaitInstanceByID(ctx, instanceID)
+	var instance *types.InstanceSpecification
+	var err error
+	if includeEvicting {
+		instance, err = instancemanager.WaitInstanceByIDForForceInvoke(ctx, instanceID)
+	} else {
+		instance, err = instancemanager.WaitInstanceByID(ctx, instanceID)
+	}
 	if err != nil {
 		return OwnerRoute{}, fmt.Errorf("wait for instance %s route: %w", instanceID, err)
 	}
@@ -71,8 +89,11 @@ func Wait(ctx context.Context, instanceID string, capability Capability, transpo
 			return OwnerRoute{}, fmt.Errorf("resolve owner proxy for instance %s capability %s: %w",
 				instanceID, capability, ctx.Err())
 		case <-ticker.C:
-			if current := instancemanager.GetGlobalInstanceScheduler().
-				GetInstanceByIDAcrossFunctions(instanceID); current != nil {
+			current := instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID)
+			if current == nil && includeEvicting {
+				current = instancemanager.GetEvictingInstanceByID(instanceID)
+			}
+			if current != nil {
 				instance = current
 			}
 		}

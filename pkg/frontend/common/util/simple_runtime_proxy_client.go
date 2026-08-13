@@ -888,8 +888,8 @@ func (c *routingFrontendProxyInvokeClient) DownloadFile(ctx context.Context, ins
 type defaultFrontendProxyRouteResolver struct{}
 
 func (defaultFrontendProxyRouteResolver) ResolveFrontendProxyAddress(req simpleRuntimeInvokeRequest) (string, error) {
-	route, err := resolveDirectProxyOwner(
-		req.ctx, req.instanceID, proxyrouting.CapabilityInvoke, proxyrouting.TransportGRPC)
+	route, err := proxyrouting.WaitForInvoke(req.ctx, req.instanceID,
+		proxyrouting.CapabilityInvoke, proxyrouting.TransportGRPC, req.options.ForceInvoke)
 	if err != nil {
 		return "", err
 	}
@@ -1581,14 +1581,29 @@ func appendProtoVarint(payload []byte, field protowire.Number, value uint64) []b
 }
 
 func convertSimpleRuntimeInvokeOptions(options api.InvokeOptions) *core.InvokeOptions {
-	customTag := make(map[string]string, len(options.CustomExtensions)+len(options.CreateOpt))
+	customTag := make(map[string]string, len(options.CustomExtensions)+len(options.CreateOpt)+3)
 	for key, value := range options.CustomExtensions {
 		customTag[key] = value
 	}
 	for key, value := range options.CreateOpt {
 		customTag[key] = value
 	}
-	return &core.InvokeOptions{CustomTag: customTag}
+	// Keep the wire representation used by libruntime. FunctionProxy and
+	// runtime already consume these reserved tags; direct frontend calls must
+	// encode the same options instead of introducing a second protocol.
+	if options.InstanceSession != nil && options.InstanceSession.SessionID != "" {
+		customTag["YR_AGENT_SESSION_ID"] = options.InstanceSession.SessionID
+	}
+	if options.IsInterrupted {
+		customTag["IS_INTERRUPTED"] = "true"
+	}
+	if options.ForceInvoke {
+		customTag["ENABLE_FORCE_INVOKE"] = ""
+	}
+	return &core.InvokeOptions{
+		CustomTag:        customTag,
+		BypassDatasystem: options.BypassDataSystem,
+	}
 }
 
 func convertSimpleRuntimeCreateOptions(options api.InvokeOptions) map[string]string {

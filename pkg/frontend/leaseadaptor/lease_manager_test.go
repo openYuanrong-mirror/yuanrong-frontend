@@ -536,10 +536,6 @@ func Test_ReleaseInstanceLease(t *testing.T) {
 			pool := newInstanceLeasePool("func1", op, &types.RingName{Name: constant.GreenRing})
 			pool.leaseMap["leaseId"] = &InstanceLease{}
 			freeCalled := 0
-			defer gomonkey.ApplyFunc((*FuncKeyLeasePools).loop,
-				func(_ *FuncKeyLeasePools) {
-					return
-				}).Reset()
 			defer gomonkey.ApplyFunc((*InstanceLease).free, func(_ *InstanceLease, abnormal bool, record bool) {
 				freeCalled++
 			}).Reset()
@@ -564,7 +560,10 @@ func Test_ReleaseInstanceLease(t *testing.T) {
 					LocalAuth:   &localauth.AuthConfig{},
 				}
 			}).Reset()
-			funcKeyLeasePools := GetInstanceManager().newFuncKeyLeasePools("funcKey")
+			funcKeyLeasePools := &FuncKeyLeasePools{
+				globalLeaseList:    make(map[string]*InstanceLease),
+				leaseIdToLeasePool: make(map[string]*LeasePool),
+			}
 
 			funcKeyLeasePools.releaseInstanceLease("leaseId", true)
 			convey.So(freeCalled, convey.ShouldEqual, 0)
