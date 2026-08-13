@@ -89,6 +89,7 @@ const (
 	agentCreateTimeoutSeconds    = 60
 	agentInitTimeoutSeconds      = 305
 	agentGracefulShutdownSeconds = 0
+	defaultRecoverRetryTimes     = 3
 	agentDirectoryQuotaMB        = 512
 	agentInstanceType            = "reserved"
 	agentDelegateDirectory       = "/tmp"
@@ -345,6 +346,7 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest, funcKey s
 			applyAgentCodePaths(&invokeOpts, spec)
 		}
 	}
+	invokeOpts.RecoverRetryTimes = defaultRecoverRetryTimes
 	applyAgentCreateOpts(&invokeOpts, ctx, req, inline, funcKey)
 	return invokeOpts, nil
 }
@@ -751,6 +753,9 @@ func applyAgentCreateOpts(invokeOpts *api.InvokeOptions, ctx *gin.Context, req C
 	invokeOpts.CreateOpt["DELEGATE_DIRECTORY_INFO"] = agentDelegateDirectory
 	invokeOpts.CreateOpt["DELEGATE_DIRECTORY_QUOTA"] = strconv.Itoa(agentDirectoryQuotaMB)
 	invokeOpts.CreateOpt["ConcurrentNum"] = agentConcurrency
+	if invokeOpts.RecoverRetryTimes > 0 {
+		invokeOpts.CreateOpt["RecoverRetryTimes"] = strconv.Itoa(invokeOpts.RecoverRetryTimes)
+	}
 	if resSpecJSON, err := buildAgentResourceSpecJSON(invokeOpts.Cpu, invokeOpts.Memory); err == nil {
 		invokeOpts.CreateOpt[constant.ResourceSpecNote] = resSpecJSON
 	} else {
