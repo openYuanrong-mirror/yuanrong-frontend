@@ -127,6 +127,7 @@ message CreateResponses {
 
 message InvokeOptions {
   map<string, string>  customTag = 1;
+  bool bypass_datasystem = 2;
 }
 
 message InvokeRequest {

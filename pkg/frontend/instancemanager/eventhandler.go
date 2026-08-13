@@ -64,6 +64,7 @@ func ProcessInstanceUpdate(event *etcd3.Event) {
 	instanceId := instance.GetInstanceIDFromEtcdKey(event.Key)
 	insSpec := instance.GetInsSpecFromEtcdValue(event.Key, event.Value)
 	RemoveRouteOnlyInstance(instanceId)
+	removeEvictingInstance(instanceId)
 	if len(instanceId) == 0 || insSpec == nil {
 		logger.Warnf("ignoring invalid etcd key, key: %s", event.Key)
 		return
@@ -98,6 +99,9 @@ func ProcessInstanceUpdate(event *etcd3.Event) {
 
 	if insSpec.InstanceStatus.Code != int32(constant.KernelInstanceStatusRunning) {
 		GetGlobalInstanceScheduler().delInstance(functionKey, insSpec, logger)
+		if insSpec.InstanceStatus.Code == int32(constant.KernelInstanceStatusEvicting) {
+			recordEvictingInstance(insSpec)
+		}
 	} else {
 		GetGlobalInstanceScheduler().addInstance(functionKey, insSpec, logger)
 	}
@@ -110,6 +114,7 @@ func ProcessInstanceDelete(event *etcd3.Event) {
 	instanceId := instance.GetInstanceIDFromEtcdKey(event.Key)
 	insSpec := instance.GetInsSpecFromEtcdValue(event.Key, event.PrevValue)
 	RemoveRouteOnlyInstance(instanceId)
+	removeEvictingInstance(instanceId)
 	if len(instanceId) == 0 || insSpec == nil {
 		logger.Warnf("ignoring invalid etcd key")
 		return

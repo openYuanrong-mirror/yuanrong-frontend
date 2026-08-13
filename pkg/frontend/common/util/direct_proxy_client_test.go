@@ -36,3 +36,18 @@ func TestDirectProxyClientRejectsObjectReferenceArguments(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "ObjectRef or nested refs")
 }
+
+func TestNewDirectInvokeRequestPreservesBypassDataSystem(t *testing.T) {
+	req, err := NewDirectInvokeRequest(InvokeRequest{
+		Function:         "tenant/function/$latest",
+		InstanceID:       "instance-a",
+		BypassDataSystem: true,
+		Args: []*api.Arg{{
+			Type: api.Value,
+			Data: []byte("value"),
+		}},
+	})
+
+	require.NoError(t, err)
+	require.True(t, req.BypassDataSystem)
+}

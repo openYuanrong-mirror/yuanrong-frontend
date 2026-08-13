@@ -55,6 +55,9 @@ message FrontendRequestContext {
 }
 
 message FrontendProxyStatus {
+  // status describes only frontend-to-proxy request handling. Once proxy has
+  // collected a valid runtime CallResult, code is ERR_NONE even when the
+  // function execution represented by CallResult.code failed.
   common.ErrorCode code = 1;
   string message        = 2;
   // retryable tells frontend whether it should re-acquire/retry instead of
@@ -71,15 +74,17 @@ message InvokeInstanceRequest {
 message InvokeInstanceResponse {
   FrontendProxyStatus status = 1;
   core_service.InvokeResponse invoke = 2;
-  // callResult carries the final small-object / runtime result that old stream
-  // paths delivered asynchronously. Frontend may adapt it to its local result
-  // store for compatibility with InvokeByInstanceId + GetAsync.
+  // callResult carries the final runtime result. Direct frontend invokes leave
+  // returnObjectIDs empty, so the inline return payload follows the historical
+  // return-by-message contract in CallResult.message; smallObjects is not the
+  // frontend inline-payload contract.
   core_service.CallResult callResult = 3;
 }
 
 // InvokeInstanceStreamResponse preserves the runtime event boundary. Event
 // frames are forwarded as opaque bytes in order and the stream terminates with
-// exactly one final response carrying the ordinary invoke/call-result status.
+// exactly one final response with the same proxy-status/runtime-result split as
+// InvokeInstanceResponse.
 message InvokeInstanceStreamResponse {
   oneof payload {
     bytes event = 1;
