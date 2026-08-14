@@ -1162,23 +1162,19 @@ func (e *frontendProxyBusinessErr) Error() string {
 	if e == nil {
 		return "frontend proxy failed with nil business error"
 	}
-	return fmt.Sprintf("frontend proxy %s failed, code: %v, message: %s",
-		e.operation, e.code, e.message)
+	// Business errors originate from Runtime or FunctionProxy and become the
+	// user-facing frontend response. Keep the historical libruntime contract by
+	// returning the upstream message unchanged; operation and code remain on the
+	// typed error for logging, classification, and retry decisions.
+	return e.message
 }
 
 func (e *frontendProxyStatusErr) Error() string {
 	if e == nil {
-		return "frontend proxy failed with nil status error"
+		return "request failed"
 	}
-	message := fmt.Sprintf("frontend proxy %s failed, code: %v, message: %s",
+	return fmt.Sprintf("%s failed, code: %v, message: %s",
 		e.operation, e.code, e.message)
-	if e.retryable {
-		message += ", retryable: true"
-	}
-	if e.retryReason != "" {
-		message += fmt.Sprintf(", retryReason: %s", e.retryReason)
-	}
-	return message
 }
 
 func (e *frontendProxyStatusErr) directProxyErrorMetadata() DirectProxyErrorMetadata {

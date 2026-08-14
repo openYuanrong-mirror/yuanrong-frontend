@@ -1123,7 +1123,7 @@ func TestGRPCFrontendProxyLifecycleClientReturnsCreateError(t *testing.T) {
 	})
 
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "authorize failed")
+	require.Equal(t, "authorize failed", err.Error())
 }
 
 func TestRoutingFrontendProxyLifecycleClientSelectsCreateCapabilityEndpoint(t *testing.T) {
@@ -1543,6 +1543,12 @@ func TestRoutingFrontendProxyInvokeClientEvictsAddressOnInvokeErrorWithoutRetry(
 	require.Equal(t, int(common.ErrorCode_ERR_INNER_SYSTEM_ERROR), metadata.Code)
 	require.False(t, metadata.Retryable)
 	require.Equal(t, directProxyPostDispatchReason, metadata.RetryReason)
+	require.Equal(t, "request failed: rpc error: code = Unavailable desc = transport unavailable",
+		err.Error())
+	require.NotContains(t, err.Error(), "frontend")
+	require.NotContains(t, err.Error(), "proxy")
+	require.NotContains(t, err.Error(), "retryable")
+	require.NotContains(t, err.Error(), "retryReason")
 	require.Equal(t, []string{"127.0.0.1:22769"}, factory.evicted)
 	require.Equal(t, 1, fakeService.calls)
 }
@@ -1579,6 +1585,11 @@ func TestRoutingFrontendProxyInvokeClientMarksEndpointSuspectOnClientFactoryErro
 	require.Equal(t, int(common.ErrorCode_ERR_INNER_COMMUNICATION), metadata.Code)
 	require.True(t, metadata.Retryable)
 	require.Equal(t, directProxyPreDispatchReason, metadata.RetryReason)
+	require.Equal(t, "request failed: rpc error: code = Unavailable desc = dial invoke proxy failed",
+		err.Error())
+	require.NotContains(t, err.Error(), "frontend")
+	require.NotContains(t, err.Error(), "retryable")
+	require.NotContains(t, err.Error(), "retryReason")
 	require.Equal(t, []string{"127.0.0.1:22769"}, factory.evicted)
 	require.True(t, discovery.IsSuspectAddress("127.0.0.1:22769"))
 }
@@ -2484,7 +2495,7 @@ func TestRawSimpleRuntimeContextPreservesUnboundedParent(t *testing.T) {
 	require.False(t, hasDeadline)
 }
 
-func TestGRPCFrontendProxyInvokeClientStatusErrorIncludesRetryHint(t *testing.T) {
+func TestGRPCFrontendProxyInvokeClientStatusErrorKeepsRetryHintInternal(t *testing.T) {
 	fakeService := &fakeFrontendProxyServiceClient{
 		resp: &frontend_proxy.InvokeInstanceResponse{
 			Status: &frontend_proxy.FrontendProxyStatus{
@@ -2510,13 +2521,38 @@ func TestGRPCFrontendProxyInvokeClientStatusErrorIncludesRetryHint(t *testing.T)
 	require.Equal(t, "proxy unavailable", statusErr.message)
 	require.True(t, statusErr.retryable)
 	require.Equal(t, "route-stale", statusErr.retryReason)
-	require.Contains(t, err.Error(), "retryable: true")
-	require.Contains(t, err.Error(), "retryReason: route-stale")
+	require.Equal(t, "invoke failed, code: ERR_INNER_SYSTEM_ERROR, message: proxy unavailable",
+		err.Error())
+	require.NotContains(t, err.Error(), "frontend")
+	require.NotContains(t, err.Error(), "retryable")
+	require.NotContains(t, err.Error(), "retryReason")
 	metadata, ok := GetDirectProxyErrorMetadata(err)
 	require.True(t, ok)
 	require.Equal(t, int(common.ErrorCode_ERR_INNER_SYSTEM_ERROR), metadata.Code)
 	require.True(t, metadata.Retryable)
 	require.Equal(t, "route-stale", metadata.RetryReason)
+}
+
+func TestDirectProxyTransportErrorReportsTimeoutClearly(t *testing.T) {
+	tests := []struct {
+		name  string
+		cause error
+	}{
+		{name: "context deadline", cause: context.DeadlineExceeded},
+		{name: "grpc deadline", cause: status.Error(codes.DeadlineExceeded, "context deadline exceeded")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := newDirectProxyPostDispatchError("invoke transport", tt.cause)
+
+			require.EqualError(t, err, "request timed out")
+			metadata, ok := GetDirectProxyErrorMetadata(err)
+			require.True(t, ok)
+			require.False(t, metadata.Retryable)
+			require.Equal(t, directProxyPostDispatchReason, metadata.RetryReason)
+		})
+	}
 }
 
 func TestGRPCFrontendProxyInvokeClientKeepsRuntimeFailureOutOfProxyStatus(t *testing.T) {
@@ -2541,10 +2577,25 @@ func TestGRPCFrontendProxyInvokeClientKeepsRuntimeFailureOutOfProxyStatus(t *tes
 	var businessErr *frontendProxyBusinessErr
 	require.True(t, errors.As(err, &businessErr))
 	require.Equal(t, common.ErrorCode_ERR_INSTANCE_EXITED, businessErr.code)
+	require.Equal(t, "runtime exited during invoke", err.Error())
 	metadata, ok := GetDirectProxyErrorMetadata(err)
 	require.True(t, ok)
 	require.False(t, metadata.Retryable)
 	require.Empty(t, metadata.RetryReason)
+}
+
+func TestFrontendProxyBusinessErrorPreservesUpstreamMessage(t *testing.T) {
+	for _, operation := range []string{"invoke call result", "create", "kill"} {
+		t.Run(operation, func(t *testing.T) {
+			err := frontendProxyBusinessError(operation, common.ErrorCode_ERR_INSTANCE_EXITED,
+				"upstream business failure")
+
+			require.Equal(t, "upstream business failure", err.Error())
+			metadata, ok := GetDirectProxyErrorMetadata(err)
+			require.True(t, ok)
+			require.Equal(t, int(common.ErrorCode_ERR_INSTANCE_EXITED), metadata.Code)
+		})
+	}
 }
 
 func TestGRPCFrontendProxyInvokeClientMalformedResponseIsPostDispatchFailure(t *testing.T) {
