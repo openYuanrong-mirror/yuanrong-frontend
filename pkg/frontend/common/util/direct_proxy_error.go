@@ -17,8 +17,13 @@
 package util
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"frontend/pkg/common/faas_common/grpc/pb/common"
 )
@@ -50,10 +55,20 @@ type directProxyTransportError struct {
 
 func (e *directProxyTransportError) Error() string {
 	if e == nil {
-		return "frontend proxy transport failed with nil error"
+		return "request failed"
 	}
-	return fmt.Sprintf("frontend proxy %s failed: %v, retryable: %t, retryReason: %s",
-		e.operation, e.cause, e.metadata.Retryable, e.metadata.RetryReason)
+	if isDirectProxyTimeout(e.cause) {
+		return "request timed out"
+	}
+	return fmt.Sprintf("request failed: %v", e.cause)
+}
+
+func isDirectProxyTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (e *directProxyTransportError) Unwrap() error {
