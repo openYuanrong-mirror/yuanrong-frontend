@@ -37,6 +37,7 @@ import (
 
 	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/common"
 	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
@@ -1297,14 +1298,85 @@ func uploadInstanceFile(ctx *gin.Context, instanceID, path string,
 	return transferClient.UploadFile(ctx.Request.Context(), instanceID, path, reader, tenantID)
 }
 
+// FileListHandler handles GET /api/agent/:instanceId/files/list.
+// It returns a JSON array of files and directories at the given path
+// inside the instance's filesystem.
+func FileListHandler(ctx *gin.Context) {
+	instanceID := ctx.Param("instanceId")
+	if instanceID == "" {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
+		return
+	}
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	targetPath := strings.TrimSpace(ctx.Query("path"))
+	if targetPath == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"message": "path query parameter is required",
+		})
+		return
+	}
+	recursive := ctx.Query("recursive") == "true"
+	maxDepth, err := strconv.Atoi(ctx.Query("max_depth"))
+	if err != nil || maxDepth < 0 {
+		maxDepth = 0
+	}
+	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
+		log.GetLogger().Warnf("file list instance not found %s: %v", instanceID, err)
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": fmt.Sprintf("instance %s not found", instanceID),
+		})
+		return
+	}
+	transferClient, err := fileTransferClient()
+	if err != nil {
+		log.GetLogger().Errorf("file list client unavailable instance %s: %v", instanceID, err)
+		ctx.JSON(http.StatusServiceUnavailable, gin.H{
+			"code":    http.StatusServiceUnavailable,
+			"message": err.Error(),
+		})
+		return
+	}
+	resp, err := transferClient.ListFile(ctx.Request.Context(), instanceID, targetPath, recursive, maxDepth, tenantID)
+	if err != nil {
+		writeFileTransferError(ctx, err)
+		return
+	}
+	if resp == nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"code":    http.StatusInternalServerError,
+			"message": "file list response is nil",
+		})
+		return
+	}
+	if resp.GetStatus().GetCode() != common.ErrorCode_ERR_NONE {
+		writeFileTransferError(ctx, fmt.Errorf("list failed: %s", resp.GetStatus().GetMessage()))
+		return
+	}
+	ctx.Header("Content-Type", "application/json")
+	ctx.String(http.StatusOK, resp.GetItemsJson())
+}
+
 // writeFileTransferError maps a file transfer error to the most appropriate
-// HTTP status. Business/instance-not-found errors map to 404, size overflow
-// to 413, invalid input to 400, everything else to 500.
+// HTTP status. Business/instance-not-found errors map to 404, path-not-found
+// errors map to 404, size overflow to 413, invalid input to 400, everything
+// else to 500.
 func writeFileTransferError(ctx *gin.Context, err error) {
 	if err == nil {
 		return
 	}
 	if isFileNotFoundError(err) {
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": err.Error(),
+		})
+		return
+	}
+	if strings.Contains(err.Error(), "path not found") || strings.Contains(err.Error(), "No such file or directory") {
 		ctx.JSON(http.StatusNotFound, gin.H{
 			"code":    http.StatusNotFound,
 			"message": err.Error(),

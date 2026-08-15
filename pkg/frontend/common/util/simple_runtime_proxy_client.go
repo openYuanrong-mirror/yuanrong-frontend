@@ -74,7 +74,7 @@ const (
 	simpleRuntimeFaaSMetaPrefix                         = "0000000000000000"
 	defaultFrontendProxyTimeout                         = 60 * time.Second
 	frontendProxyKeepaliveTimeout                       = 10 * time.Second
-	frontendProxyFileTransferChunkSize                  = 4 * 1024 * 1024
+	frontendProxyFileTransferChunkSize                  = 2 * 1024 * 1024
 	frontendProxyKillMaxAttempts                        = 2
 	runtimeRequestIDLength                              = 18
 	createReadyCallResultFieldNumber   protowire.Number = 4
@@ -613,6 +613,34 @@ func (c *grpcFrontendProxyInvokeClient) DownloadFile(ctx context.Context, instan
 	})
 }
 
+// ListFile sends a unary ListFile RPC to the owning frontend proxy of
+// instanceID and returns the file list response.
+func (c *grpcFrontendProxyInvokeClient) ListFile(ctx context.Context, instanceID string, path string,
+	recursive bool, maxDepth int, tenantID string,
+) (*frontend_proxy.FileListResponse, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("frontend proxy grpc client is nil")
+	}
+	if instanceID == "" {
+		return nil, fmt.Errorf("frontend proxy list file requires non-empty instance id")
+	}
+	if path == "" {
+		return nil, fmt.Errorf("frontend proxy list file requires non-empty path")
+	}
+	requestID := newFrontendProxyRuntimeRequestID()
+	return c.client.ListFile(ctx, &frontend_proxy.FileListRequest{
+		Context: &frontend_proxy.FrontendRequestContext{
+			FrontendClientID: c.frontendClientID,
+			TenantID:         tenantID,
+			RequestID:        requestID,
+		},
+		InstanceID: instanceID,
+		Path:       path,
+		Recursive:  recursive,
+		MaxDepth:   int32(maxDepth),
+	})
+}
+
 type frontendProxyRouteResolver interface {
 	ResolveFrontendProxyAddress(req simpleRuntimeInvokeRequest) (string, error)
 }
@@ -883,6 +911,34 @@ func (c *routingFrontendProxyInvokeClient) DownloadFile(ctx context.Context, ins
 		return nil, err
 	}
 	return stream, nil
+}
+
+// ListFile resolves the owning proxy for instanceID, acquires a pooled gRPC
+// client, and sends a ListFile unary RPC.
+func (c *routingFrontendProxyInvokeClient) ListFile(ctx context.Context, instanceID string, path string,
+	recursive bool, maxDepth int, tenantID string,
+) (*frontend_proxy.FileListResponse, error) {
+	if c == nil || c.clientFactory == nil {
+		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
+	}
+	route, err := resolveDirectProxyOwner(
+		ctx, instanceID, proxyrouting.CapabilityFileTransfer, proxyrouting.TransportGRPC)
+	if err != nil {
+		return nil, err
+	}
+	address := route.Address
+	serviceClient, err := c.clientFactory.ClientForAddress(address)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, err
+	}
+	resp, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
+		ListFile(ctx, instanceID, path, recursive, maxDepth, tenantID)
+	if err != nil {
+		evictFrontendProxyClientOnError(c.clientFactory, address, err)
+		return nil, err
+	}
+	return resp, nil
 }
 
 type defaultFrontendProxyRouteResolver struct{}

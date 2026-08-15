@@ -206,6 +206,12 @@ func (f *fakeFrontendProxyServiceClient) DownloadFile(_ context.Context,
 	return nil, f.err
 }
 
+func (f *fakeFrontendProxyServiceClient) ListFile(_ context.Context,
+	_ *frontend_proxy.FileListRequest, _ ...grpc.CallOption,
+) (*frontend_proxy.FileListResponse, error) {
+	return nil, f.err
+}
+
 func createResponseWithUnknownReadyCallResult(
 	t *testing.T,
 	callResult *core.CallResult,

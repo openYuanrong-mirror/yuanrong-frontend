@@ -104,6 +104,12 @@ func (r *directRuntimeStub) DownloadFile(ctx context.Context, instanceID, path s
 	return r.runtime.DownloadFile(ctx, instanceID, path, offset, tenantID)
 }
 
+func (r *directRuntimeStub) ListFile(ctx context.Context, instanceID, path string,
+	recursive bool, maxDepth int, tenantID string,
+) (*frontend_proxy.FileListResponse, error) {
+	return r.runtime.ListFile(ctx, instanceID, path, recursive, maxDepth, tenantID)
+}
+
 func (r *runtimeStub) Invoke(util.InvokeRequest) ([]byte, error) {
 	return nil, nil
 }
@@ -156,6 +162,12 @@ func (r *runtimeStub) UploadFile(
 func (r *runtimeStub) DownloadFile(
 	context.Context, string, string, int64, string,
 ) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
+	return nil, nil
+}
+
+func (r *runtimeStub) ListFile(
+	context.Context, string, string, bool, int, string,
+) (*frontend_proxy.FileListResponse, error) {
 	return nil, nil
 }
 

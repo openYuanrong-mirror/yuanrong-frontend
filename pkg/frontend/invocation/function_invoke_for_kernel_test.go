@@ -260,6 +260,12 @@ func (f *fakeDirectProxyClient) DownloadFile(
 	return nil, nil
 }
 
+func (f *fakeDirectProxyClient) ListFile(
+	context.Context, string, string, bool, int, string,
+) (*frontend_proxy.FileListResponse, error) {
+	return nil, nil
+}
+
 func (f *fakeClient) AcquireInstance(functionKey string, req types.AcquireOption) (*types.InstanceAllocationInfo, error) {
 	// TODO implement me
 	panic("implement me")

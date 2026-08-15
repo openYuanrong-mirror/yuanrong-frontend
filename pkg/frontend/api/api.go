@@ -223,6 +223,7 @@ func InitRoute(r *gin.Engine) {
 		// agent instance file transfer (upload/download to the owning proxy)
 		agentGroup.POST("/:instanceId/files/upload", agent.FileUploadHandler)
 		agentGroup.GET("/:instanceId/files/download", agent.FileDownloadHandler)
+		agentGroup.GET("/:instanceId/files/list", agent.FileListHandler)
 	}
 
 	// web terminal
