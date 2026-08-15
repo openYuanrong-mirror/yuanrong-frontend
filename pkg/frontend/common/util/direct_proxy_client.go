@@ -333,3 +333,17 @@ func (c *directProxyClient) DownloadFile(
 	}
 	return c.invokeClient.DownloadFile(ctx, instanceID, path, offset, tenantID)
 }
+
+func (c *directProxyClient) ListFile(
+	ctx context.Context,
+	instanceID string,
+	path string,
+	recursive bool,
+	maxDepth int,
+	tenantID string,
+) (*frontend_proxy.FileListResponse, error) {
+	if c == nil || c.invokeClient == nil {
+		return nil, fmt.Errorf("direct proxy file transfer client is not initialized")
+	}
+	return c.invokeClient.ListFile(ctx, instanceID, path, recursive, maxDepth, tenantID)
+}

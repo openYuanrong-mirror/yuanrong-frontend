@@ -361,4 +361,8 @@ type FileTransferClient interface {
 	// io.EOF and must close the stream when finished.
 	DownloadFile(ctx context.Context, instanceID string, path string,
 		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
+	// ListFile lists files and directories at path inside the instance's
+	// filesystem. The returned items_json is a JSON array string.
+	ListFile(ctx context.Context, instanceID string, path string,
+		recursive bool, maxDepth int, tenantID string) (*frontend_proxy.FileListResponse, error)
 }

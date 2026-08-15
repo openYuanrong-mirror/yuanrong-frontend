@@ -116,6 +116,12 @@ func (*directProxyInvokeStub) DownloadFile(
 	return nil, nil
 }
 
+func (*directProxyInvokeStub) ListFile(
+	context.Context, string, string, bool, int, string,
+) (*frontend_proxy.FileListResponse, error) {
+	return nil, nil
+}
+
 func (f *fakeClient) AcquireInstance(functionKey string, req commontype.AcquireOption) (*commontype.InstanceAllocationInfo, error) {
 	// TODO implement me
 	panic("implement me")
