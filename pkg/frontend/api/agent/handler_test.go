@@ -456,6 +456,8 @@ func TestCreateHandlerSetsDetachedAndReservedCreateOptions(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(capturedInvokeOpt.CreateOpt[constant.ResourceSpecNote]), &resSpec))
 	require.EqualValues(t, defaultAgentCPU, resSpec.CPU)
 	require.EqualValues(t, defaultAgentMemory, resSpec.Memory)
+	// recover_retry_times 未传 → frontend 填默认 defaultRecoverRetryTimes=3 启用重拉。
+	require.Equal(t, "3", capturedInvokeOpt.CreateOpt["RecoverRetryTimes"])
 }
 
 func TestCreateHandlerRegisteredSinksFuncMetaResources(t *testing.T) {
