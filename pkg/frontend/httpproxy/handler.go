@@ -14,20 +14,12 @@
  * limitations under the License.
  */
 
-// Package httpproxy is the HTTP peer of sshproxy (SSH) and wsproxy (WebSocket):
-// a transparent L4 byte pipe from an external HTTP client to an in-sandbox
-// HTTP server. Like wsproxy it reuses the function_proxy tcp.tunnel (an L4 byte
-// pipe, Protocol="tcp") via the shared wsproxy.DialSandboxTunnel pipeline
-// (authenticate -> resolve -> authorize -> dial), then Hijacks the client HTTP
-// connection into a raw net.Conn, writes the inbound HTTP request verbatim to
-// the tunnel, and io.Copy bytes both ways. The frontend never parses the HTTP
-// request or response — the in-sandbox server produces the response (status
-// line, headers, body, including chunked/SSE streaming), relayed back verbatim.
-//
-// This is NOT an HTTP<->WS gateway: the frontend is protocol-transparent, the
-// same byte-pipe shape as wsproxy, only carrying HTTP bytes instead of WS
-// bytes. Whatever HTTP server listens in-sandbox on ?port is the caller's
-// concern (AgentServer HTTP listener, sidecar, etc.) — out of scope here.
+// Package httpproxy is the HTTP peer of wsproxy (WebSocket) and sshproxy (SSH):
+// it forwards external HTTP requests to an in-sandbox HTTP server via the shared
+// function_proxy tcp.tunnel (L4 byte pipe). The frontend never parses the HTTP
+// layer beyond a single rewriteRequest of the request line — the in-sandbox
+// server produces the response, relayed back verbatim through a bidirectional
+// io.Copy after Hijack.
 package httpproxy
 
 import (
@@ -37,6 +29,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"frontend/pkg/common/faas_common/logger/log"
@@ -45,32 +39,41 @@ import (
 
 const pipeDirections = 2
 
+// httpRoutePrefix is the frontend entry route that prefixes every passthrough
+// request; rewriteRequest strips it to restore the in-sandbox request path.
+var httpRoutePrefix = "/serverless/v1/http"
+
+// routeQueryKeys lists the query keys consumed by the routing pipeline
+// (instance/port/tenant_id/token). rewriteRequest strips them from the
+// forwarded request so only business query keys reach the in-sandbox server.
+var routeQueryKeys = map[string]struct{}{
+	"instance":  {},
+	"port":      {},
+	"tenant_id": {},
+	"token":     {},
+}
+
 // HandleHTTP is the httpproxy entry point registered on
-// /serverless/v1/http?instance=<id>&port=<n>&token=<jwt>.
-//
-// It performs pure L4 passthrough: authenticate + resolve + dial the
-// function_proxy tcp.tunnel (via wsproxy.DialSandboxTunnel, identical to the
-// WS path), Hijack the client HTTP connection into a raw net.Conn, write the
-// inbound HTTP request bytes to the tunnel, then io.Copy bytes both ways. The
-// frontend never terminates the HTTP layer or parses frames — the in-sandbox
-// HTTP server produces the response, relayed back verbatim. Same shape as
-// wsproxy.HandleWebSocket's post-dial body, only carrying HTTP bytes.
-//
-// All failure paths (auth, route resolution, tunnel dial) happen BEFORE Hijack
-// so a clean HTTP 4xx/502 can be returned — once Hijack takes the connection
-// there is no HTTP layer left to write an error response to.
+// /serverless/v1/http and /serverless/v1/http/*splat. It rewrites the request
+// line (strip the route prefix and routing query keys, drop Authorization,
+// set X-Forwarded-Proto), dials the function_proxy tcp.tunnel via
+// wsproxy.DialSandboxTunnel, Hijacks the client connection, writes the
+// rewritten request to the tunnel, then pipes bytes both ways. All failure
+// paths (bad path, auth, route resolution, dial) return before Hijack so a
+// clean 4xx/502 can be written; once Hijack takes the connection there is no
+// HTTP layer left to report errors on.
 func HandleHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Acquire the authenticated tunnel conn to the in-sandbox HTTP server.
-	//    All 4xx/502 failure handling lives inside DialSandboxTunnel.
+	pr, ok := rewriteRequest(w, r)
+	if !ok {
+		return
+	}
+
 	tunnelConn, ok := wsproxy.DialSandboxTunnel(w, r)
 	if !ok {
-		return // DialSandboxTunnel already wrote the error response.
+		return
 	}
 	defer closeWithLog(tunnelConn, "httpproxy tunnel")
 
-	// 2. Hijack the client HTTP connection into a raw net.Conn. After this
-	//    succeeds there is no HTTP layer — we can no longer return error codes,
-	//    so every prior failure path returned above.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "http hijack unsupported", http.StatusInternalServerError)
@@ -84,29 +87,47 @@ func HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer closeWithLog(clientConn, "httpproxy client")
 
-	// 3. gin has already read the entire HTTP request off the client conn before
-	//    routing here, so the hijacked clientBuf holds no complete request.
-	//    Rewrite it to the tunnel or the in-sandbox server never answers.
-	if werr := r.Write(tunnelConn); werr != nil {
+	if werr := pr.Write(tunnelConn); werr != nil {
 		log.GetLogger().Warnf("httpproxy write request to tunnel failed: %v", werr)
 		return
 	}
 	flushPrefetch(clientBuf, tunnelConn)
 
-	// 4. Bidirectional byte copy: two goroutines, the first to finish closes
-	//    the peer. No HTTP frame parsing — the client and in-sandbox server
-	//    reassemble HTTP from the byte stream themselves (TCP is a stream).
-	//    Streaming responses (chunked/SSE) flow back through the tunnel->client
-	//    copy without any buffering or framing by the frontend. Same shape as
-	//    wsproxy.pipe.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	pipe(ctx, cancel, clientConn, tunnelConn)
 }
 
-// flushPrefetch flushes bytes the HTTP reader prefetched past the request
-// (e.g. an early request body) into the tunnel, so nothing the client sent is
-// lost. Mirrors wsproxy.flushPrefetch.
+func rewriteRequest(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
+	pr := r.Clone(r.Context())
+	rest := strings.TrimPrefix(r.URL.Path, httpRoutePrefix)
+	if rest == "" {
+		rest = "/"
+	}
+	pr.URL.Path = rest
+	pr.URL.RawPath = ""
+	pr.Host = r.Host
+	pr.Header.Del("Authorization")
+
+	bizQ := url.Values{}
+	for k, vs := range r.URL.Query() {
+		if _, isRoute := routeQueryKeys[k]; isRoute {
+			continue
+		}
+		bizQ[k] = vs
+	}
+	pr.URL.RawQuery = bizQ.Encode()
+
+	if pr.Header.Get("X-Forwarded-Proto") == "" {
+		if r.TLS != nil {
+			pr.Header.Set("X-Forwarded-Proto", "https")
+		} else {
+			pr.Header.Set("X-Forwarded-Proto", "http")
+		}
+	}
+	return pr, true
+}
+
 func flushPrefetch(clientBuf *bufio.ReadWriter, tunnelConn net.Conn) {
 	if clientBuf == nil {
 		return
@@ -125,9 +146,6 @@ func flushPrefetch(clientBuf *bufio.ReadWriter, tunnelConn net.Conn) {
 	}
 }
 
-// pipe runs two io.Copy goroutines (client->tunnel and tunnel->client) until
-// one side ends, then closes both. It is the entire data-plane body of the
-// handler after Hijack. Mirrors wsproxy.pipe.
 func pipe(ctx context.Context, cancel context.CancelFunc, client, tunnel net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(pipeDirections)
@@ -156,7 +174,6 @@ func pipe(ctx context.Context, cancel context.CancelFunc, client, tunnel net.Con
 	<-ctx.Done()
 }
 
-// closeWithLog closes a connection and logs only non-trivial errors.
 func closeWithLog(c io.Closer, name string) {
 	if err := c.Close(); err != nil && !isClosedNetErr(err) {
 		log.GetLogger().Warnf("close %s failed: %s", name, err)
@@ -168,10 +185,6 @@ func isClosedNetErr(err error) bool {
 		(err != nil && err.Error() == "use of closed network connection")
 }
 
-// writeAll writes all of b to w, retrying on short writes. net.Conn.Write does
-// not guarantee a single call writes the whole buffer; without this loop a
-// short write would drop part of the HTTP request bytes and the in-sandbox
-// server would never see a complete request.
 func writeAll(w io.Writer, b []byte) error {
 	for len(b) > 0 {
 		n, err := w.Write(b)
