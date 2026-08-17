@@ -126,6 +126,10 @@ message FileChunk {
   int64 offset = 4;
   bytes data = 5;
   bool isLast = 6;
+  // permissions is an optional octal permission string (e.g. "600", "755")
+  // carried in the first chunk. When non-empty, the runtime applies
+  // os.chmod(path, int(permissions, 8)) after the file is fully written.
+  string permissions = 7;
 }
 
 // FileTransferRequest is the request message for a download (server-streaming).

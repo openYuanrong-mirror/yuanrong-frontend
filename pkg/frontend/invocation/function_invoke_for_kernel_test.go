@@ -249,7 +249,7 @@ func (f *fakeDirectProxyClient) KillInstance(util.DirectKillRequest) error {
 }
 
 func (f *fakeDirectProxyClient) UploadFile(
-	context.Context, string, string, io.Reader, string,
+	context.Context, string, string, io.Reader, string, string,
 ) (*frontend_proxy.FileTransferResponse, error) {
 	return nil, nil
 }

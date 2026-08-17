@@ -1182,6 +1182,7 @@ func FileUploadHandler(ctx *gin.Context) {
 	}
 
 	var targetPath string
+	var fileMode string
 	pathSeen := false
 	for {
 		part, err := reader.NextPart()
@@ -1205,6 +1206,20 @@ func FileUploadHandler(ctx *gin.Context) {
 				return
 			}
 			targetPath = strings.TrimSpace(string(buf))
+		case "mode":
+			// Optional octal permission string (e.g. "600", "755"). When
+			// present, the runtime applies os.chmod after the upload
+			// completes.
+			buf, err := io.ReadAll(part)
+			if err != nil {
+				log.GetLogger().Warnf("file upload mode read failed instance %s: %v", instanceID, err)
+				ctx.JSON(http.StatusBadRequest, gin.H{
+					"code":    http.StatusBadRequest,
+					"message": fmt.Sprintf("read mode failed: %v", err),
+				})
+				return
+			}
+			fileMode = strings.TrimSpace(string(buf))
 		case "file":
 			// The "path" field must precede the "file" field so the upload
 			// target is known before streaming begins.
@@ -1218,7 +1233,7 @@ func FileUploadHandler(ctx *gin.Context) {
 			// Wrap the part so cumulative size is checked against the cap while
 			// bytes are streamed straight to the owning proxy.
 			countingReader := &countingReader{reader: part}
-			resp, uploadErr := uploadInstanceFile(ctx, instanceID, targetPath, countingReader, tenantID)
+			resp, uploadErr := uploadInstanceFile(ctx, instanceID, targetPath, countingReader, tenantID, fileMode)
 			if uploadErr != nil {
 				log.GetLogger().Errorf("file upload failed instance %s path %s: %v",
 					instanceID, targetPath, uploadErr)
@@ -1291,7 +1306,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // upload. It centralizes the client resolution so the handler stays focused
 // on HTTP concerns.
 func uploadInstanceFile(ctx *gin.Context, instanceID, path string,
-	reader io.Reader, tenantID string,
+	reader io.Reader, tenantID string, fileMode string,
 ) (*frontend_proxy.FileTransferResponse, error) {
 	if path == "" {
 		return nil, fmt.Errorf("path is required")
@@ -1300,7 +1315,7 @@ func uploadInstanceFile(ctx *gin.Context, instanceID, path string,
 	if err != nil {
 		return nil, err
 	}
-	return transferClient.UploadFile(ctx.Request.Context(), instanceID, path, reader, tenantID)
+	return transferClient.UploadFile(ctx.Request.Context(), instanceID, path, reader, tenantID, fileMode)
 }
 
 // FileListHandler handles GET /api/agent/:instanceId/files/list.
