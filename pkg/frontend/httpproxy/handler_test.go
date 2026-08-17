@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/licenses-2.0
+ * http://www.apache.org/licenses/2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -62,8 +63,6 @@ func (s *shortWriteConn) SetDeadline(time.Time) error      { return nil }
 func (s *shortWriteConn) SetReadDeadline(time.Time) error  { return nil }
 func (s *shortWriteConn) SetWriteDeadline(time.Time) error { return nil }
 
-// TestWriteAllRetriesOnShortWrite ensures the whole buffer is delivered even
-// when the underlying writer accepts only a few bytes per call.
 func TestWriteAllRetriesOnShortWrite(t *testing.T) {
 	const total = 4096
 	payload := bytes.Repeat([]byte("x"), total)
@@ -79,8 +78,6 @@ func TestWriteAllRetriesOnShortWrite(t *testing.T) {
 	}
 }
 
-// TestWriteAllPropagatesWriteError verifies the loop surfaces a real write
-// error instead of looping forever or returning a false success.
 func TestWriteAllPropagatesWriteError(t *testing.T) {
 	w := &errWriter{maxPerWrite: shortWriteCap, failOnCall: failOnThirdWrite}
 	if err := writeAll(w, bytes.Repeat([]byte("y"), errorPayloadLen)); err == nil {
@@ -106,9 +103,6 @@ func (w *errWriter) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-// TestFlushPrefetchForwardsBufferedBytes proves prefetched bytes past the
-// request line (e.g. an early body) are not lost when the connection is handed
-// to the byte pipe.
 func TestFlushPrefetchForwardsBufferedBytes(t *testing.T) {
 	prefetched := []byte("body-started-early")
 	reader := bufio.NewReader(strings.NewReader(string(prefetched) + "trailing"))
@@ -129,7 +123,6 @@ func TestFlushPrefetchForwardsBufferedBytes(t *testing.T) {
 	}
 }
 
-// bytesConn is a minimal net.Conn backed by a bytes.Buffer for write capture.
 type bytesConn struct {
 	w *bytes.Buffer
 }
@@ -143,10 +136,8 @@ func (c *bytesConn) SetDeadline(time.Time) error      { return nil }
 func (c *bytesConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *bytesConn) SetWriteDeadline(time.Time) error { return nil }
 
-// TestPipeBidirectionalPassthrough proves pipe() relays HTTP bytes both ways
-// verbatim (request client->tunnel, response tunnel->client).
 func TestPipeBidirectionalPassthrough(t *testing.T) {
-	requestBytes := []byte("POST /serverless/v1/http?instance=i&port=18092 HTTP/1.1\r\n" +
+	requestBytes := []byte("POST /serverless/v1/http/users?instance=i&port=18092 HTTP/1.1\r\n" +
 		"Host: x\r\nContent-Length: 5\r\n\r\nhello")
 	responseBytes := []byte("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nok-body")
 
@@ -188,9 +179,6 @@ func TestPipeBidirectionalPassthrough(t *testing.T) {
 	}
 }
 
-// sandboxEchoServer reads the full expected request from the tunnel far end,
-// asserts it arrived verbatim, then writes the canned response. Reports the
-// first failure (or nil) to errCh.
 func sandboxEchoServer(tunnelEnd io.ReadWriter, wantReq, resp []byte, errCh chan<- error) {
 	got := make([]byte, len(wantReq))
 	if _, err := io.ReadFull(tunnelEnd, got); err != nil {
@@ -208,8 +196,6 @@ func sandboxEchoServer(tunnelEnd io.ReadWriter, wantReq, resp []byte, errCh chan
 	errCh <- nil
 }
 
-// TestPipeClosesBothOnHalfClose verifies the first side ending closes the peer
-// (no goroutine leak, no hang) — the once.Do closeBoth contract in pipe.
 func TestPipeClosesBothOnHalfClose(t *testing.T) {
 	clientEnd, tunnelEnd := net.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -230,61 +216,86 @@ func TestPipeClosesBothOnHalfClose(t *testing.T) {
 	case <-time.After(pipeTimeout):
 		t.Fatal("pipe did not terminate after one side closed")
 	}
-	// tunnelEnd was closed by pipe's closeBoth — a read must error.
 	buf := make([]byte, readProbeSize)
 	if _, err := tunnelEnd.Read(buf); err == nil {
 		t.Fatal("expected tunnel read to error after client close, got nil")
 	}
 }
 
-// TestHandleHTTPPostDialPassthrough drives the post-dial body of HandleHTTP:
-// the inbound request is written to the tunnel via r.Write and the response
-// flows back through pipe. The pre-dial half (DialSandboxTunnel) is shared
-// with wsproxy and covered by its tests.
-func TestHandleHTTPPostDialPassthrough(t *testing.T) {
+func TestRewriteRequestRestoresPath(t *testing.T) {
+	rawURL := "/serverless/v1/http/api/v1/users?instance=i&port=18092&tenant_id=default&bar=baz"
+	req := mustNewRequest(t, "GET", rawURL)
+	req.Host = "caller.example"
+
+	pr, ok := rewriteRequest(httptest.NewRecorder(), req)
+	if !ok {
+		t.Fatal("rewriteRequest returned ok=false for a valid path")
+	}
+	if pr.URL.Path != "/api/v1/users" {
+		t.Fatalf("path: got %q want %q", pr.URL.Path, "/api/v1/users")
+	}
+	if got := pr.URL.RawQuery; got != "bar=baz" {
+		t.Fatalf("business query: got %q want %q (route keys must be stripped)", got, "bar=baz")
+	}
+	if pr.Host != "caller.example" {
+		t.Fatalf("Host: got %q want %q", pr.Host, "caller.example")
+	}
 	tunnelEnd, sandboxEnd := net.Pipe()
 	defer tunnelEnd.Close()
-	defer sandboxEnd.Close()
-
-	requestBytes := []byte("GET /serverless/v1/http?instance=i&port=18092 HTTP/1.1\r\nHost: x\r\n\r\n")
-	responseFull := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-
-	serverErr := make(chan error, 1)
-	go func() {
-		defer sandboxEnd.Close()
-		req, err := http.ReadRequest(bufio.NewReader(sandboxEnd))
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		if req.Method != "GET" || req.URL.Path != "/serverless/v1/http" {
-			serverErr <- errString("sandbox did not receive correct request line")
-			return
-		}
-		if _, err := sandboxEnd.Write(responseFull); err != nil {
-			serverErr <- err
-			return
-		}
-		serverErr <- nil
-	}()
-
-	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(requestBytes)))
+	go func() { defer sandboxEnd.Close(); pr.Write(tunnelEnd) }()
+	got, err := http.ReadRequest(bufio.NewReader(sandboxEnd))
 	if err != nil {
-		t.Fatalf("parse request: %v", err)
+		t.Fatalf("read forwarded request: %v", err)
 	}
-	if err := req.Write(tunnelEnd); err != nil {
-		t.Fatalf("r.Write to tunnel: %v", err)
+	if got.URL.Path != "/api/v1/users" || got.URL.RawQuery != "bar=baz" {
+		t.Fatalf("forwarded request line: path=%q query=%q, want /api/v1/users bar=baz",
+			got.URL.Path, got.URL.RawQuery)
 	}
-	got := make([]byte, len(responseFull))
-	if _, err := io.ReadFull(tunnelEnd, got); err != nil {
-		t.Fatalf("read response: %v", err)
+}
+
+func TestRewriteRequestBareRouteRestoresRoot(t *testing.T) {
+	req := mustNewRequest(t, "GET", "/serverless/v1/http?instance=i&port=18092")
+	pr, ok := rewriteRequest(httptest.NewRecorder(), req)
+	if !ok {
+		t.Fatal("rewriteRequest returned ok=false for a bare route")
 	}
-	if !bytes.Equal(got, responseFull) {
-		t.Fatalf("response not verbatim: got %q want %q", got, responseFull)
+	if pr.URL.Path != "/" {
+		t.Fatalf(`path: got %q want "/" (bare route must map to root)`, pr.URL.Path)
 	}
-	if err := <-serverErr; err != nil {
-		t.Fatalf("sandbox side: %v", err)
+
+	tunnelEnd, sandboxEnd := net.Pipe()
+	defer tunnelEnd.Close()
+	go func() { defer sandboxEnd.Close(); pr.Write(tunnelEnd) }()
+	got, err := http.ReadRequest(bufio.NewReader(sandboxEnd))
+	if err != nil {
+		t.Fatalf("read forwarded request: %v", err)
 	}
+	if got.URL.Path != "/" {
+		t.Fatalf(`forwarded request line: path=%q, want "/"`, got.URL.Path)
+	}
+}
+
+func TestRewriteRequestStripsAuthorization(t *testing.T) {
+	req := mustNewRequest(t, "GET",
+		"/serverless/v1/http/users?instance=i&port=18092")
+	req.Header.Set("Authorization", "Basic dTpw")
+
+	pr, ok := rewriteRequest(httptest.NewRecorder(), req)
+	if !ok {
+		t.Fatal("rewriteRequest returned ok=false")
+	}
+	if got := pr.Header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization must be stripped, got %q", got)
+	}
+}
+
+func mustNewRequest(t *testing.T, method, urlStr string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, urlStr, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s, %q): %v", method, urlStr, err)
+	}
+	return req
 }
 
 type errString string

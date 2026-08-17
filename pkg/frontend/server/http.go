@@ -71,6 +71,7 @@ func CreateHTTPServer() *http.Server {
 	}
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
+	engine.RedirectTrailingSlash = false
 	engine.Use(gin.Recovery())
 	api.InitRoute(engine)
 	server = &http.Server{
