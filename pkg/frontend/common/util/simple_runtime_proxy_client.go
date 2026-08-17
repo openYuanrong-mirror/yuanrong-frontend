@@ -524,8 +524,10 @@ func validateDirectProxyCoreArgs(args []*common.Arg) error {
 // UploadFile streams the contents of reader to the owning frontend proxy of
 // instanceID using the client-streaming UploadFile RPC. The reader is chunked
 // at frontendProxyFileTransferChunkSize bytes; the final chunk carries isLast.
+// permissions is an optional octal string (e.g. "600") sent in the first chunk;
+// when non-empty the runtime applies os.chmod after the file is fully written.
 func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instanceID string, path string,
-	reader io.Reader, tenantID string,
+	reader io.Reader, tenantID string, permissions string,
 ) (*frontend_proxy.FileTransferResponse, error) {
 	if c.client == nil {
 		return nil, fmt.Errorf("frontend proxy grpc client is nil")
@@ -543,11 +545,12 @@ func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instance
 	requestID := newFrontendProxyRuntimeRequestID()
 	chunkBuffer := make([]byte, frontendProxyFileTransferChunkSize)
 	var offset int64
+	sent := false
 	for {
 		n, readErr := reader.Read(chunkBuffer)
 		if n > 0 {
 			offset += int64(n)
-			if err := stream.Send(&frontend_proxy.FileChunk{
+			chunk := &frontend_proxy.FileChunk{
 				Context: &frontend_proxy.FrontendRequestContext{
 					FrontendClientID: c.frontendClientID,
 					TenantID:         tenantID,
@@ -558,11 +561,39 @@ func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instance
 				Offset:     offset - int64(n),
 				Data:       chunkBuffer[:n],
 				IsLast:     errors.Is(readErr, io.EOF),
-			}); err != nil {
+			}
+			if !sent && permissions != "" {
+				chunk.Permissions = permissions
+			}
+			if err := stream.Send(chunk); err != nil {
 				return nil, err
 			}
+			sent = true
 		}
 		if errors.Is(readErr, io.EOF) {
+			// Zero-byte file: reader.Read returns (0, io.EOF) on the first
+			// call, so no chunk was ever sent. Send a single empty chunk to
+			// carry permissions and signal completion to the runtime.
+			if !sent {
+				chunk := &frontend_proxy.FileChunk{
+					Context: &frontend_proxy.FrontendRequestContext{
+						FrontendClientID: c.frontendClientID,
+						TenantID:         tenantID,
+						RequestID:        requestID,
+					},
+					InstanceID: instanceID,
+					Path:       path,
+					Offset:     0,
+					Data:       nil,
+					IsLast:     true,
+				}
+				if permissions != "" {
+					chunk.Permissions = permissions
+				}
+				if err := stream.Send(chunk); err != nil {
+					return nil, err
+				}
+			}
 			break
 		}
 		if readErr != nil {
@@ -859,7 +890,7 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRunti
 // UploadFile resolves the owning proxy for instanceID, acquires a pooled gRPC
 // client, and streams reader to the proxy via the client-streaming UploadFile RPC.
 func (c *routingFrontendProxyInvokeClient) UploadFile(ctx context.Context, instanceID string, path string,
-	reader io.Reader, tenantID string,
+	reader io.Reader, tenantID string, permissions string,
 ) (*frontend_proxy.FileTransferResponse, error) {
 	if c == nil || c.clientFactory == nil {
 		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
@@ -876,7 +907,7 @@ func (c *routingFrontendProxyInvokeClient) UploadFile(ctx context.Context, insta
 		return nil, err
 	}
 	resp, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
-		UploadFile(ctx, instanceID, path, reader, tenantID)
+		UploadFile(ctx, instanceID, path, reader, tenantID, permissions)
 	if err != nil {
 		evictFrontendProxyClientOnError(c.clientFactory, address, err)
 		return nil, err

@@ -93,9 +93,9 @@ func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
 }
 
 func (r *directRuntimeStub) UploadFile(ctx context.Context, instanceID, path string, reader io.Reader,
-	tenantID string,
+	tenantID string, permissions string,
 ) (*frontend_proxy.FileTransferResponse, error) {
-	return r.runtime.UploadFile(ctx, instanceID, path, reader, tenantID)
+	return r.runtime.UploadFile(ctx, instanceID, path, reader, tenantID, permissions)
 }
 
 func (r *directRuntimeStub) DownloadFile(ctx context.Context, instanceID, path string, offset int64,
@@ -154,7 +154,7 @@ func (r *runtimeStub) Kill(instanceID string, signal int, payload []byte, invoke
 }
 
 func (r *runtimeStub) UploadFile(
-	context.Context, string, string, io.Reader, string,
+	context.Context, string, string, io.Reader, string, string,
 ) (*frontend_proxy.FileTransferResponse, error) {
 	return nil, nil
 }

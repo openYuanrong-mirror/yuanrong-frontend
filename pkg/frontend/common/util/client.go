@@ -355,7 +355,7 @@ type FileTransferClient interface {
 	// UploadFile streams reader to the owning proxy of instanceID. The proxy
 	// writes the bytes to path inside the instance's filesystem sandbox.
 	UploadFile(ctx context.Context, instanceID string, path string,
-		reader io.Reader, tenantID string) (*frontend_proxy.FileTransferResponse, error)
+		reader io.Reader, tenantID string, permissions string) (*frontend_proxy.FileTransferResponse, error)
 	// DownloadFile opens a server-streaming download for path at offset.
 	// The returned stream yields FileChunk messages; the caller reads until
 	// io.EOF and must close the stream when finished.

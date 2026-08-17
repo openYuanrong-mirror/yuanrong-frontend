@@ -314,11 +314,12 @@ func (c *directProxyClient) UploadFile(
 	path string,
 	reader io.Reader,
 	tenantID string,
+	permissions string,
 ) (*frontend_proxy.FileTransferResponse, error) {
 	if c == nil || c.invokeClient == nil {
 		return nil, fmt.Errorf("direct proxy file transfer client is not initialized")
 	}
-	return c.invokeClient.UploadFile(ctx, instanceID, path, reader, tenantID)
+	return c.invokeClient.UploadFile(ctx, instanceID, path, reader, tenantID, permissions)
 }
 
 func (c *directProxyClient) DownloadFile(

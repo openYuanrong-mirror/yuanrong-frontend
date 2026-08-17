@@ -105,7 +105,7 @@ func (*directProxyInvokeStub) InvokeRaw(util.DirectRawRequest) ([]byte, error) {
 func (*directProxyInvokeStub) KillInstance(util.DirectKillRequest) error { return nil }
 
 func (*directProxyInvokeStub) UploadFile(
-	context.Context, string, string, io.Reader, string,
+	context.Context, string, string, io.Reader, string, string,
 ) (*frontend_proxy.FileTransferResponse, error) {
 	return nil, nil
 }

@@ -67,7 +67,7 @@ type frontendProxyInvokeClient interface {
 	InvokeByInstanceIDStream(simpleRuntimeInvokeRequest, types.ResponseWriter) ([]byte, error)
 	InvokeByInstanceIDRaw(simpleRuntimeRawInvokeRequest) ([]byte, error)
 	UploadFile(ctx context.Context, instanceID string, path string,
-		reader io.Reader, tenantID string) (*frontend_proxy.FileTransferResponse, error)
+		reader io.Reader, tenantID string, permissions string) (*frontend_proxy.FileTransferResponse, error)
 	DownloadFile(ctx context.Context, instanceID string, path string,
 		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
 	ListFile(ctx context.Context, instanceID string, path string,
