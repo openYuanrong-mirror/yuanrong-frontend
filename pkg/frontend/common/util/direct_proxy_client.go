@@ -19,12 +19,10 @@ package util
 import (
 	"context"
 	"fmt"
-	"io"
 	"sync"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/proxyrouting"
 )
@@ -34,11 +32,13 @@ import (
 // Client or invokerLibruntime and therefore cannot fall back to libruntime.
 type DirectProxyClient interface {
 	Invoke(req DirectInvokeRequest) ([]byte, error)
+	// CreateInstance creates a FaaS instance from the typed Frontend request.
+	// Actor direct creation has a different wire contract and must use a dedicated
+	// request constructor and adapter instead of this method.
 	CreateInstance(req DirectCreateRequest) (string, error)
 	CreateRaw(req DirectRawRequest) ([]byte, error)
 	InvokeRaw(req DirectRawRequest) ([]byte, error)
 	KillInstance(req DirectKillRequest) error
-	FileTransferClient
 }
 
 // DirectInvokeRequest is the inline-data DTO exposed by DirectProxyClient. It
@@ -98,7 +98,9 @@ func NewDirectInvokeRequest(req InvokeRequest) (DirectInvokeRequest, error) {
 	}, nil
 }
 
-// NewDirectCreateRequest validates arguments for a direct create request.
+// NewDirectCreateRequest builds a typed direct-create request for a FaaS instance.
+// Actor direct creation must use a separate constructor because its create wire
+// contract must not inherit the FaaS argument encoding performed by this path.
 func NewDirectCreateRequest(
 	funcMeta api.FunctionMeta, args []api.Arg, options api.InvokeOptions,
 ) (DirectCreateRequest, error) {
@@ -249,6 +251,8 @@ func (c *directProxyClient) Invoke(req DirectInvokeRequest) ([]byte, error) {
 	return c.invokeClient.InvokeByInstanceID(proxyReq)
 }
 
+// CreateInstance sends the typed FaaS create contract to FunctionProxy. Actor
+// direct creation is intentionally out of scope for this adapter.
 func (c *directProxyClient) CreateInstance(req DirectCreateRequest) (string, error) {
 	if c == nil || c.lifecycleClient == nil {
 		return "", fmt.Errorf("direct proxy lifecycle client is not initialized")
@@ -306,45 +310,4 @@ func (c *directProxyClient) KillInstance(req DirectKillRequest) error {
 		ctx: req.Context, instanceID: req.InstanceID, tenantID: req.TenantID,
 		signal: req.Signal, payload: req.Payload, options: options,
 	})
-}
-
-func (c *directProxyClient) UploadFile(
-	ctx context.Context,
-	instanceID string,
-	path string,
-	reader io.Reader,
-	tenantID string,
-	permissions string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	if c == nil || c.invokeClient == nil {
-		return nil, fmt.Errorf("direct proxy file transfer client is not initialized")
-	}
-	return c.invokeClient.UploadFile(ctx, instanceID, path, reader, tenantID, permissions)
-}
-
-func (c *directProxyClient) DownloadFile(
-	ctx context.Context,
-	instanceID string,
-	path string,
-	offset int64,
-	tenantID string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	if c == nil || c.invokeClient == nil {
-		return nil, fmt.Errorf("direct proxy file transfer client is not initialized")
-	}
-	return c.invokeClient.DownloadFile(ctx, instanceID, path, offset, tenantID)
-}
-
-func (c *directProxyClient) ListFile(
-	ctx context.Context,
-	instanceID string,
-	path string,
-	recursive bool,
-	maxDepth int,
-	tenantID string,
-) (*frontend_proxy.FileListResponse, error) {
-	if c == nil || c.invokeClient == nil {
-		return nil, fmt.Errorf("direct proxy file transfer client is not initialized")
-	}
-	return c.invokeClient.ListFile(ctx, instanceID, path, recursive, maxDepth, tenantID)
 }

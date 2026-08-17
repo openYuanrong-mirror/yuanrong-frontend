@@ -18,11 +18,9 @@ package util
 
 import (
 	"context"
-	"io"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/types"
 )
 
@@ -66,12 +64,6 @@ type frontendProxyInvokeClient interface {
 	InvokeByInstanceID(simpleRuntimeInvokeRequest) ([]byte, error)
 	InvokeByInstanceIDStream(simpleRuntimeInvokeRequest, types.ResponseWriter) ([]byte, error)
 	InvokeByInstanceIDRaw(simpleRuntimeRawInvokeRequest) ([]byte, error)
-	UploadFile(ctx context.Context, instanceID string, path string,
-		reader io.Reader, tenantID string, permissions string) (*frontend_proxy.FileTransferResponse, error)
-	DownloadFile(ctx context.Context, instanceID string, path string,
-		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
-	ListFile(ctx context.Context, instanceID string, path string,
-		recursive bool, maxDepth int, tenantID string) (*frontend_proxy.FileListResponse, error)
 }
 
 type frontendProxyLifecycleClient interface {

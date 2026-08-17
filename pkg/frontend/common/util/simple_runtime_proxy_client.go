@@ -67,34 +67,35 @@ var (
 )
 
 const (
-	frontendProxyRouteKey                               = "YR_ROUTE"
-	frontendProxyCreateSourceKey                        = "source"
-	frontendProxyCreateSource                           = "frontend"
-	frontendProxyControlNotWired                        = "control-path-not-wired"
-	simpleRuntimeFaaSMetaPrefix                         = "0000000000000000"
-	defaultFrontendProxyTimeout                         = 60 * time.Second
-	frontendProxyKeepaliveTimeout                       = 10 * time.Second
-	frontendProxyFileTransferChunkSize                  = 2 * 1024 * 1024
-	frontendProxyKillMaxAttempts                        = 2
-	runtimeRequestIDLength                              = 18
-	createReadyCallResultFieldNumber   protowire.Number = 4
-	runtimeNotifyRequestIDField        protowire.Number = 1
-	runtimeNotifyCodeField             protowire.Number = 2
-	runtimeNotifyMessageField          protowire.Number = 3
-	runtimeNotifySmallObjectField      protowire.Number = 4
-	runtimeNotifyStackTraceField       protowire.Number = 5
-	runtimeNotifyRuntimeInfoField      protowire.Number = 7
-	runtimeNotifyInstanceIDField       protowire.Number = 8
-	functionMetaAppNameField           protowire.Number = 1
-	functionMetaModuleNameField        protowire.Number = 2
-	functionMetaFunctionNameField      protowire.Number = 3
-	functionMetaClassNameField         protowire.Number = 4
-	functionMetaLanguageField          protowire.Number = 5
-	functionMetaSignatureField         protowire.Number = 7
-	functionMetaAPIField               protowire.Number = 8
-	functionMetaNameField              protowire.Number = 9
-	functionMetaNamespaceField         protowire.Number = 10
-	functionMetaIDField                protowire.Number = 11
+	frontendProxyRouteKey                             = "YR_ROUTE"
+	frontendProxyCreateSourceKey                      = "source"
+	frontendProxyCreateSource                         = "frontend"
+	frontendProxyControlNotWired                      = "control-path-not-wired"
+	simpleRuntimeFaaSMetaPrefix                       = "0000000000000000"
+	defaultFrontendProxyTimeout                       = 60 * time.Second
+	frontendProxyKeepaliveTimeout                     = 10 * time.Second
+	frontendProxyKillMaxAttempts                      = 2
+	runtimeRequestIDLength                            = 18
+	createReadyCallResultFieldNumber protowire.Number = 4
+	runtimeNotifyRequestIDField      protowire.Number = 1
+	runtimeNotifyCodeField           protowire.Number = 2
+	runtimeNotifyMessageField        protowire.Number = 3
+	runtimeNotifySmallObjectField    protowire.Number = 4
+	runtimeNotifyStackTraceField     protowire.Number = 5
+	runtimeNotifyRuntimeInfoField    protowire.Number = 7
+	runtimeNotifyInstanceIDField     protowire.Number = 8
+	functionMetaAppNameField         protowire.Number = 1
+	functionMetaModuleNameField      protowire.Number = 2
+	functionMetaFunctionNameField    protowire.Number = 3
+	functionMetaClassNameField       protowire.Number = 4
+	functionMetaLanguageField        protowire.Number = 5
+	functionMetaSignatureField       protowire.Number = 7
+	functionMetaAPIField             protowire.Number = 8
+	functionMetaNameField            protowire.Number = 9
+	functionMetaNamespaceField       protowire.Number = 10
+	functionMetaIDField              protowire.Number = 11
+	metaDataConfigField              protowire.Number = 3
+	metaConfigCodePathsField         protowire.Number = 2
 )
 
 type grpcFrontendProxyInvokeClient struct {
@@ -324,7 +325,7 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreat
 		},
 		Create: &core.CreateRequest{
 			Function:      req.funcMeta.FuncID,
-			Args:          convertSimpleRuntimeCreateArgs(req.funcMeta, req.args),
+			Args:          convertSimpleRuntimeCreateArgs(req.funcMeta, req.args, req.options.CodePaths),
 			RequestID:     requestID,
 			TraceID:       req.options.TraceID,
 			CreateOptions: convertSimpleRuntimeCreateOptions(req.options),
@@ -519,157 +520,6 @@ func validateDirectProxyCoreArgs(args []*common.Arg) error {
 		}
 	}
 	return nil
-}
-
-// UploadFile streams the contents of reader to the owning frontend proxy of
-// instanceID using the client-streaming UploadFile RPC. The reader is chunked
-// at frontendProxyFileTransferChunkSize bytes; the final chunk carries isLast.
-// permissions is an optional octal string (e.g. "600") sent in the first chunk;
-// when non-empty the runtime applies os.chmod after the file is fully written.
-func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instanceID string, path string,
-	reader io.Reader, tenantID string, permissions string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	if c.client == nil {
-		return nil, fmt.Errorf("frontend proxy grpc client is nil")
-	}
-	if instanceID == "" {
-		return nil, fmt.Errorf("frontend proxy upload file requires non-empty instance id")
-	}
-	if path == "" {
-		return nil, fmt.Errorf("frontend proxy upload file requires non-empty path")
-	}
-	stream, err := c.client.UploadFile(ctx)
-	if err != nil {
-		return nil, err
-	}
-	requestID := newFrontendProxyRuntimeRequestID()
-	chunkBuffer := make([]byte, frontendProxyFileTransferChunkSize)
-	var offset int64
-	sent := false
-	for {
-		n, readErr := reader.Read(chunkBuffer)
-		if n > 0 {
-			offset += int64(n)
-			chunk := &frontend_proxy.FileChunk{
-				Context: &frontend_proxy.FrontendRequestContext{
-					FrontendClientID: c.frontendClientID,
-					TenantID:         tenantID,
-					RequestID:        requestID,
-				},
-				InstanceID: instanceID,
-				Path:       path,
-				Offset:     offset - int64(n),
-				Data:       chunkBuffer[:n],
-				IsLast:     errors.Is(readErr, io.EOF),
-			}
-			if !sent && permissions != "" {
-				chunk.Permissions = permissions
-			}
-			if err := stream.Send(chunk); err != nil {
-				return nil, err
-			}
-			sent = true
-		}
-		if errors.Is(readErr, io.EOF) {
-			// Zero-byte file: reader.Read returns (0, io.EOF) on the first
-			// call, so no chunk was ever sent. Send a single empty chunk to
-			// carry permissions and signal completion to the runtime.
-			if !sent {
-				chunk := &frontend_proxy.FileChunk{
-					Context: &frontend_proxy.FrontendRequestContext{
-						FrontendClientID: c.frontendClientID,
-						TenantID:         tenantID,
-						RequestID:        requestID,
-					},
-					InstanceID: instanceID,
-					Path:       path,
-					Offset:     0,
-					Data:       nil,
-					IsLast:     true,
-				}
-				if permissions != "" {
-					chunk.Permissions = permissions
-				}
-				if err := stream.Send(chunk); err != nil {
-					return nil, err
-				}
-			}
-			break
-		}
-		if readErr != nil {
-			readErr = fmt.Errorf("frontend proxy upload file read failed: %w", readErr)
-			_, _ = stream.CloseAndRecv()
-			return nil, readErr
-		}
-	}
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return nil, err
-	}
-	if resp == nil {
-		return nil, fmt.Errorf("frontend proxy upload file response is nil")
-	}
-	if err := checkFrontendProxyStatus("upload", resp.GetStatus()); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-// DownloadFile opens a server-streaming DownloadFile RPC against the owning
-// frontend proxy of instanceID and returns the stream receiver for the caller
-// to iterate. The caller is responsible for reading chunks until io.EOF.
-func (c *grpcFrontendProxyInvokeClient) DownloadFile(ctx context.Context, instanceID string, path string,
-	offset int64, tenantID string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	if c.client == nil {
-		return nil, fmt.Errorf("frontend proxy grpc client is nil")
-	}
-	if instanceID == "" {
-		return nil, fmt.Errorf("frontend proxy download file requires non-empty instance id")
-	}
-	if path == "" {
-		return nil, fmt.Errorf("frontend proxy download file requires non-empty path")
-	}
-	requestID := newFrontendProxyRuntimeRequestID()
-	return c.client.DownloadFile(ctx, &frontend_proxy.FileTransferRequest{
-		Context: &frontend_proxy.FrontendRequestContext{
-			FrontendClientID: c.frontendClientID,
-			TenantID:         tenantID,
-			RequestID:        requestID,
-		},
-		InstanceID: instanceID,
-		Path:       path,
-		Offset:     offset,
-		ChunkSize:  frontendProxyFileTransferChunkSize,
-	})
-}
-
-// ListFile sends a unary ListFile RPC to the owning frontend proxy of
-// instanceID and returns the file list response.
-func (c *grpcFrontendProxyInvokeClient) ListFile(ctx context.Context, instanceID string, path string,
-	recursive bool, maxDepth int, tenantID string,
-) (*frontend_proxy.FileListResponse, error) {
-	if c.client == nil {
-		return nil, fmt.Errorf("frontend proxy grpc client is nil")
-	}
-	if instanceID == "" {
-		return nil, fmt.Errorf("frontend proxy list file requires non-empty instance id")
-	}
-	if path == "" {
-		return nil, fmt.Errorf("frontend proxy list file requires non-empty path")
-	}
-	requestID := newFrontendProxyRuntimeRequestID()
-	return c.client.ListFile(ctx, &frontend_proxy.FileListRequest{
-		Context: &frontend_proxy.FrontendRequestContext{
-			FrontendClientID: c.frontendClientID,
-			TenantID:         tenantID,
-			RequestID:        requestID,
-		},
-		InstanceID: instanceID,
-		Path:       path,
-		Recursive:  recursive,
-		MaxDepth:   int32(maxDepth),
-	})
 }
 
 type frontendProxyRouteResolver interface {
@@ -888,90 +738,6 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRunti
 }
 
 // UploadFile resolves the owning proxy for instanceID, acquires a pooled gRPC
-// client, and streams reader to the proxy via the client-streaming UploadFile RPC.
-func (c *routingFrontendProxyInvokeClient) UploadFile(ctx context.Context, instanceID string, path string,
-	reader io.Reader, tenantID string, permissions string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	if c == nil || c.clientFactory == nil {
-		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
-	}
-	route, err := resolveDirectProxyOwner(
-		ctx, instanceID, proxyrouting.CapabilityFileTransfer, proxyrouting.TransportGRPC)
-	if err != nil {
-		return nil, err
-	}
-	address := route.Address
-	serviceClient, err := c.clientFactory.ClientForAddress(address)
-	if err != nil {
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return nil, err
-	}
-	resp, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
-		UploadFile(ctx, instanceID, path, reader, tenantID, permissions)
-	if err != nil {
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return nil, err
-	}
-	return resp, nil
-}
-
-// DownloadFile resolves the owning proxy for instanceID, acquires a pooled gRPC
-// client, and opens the server-streaming DownloadFile RPC. The caller reads
-// chunks from the returned stream until io.EOF.
-func (c *routingFrontendProxyInvokeClient) DownloadFile(ctx context.Context, instanceID string, path string,
-	offset int64, tenantID string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	if c == nil || c.clientFactory == nil {
-		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
-	}
-	route, err := resolveDirectProxyOwner(
-		ctx, instanceID, proxyrouting.CapabilityFileTransfer, proxyrouting.TransportGRPC)
-	if err != nil {
-		return nil, err
-	}
-	address := route.Address
-	serviceClient, err := c.clientFactory.ClientForAddress(address)
-	if err != nil {
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return nil, err
-	}
-	stream, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
-		DownloadFile(ctx, instanceID, path, offset, tenantID)
-	if err != nil {
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return nil, err
-	}
-	return stream, nil
-}
-
-// ListFile resolves the owning proxy for instanceID, acquires a pooled gRPC
-// client, and sends a ListFile unary RPC.
-func (c *routingFrontendProxyInvokeClient) ListFile(ctx context.Context, instanceID string, path string,
-	recursive bool, maxDepth int, tenantID string,
-) (*frontend_proxy.FileListResponse, error) {
-	if c == nil || c.clientFactory == nil {
-		return nil, fmt.Errorf("frontend proxy routing client is not initialized")
-	}
-	route, err := resolveDirectProxyOwner(
-		ctx, instanceID, proxyrouting.CapabilityFileTransfer, proxyrouting.TransportGRPC)
-	if err != nil {
-		return nil, err
-	}
-	address := route.Address
-	serviceClient, err := c.clientFactory.ClientForAddress(address)
-	if err != nil {
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return nil, err
-	}
-	resp, err := newGRPCFrontendProxyInvokeClient(serviceClient, c.frontendClientID).
-		ListFile(ctx, instanceID, path, recursive, maxDepth, tenantID)
-	if err != nil {
-		evictFrontendProxyClientOnError(c.clientFactory, address, err)
-		return nil, err
-	}
-	return resp, nil
-}
-
 type defaultFrontendProxyRouteResolver struct{}
 
 func (defaultFrontendProxyRouteResolver) ResolveFrontendProxyAddress(req simpleRuntimeInvokeRequest) (string, error) {
@@ -1296,30 +1062,6 @@ func frontendProxyBusinessError(operation string, code common.ErrorCode, message
 	}
 }
 
-// IsFileTransferNotFoundError reports whether err was returned by a file
-// transfer RPC and indicates the instance/path does not exist on the owning
-// proxy. It inspects the gRPC status code (NotFound) and the frontend proxy
-// business/status error envelopes (code ERR_INSTANCE_NOT_FOUND). It is the
-// exported seam that lets the HTTP handler map the failure to 404 without
-// depending on the unexported error types.
-func IsFileTransferNotFoundError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if status.Code(err) == codes.NotFound {
-		return true
-	}
-	var businessErr *frontendProxyBusinessErr
-	if errors.As(err, &businessErr) {
-		return businessErr.code == common.ErrorCode_ERR_INSTANCE_NOT_FOUND
-	}
-	var statusErr *frontendProxyStatusErr
-	if errors.As(err, &statusErr) {
-		return statusErr.code == common.ErrorCode_ERR_INSTANCE_NOT_FOUND
-	}
-	return false
-}
-
 func marshalRuntimeNotifyFromCallResult(callResult *core.CallResult) ([]byte, error) {
 	return marshalRuntimeNotifyFromCallResultWithRequestID(callResult, callResult.GetRequestID())
 }
@@ -1467,7 +1209,7 @@ func convertSimpleRuntimeInvokeArgs(funcMeta api.FunctionMeta, args []api.Arg) [
 	if funcMeta.Api == api.PosixApi {
 		return converted
 	}
-	if simpleRuntimeInvokeArgsNeedFaaSPrefix(funcMeta.Api) {
+	if simpleRuntimeArgsNeedFaaSPrefix(funcMeta.Api) {
 		converted = prefixSimpleRuntimeFaaSInvokeArgs(converted)
 	}
 	metadata := buildSimpleRuntimeInvokeMetadata(funcMeta)
@@ -1480,17 +1222,20 @@ func convertSimpleRuntimeInvokeArgs(funcMeta api.FunctionMeta, args []api.Arg) [
 	return withMetadata
 }
 
-func convertSimpleRuntimeCreateArgs(funcMeta api.FunctionMeta, args []api.Arg) []*common.Arg {
+func convertSimpleRuntimeCreateArgs(funcMeta api.FunctionMeta, args []api.Arg, codePaths []string) []*common.Arg {
 	converted := convertSimpleRuntimeArgs(args)
 	if funcMeta.Api == api.PosixApi {
 		return converted
+	}
+	if simpleRuntimeArgsNeedFaaSPrefix(funcMeta.Api) {
+		converted = prefixSimpleRuntimeFaaSInvokeArgs(converted)
 	}
 	// Libruntime used to prepend MetaData before sending a non-POSIX create.
 	// The direct Proxy path must preserve that runtime wire contract itself.
 	withMetadata := make([]*common.Arg, 0, len(converted)+1)
 	withMetadata = append(withMetadata, &common.Arg{
 		Type:  common.Arg_VALUE,
-		Value: buildSimpleRuntimeCreateMetadata(funcMeta),
+		Value: buildSimpleRuntimeCreateMetadata(funcMeta, codePaths),
 	})
 	withMetadata = append(withMetadata, converted...)
 	return withMetadata
@@ -1502,7 +1247,7 @@ func convertSimpleRuntimeInvokeArgsForRPC(funcMeta api.FunctionMeta, args []api.
 	if funcMeta.Api == api.PosixApi {
 		return converted, release
 	}
-	if simpleRuntimeInvokeArgsNeedFaaSPrefix(funcMeta.Api) {
+	if simpleRuntimeArgsNeedFaaSPrefix(funcMeta.Api) {
 		converted, release = prefixSimpleRuntimeFaaSInvokeArgsForRPC(converted)
 	}
 	metadata := buildSimpleRuntimeInvokeMetadata(funcMeta)
@@ -1512,12 +1257,12 @@ func convertSimpleRuntimeInvokeArgsForRPC(funcMeta api.FunctionMeta, args []api.
 	return withMetadata, release
 }
 
-func simpleRuntimeInvokeArgsNeedFaaSPrefix(apiType api.ApiType) bool {
+func simpleRuntimeArgsNeedFaaSPrefix(apiType api.ApiType) bool {
 	return apiType == api.FaaSApi || apiType == api.ServeApi
 }
 
 func normalizeSimpleRuntimeInvokePayload(funcMeta api.FunctionMeta, payload []byte) []byte {
-	if !simpleRuntimeInvokeArgsNeedFaaSPrefix(funcMeta.Api) {
+	if !simpleRuntimeArgsNeedFaaSPrefix(funcMeta.Api) {
 		return payload
 	}
 	prefix := []byte(simpleRuntimeFaaSMetaPrefix)
@@ -1611,14 +1356,25 @@ func buildSimpleRuntimeInvokeMetadata(funcMeta api.FunctionMeta) []byte {
 	return metadata
 }
 
-func buildSimpleRuntimeCreateMetadata(funcMeta api.FunctionMeta) []byte {
+func buildSimpleRuntimeCreateMetadata(funcMeta api.FunctionMeta, codePaths []string) []byte {
 	var metadata []byte
 	// InvokeType.CreateInstance is protobuf enum value zero and is therefore
 	// represented by the field's default value. FunctionMeta remains required
 	// by the runtime initializer.
 	metadata = appendProtoBytes(metadata, functionMetaModuleNameField, buildSimpleRuntimeFunctionMeta(funcMeta))
+	if config := buildSimpleRuntimeMetaConfig(codePaths); len(config) != 0 {
+		metadata = appendProtoBytes(metadata, metaDataConfigField, config)
+	}
 	metadata = appendProtoBytes(metadata, functionMetaClassNameField, buildSimpleRuntimeInvocationMeta())
 	return metadata
+}
+
+func buildSimpleRuntimeMetaConfig(codePaths []string) []byte {
+	var config []byte
+	for _, codePath := range codePaths {
+		config = appendProtoString(config, metaConfigCodePathsField, codePath)
+	}
+	return config
 }
 
 func buildSimpleRuntimeFunctionMeta(funcMeta api.FunctionMeta) []byte {

@@ -37,8 +37,6 @@ const (
 	CapabilityCreate Capability = "faas.create"
 	// CapabilityKill routes instance termination requests.
 	CapabilityKill Capability = "faas.kill"
-	// CapabilityFileTransfer routes file upload and download requests.
-	CapabilityFileTransfer Capability = "file.transfer"
 	// CapabilityTCPTunnel routes SSH and WebSocket tunnel requests.
 	CapabilityTCPTunnel Capability = "tcp.tunnel"
 

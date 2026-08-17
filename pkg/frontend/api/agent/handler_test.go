@@ -17,15 +17,18 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -36,8 +39,8 @@ import (
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
+	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/common/util"
@@ -59,6 +62,49 @@ func stubInstanceFound(t *testing.T, instanceID string) *gomonkey.Patches {
 			}
 			return nil
 		})
+}
+
+type executorTunnelRequest struct {
+	request *http.Request
+	body    []byte
+	err     error
+}
+
+func stubExecutorTunnel(t *testing.T, status int, headers http.Header,
+	responseBody string) <-chan executorTunnelRequest {
+	t.Helper()
+	captured := make(chan executorTunnelRequest, 1)
+	original := dialAgentSandboxTunnel
+	dialAgentSandboxTunnel = func(_ http.ResponseWriter, routeRequest *http.Request) (net.Conn, bool) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			request, err := http.ReadRequest(bufio.NewReader(server))
+			if err != nil {
+				captured <- executorTunnelRequest{err: err}
+				return
+			}
+			body, err := io.ReadAll(request.Body)
+			captured <- executorTunnelRequest{request: request, body: body, err: err}
+			response := &http.Response{
+				StatusCode:    status,
+				Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        headers.Clone(),
+				Body:          io.NopCloser(strings.NewReader(responseBody)),
+				ContentLength: int64(len(responseBody)),
+			}
+			_ = response.Write(server)
+		}()
+		if routeRequest.URL.Query().Get("port") != strconv.Itoa(agentExecutorHTTPPort) {
+			return nil, false
+		}
+		return client, true
+	}
+	t.Cleanup(func() { dialAgentSandboxTunnel = original })
+	return captured
 }
 
 // runtimeStub is a minimal invokerLibruntime implementation for unit tests.
@@ -90,24 +136,6 @@ func (r *directRuntimeStub) InvokeRaw(util.DirectRawRequest) ([]byte, error) { r
 
 func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
 	return r.runtime.Kill(req.InstanceID, req.Signal, req.Payload, req.AdaptedInvokeOptions())
-}
-
-func (r *directRuntimeStub) UploadFile(ctx context.Context, instanceID, path string, reader io.Reader,
-	tenantID string, permissions string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	return r.runtime.UploadFile(ctx, instanceID, path, reader, tenantID, permissions)
-}
-
-func (r *directRuntimeStub) DownloadFile(ctx context.Context, instanceID, path string, offset int64,
-	tenantID string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	return r.runtime.DownloadFile(ctx, instanceID, path, offset, tenantID)
-}
-
-func (r *directRuntimeStub) ListFile(ctx context.Context, instanceID, path string,
-	recursive bool, maxDepth int, tenantID string,
-) (*frontend_proxy.FileListResponse, error) {
-	return r.runtime.ListFile(ctx, instanceID, path, recursive, maxDepth, tenantID)
 }
 
 func (r *runtimeStub) Invoke(util.InvokeRequest) ([]byte, error) {
@@ -151,24 +179,6 @@ func (r *runtimeStub) Kill(instanceID string, signal int, payload []byte, invoke
 		return r.kill(instanceID, signal, payload, invokeOpt)
 	}
 	return nil
-}
-
-func (r *runtimeStub) UploadFile(
-	context.Context, string, string, io.Reader, string, string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	return nil, nil
-}
-
-func (r *runtimeStub) DownloadFile(
-	context.Context, string, string, int64, string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	return nil, nil
-}
-
-func (r *runtimeStub) ListFile(
-	context.Context, string, string, bool, int, string,
-) (*frontend_proxy.FileListResponse, error) {
-	return nil, nil
 }
 
 func (r *runtimeStub) CreateInstanceRaw(createReqRaw []byte, option api.RawRequestOption) ([]byte, error) {
@@ -309,10 +319,12 @@ func newAgentCreateRecorder(t *testing.T, req CreateAgentRequest) (*httptest.Res
 func TestCreateHandlerBuildsAgentFuncMetaFromURN(t *testing.T) {
 	var capturedFuncMeta api.FunctionMeta
 	var capturedInvokeOpt api.InvokeOptions
+	var capturedArgs []api.Arg
 	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
 			capturedFuncMeta = funcMeta
 			capturedInvokeOpt = invokeOpt
+			capturedArgs = args
 			return "instance-urn", nil
 		},
 	})
@@ -336,13 +348,21 @@ func TestCreateHandlerBuildsAgentFuncMetaFromURN(t *testing.T) {
 	require.NotEqual(t, validAgentURN, capturedFuncMeta.FuncID)
 	require.Contains(t, capturedFuncMeta.FuncID, "0-system-faasExecutorPython3.11")
 	require.Equal(t, api.Python, capturedFuncMeta.Language)
-	require.Equal(t, api.ActorApi, capturedFuncMeta.Api)
+	require.Equal(t, api.FaaSApi, capturedFuncMeta.Api)
 	// Name intentionally left empty so function_proxy generates a random UUID instance_id.
 	require.Nil(t, capturedFuncMeta.Name)
 	require.NotNil(t, capturedFuncMeta.Namespace)
 	require.Equal(t, "agent-ns", *capturedFuncMeta.Namespace)
 	// The URN is propagated as the function key note for downstream routing.
 	require.Equal(t, validAgentURN, capturedInvokeOpt.CreateOpt[constant.FunctionKeyNote])
+	require.Len(t, capturedArgs, 4)
+	var executorSpec types.FuncSpec
+	require.NoError(t, json.Unmarshal(capturedArgs[0].Data, &executorSpec))
+	require.Equal(t, agentExecutorCallEntry, executorSpec.FuncMetaData.Handler)
+	require.Equal(t, "python3.11", executorSpec.FuncMetaData.Runtime)
+	require.Equal(t, agentExecutorInitEntry, executorSpec.ExtendedMetaData.Initializer.Handler)
+	require.Equal(t, agentExecutorPreStopEntry, executorSpec.ExtendedMetaData.PreStop.Handler)
+	require.Equal(t, agentPreStopTimeoutSeconds, executorSpec.ExtendedMetaData.PreStop.Timeout)
 
 	// Response is direct JSON (not base64-wrapped job.Response).
 	var resp struct {
@@ -352,6 +372,15 @@ func TestCreateHandlerBuildsAgentFuncMetaFromURN(t *testing.T) {
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
 	require.Equal(t, http.StatusOK, resp.Code)
 	require.Equal(t, "instance-urn", resp.InstanceID)
+}
+
+func TestAgentExecutorSupportsPython39And311(t *testing.T) {
+	require.True(t, isSupportedAgentPythonRuntime("python3.9"))
+	require.True(t, isSupportedAgentPythonRuntime("Python3.11"))
+	require.Equal(t, "default/0-system-faasExecutorPython3.9/$latest", getAgentExecutorFuncKey("python3.9"))
+	require.Equal(t, "default/0-system-faasExecutorPython3.11/$latest", getAgentExecutorFuncKey("python3.11"))
+	require.False(t, isSupportedAgentPythonRuntime("python3.8"))
+	require.False(t, isSupportedAgentPythonRuntime("go1.x"))
 }
 
 func TestCreateHandlerReturnsInstanceIDDirectly(t *testing.T) {
@@ -451,6 +480,10 @@ func TestCreateHandlerSetsDetachedAndReservedCreateOptions(t *testing.T) {
 	require.Equal(t, agentDelegateDirectory, createOpts["DELEGATE_DIRECTORY_INFO"])
 	require.Equal(t, fmt.Sprintf("%d", agentDirectoryQuotaMB), createOpts["DELEGATE_DIRECTORY_QUOTA"])
 	require.Equal(t, agentConcurrency, createOpts["ConcurrentNum"])
+	require.Equal(t, []string{agentExecutorInitEntry, agentExecutorCallEntry, agentExecutorPreStopEntry},
+		capturedInvokeOpt.CodePaths)
+	_, hasDelegateDownload := createOpts[constant.DelegateDownloadKey]
+	require.False(t, hasDelegateDownload)
 
 	var resSpec resspeckey.ResourceSpecification
 	require.NoError(t, json.Unmarshal([]byte(capturedInvokeOpt.CreateOpt[constant.ResourceSpecNote]), &resSpec))
@@ -458,6 +491,112 @@ func TestCreateHandlerSetsDetachedAndReservedCreateOptions(t *testing.T) {
 	require.EqualValues(t, defaultAgentMemory, resSpec.Memory)
 	// recover_retry_times 未传 → frontend 填默认 defaultRecoverRetryTimes=3 启用重拉。
 	require.Equal(t, "3", capturedInvokeOpt.CreateOpt["RecoverRetryTimes"])
+}
+
+func TestCreateHandlerPlatformExecutorKeepsDelegateDownloadForUserCode(t *testing.T) {
+	var capturedFuncMeta api.FunctionMeta
+	var capturedInvokeOpt api.InvokeOptions
+	var capturedArgs []api.Arg
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedFuncMeta = funcMeta
+			capturedInvokeOpt = invokeOpt
+			capturedArgs = args
+			return "instance-user-process", nil
+		},
+	})
+	defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(string) (*types.FuncSpec, bool) {
+		return &types.FuncSpec{
+			FuncMetaData: types.FuncMetaData{Runtime: "python3.11"},
+			CodeMetaData: types.CodeMetaData{LocalMetaData: types.LocalMetaData{
+				StorageType: constants.LocalStorageType,
+				CodePath:    "/opt/user/agent-process",
+			}},
+			ExtendedMetaData: types.ExtendedMetaData{PreStop: types.PreStop{Timeout: 25}},
+			RootfsSpecMeta:   types.RootfsSpecMeta{ImageURL: "yr-docker-runtime:v0"},
+			SandboxType:      "docker",
+		}, true
+	}).Reset()
+
+	recorder, ctx := newAgentCreateRecorder(t, CreateAgentRequest{
+		Namespace: "agent-ns",
+		Name:      "agent-user-process",
+		Urn:       validAgentURN,
+		EnvVars: map[string]string{
+			agentBootstrapCmdEnv: `[["python3","/opt/user/agent-process/main.py"]]`,
+		},
+	})
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, api.FaaSApi, capturedFuncMeta.Api)
+	require.Equal(t, []string{agentExecutorInitEntry, agentExecutorCallEntry, agentExecutorPreStopEntry},
+		capturedInvokeOpt.CodePaths)
+	require.JSONEq(t, `{"storage_type":"local","code_path":"/opt/user/agent-process"}`,
+		capturedInvokeOpt.CreateOpt[constant.DelegateDownloadKey])
+	var executorSpec types.FuncSpec
+	require.NoError(t, json.Unmarshal(capturedArgs[0].Data, &executorSpec))
+	require.Equal(t, 25, executorSpec.ExtendedMetaData.PreStop.Timeout)
+	require.Equal(t, "30", capturedInvokeOpt.CreateOpt["GRACEFUL_SHUTDOWN_TIME"])
+}
+
+func TestCreateHandlerWithUserHandlerUsesFaaSPath(t *testing.T) {
+	var capturedFuncMeta api.FunctionMeta
+	var capturedInvokeOpt api.InvokeOptions
+	var capturedArgs []api.Arg
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedFuncMeta = funcMeta
+			capturedInvokeOpt = invokeOpt
+			capturedArgs = args
+			return "instance-user-handler", nil
+		},
+	})
+	defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(string) (*types.FuncSpec, bool) {
+		return &types.FuncSpec{
+			FuncMetaData: types.FuncMetaData{Runtime: "python3.8", Handler: "user_agent.handle"},
+			CodeMetaData: types.CodeMetaData{LocalMetaData: types.LocalMetaData{
+				StorageType: constants.LocalStorageType,
+				CodePath:    "/opt/user/agent-handler",
+			}},
+			ExtendedMetaData: types.ExtendedMetaData{
+				Initializer: types.Initializer{Handler: "user_agent.initialize"},
+				PreStop:     types.PreStop{Handler: "user_agent.pre_stop", Timeout: 20},
+			},
+			RootfsSpecMeta: types.RootfsSpecMeta{
+				ImageURL: "yr-docker-runtime:v0", Ports: []string{"tcp:8080"},
+			},
+			SandboxType: "docker",
+		}, true
+	}).Reset()
+
+	recorder, ctx := newAgentCreateRecorder(t, CreateAgentRequest{
+		Namespace: "agent-ns",
+		Name:      "agent-user-handler",
+		Urn:       validAgentURN,
+	})
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, api.FaaSApi, capturedFuncMeta.Api)
+	require.Contains(t, capturedFuncMeta.FuncID, "0-system-faasExecutorPython3.8")
+	require.Equal(t, []string{"user_agent.initialize", "user_agent.handle", "user_agent.pre_stop"},
+		capturedInvokeOpt.CodePaths)
+	require.JSONEq(t, `{"storage_type":"local","code_path":"/opt/user/agent-handler"}`,
+		capturedInvokeOpt.CreateOpt[constant.DelegateDownloadKey])
+	require.JSONEq(t, `{"portForwardings":[{"port":8080,"protocol":"TCP"}]}`,
+		capturedInvokeOpt.CreateOpt["network"])
+	require.Len(t, capturedArgs, 4)
+	var userSpec types.FuncSpec
+	require.NoError(t, json.Unmarshal(capturedArgs[0].Data, &userSpec))
+	require.Equal(t, "user_agent.handle", userSpec.FuncMetaData.Handler)
+	require.Equal(t, "python3.8", userSpec.FuncMetaData.Runtime)
+	require.Equal(t, 20, userSpec.ExtendedMetaData.PreStop.Timeout)
+	require.Equal(t, "25", capturedInvokeOpt.CreateOpt["GRACEFUL_SHUTDOWN_TIME"])
+	var params createParams
+	require.NoError(t, json.Unmarshal(capturedArgs[1].Data, &params))
+	require.Equal(t, "user_agent.initialize", params.EventCreateParams.UserInitEntry)
+	require.Equal(t, "user_agent.handle", params.EventCreateParams.UserCallEntry)
 }
 
 func TestCreateHandlerRegisteredSinksFuncMetaResources(t *testing.T) {
@@ -832,7 +971,7 @@ func TestCreateHandlerInlineBuildsFuncMeta(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Contains(t, capturedFuncMeta.FuncID, "0-system-faasExecutorPython3.11")
 	require.Equal(t, api.Python, capturedFuncMeta.Language)
-	require.Equal(t, api.ActorApi, capturedFuncMeta.Api)
+	require.Equal(t, api.FaaSApi, capturedFuncMeta.Api)
 	require.Nil(t, capturedFuncMeta.Name)
 	require.Equal(t, "agent-ns", *capturedFuncMeta.Namespace)
 	// inline mode: FunctionKeyNote is the composed funcKey, not a URN.
@@ -844,7 +983,7 @@ func TestCreateHandlerInlineBuildsFuncMeta(t *testing.T) {
 		`{"mounts":[{"source":"/home/snuser/workspaceA","target":"/home/agentos","readonly":false}],
 		  "type":"image","imageurl":"yr-docker-runtime:v0"}`,
 		capturedInvokeOpt.CreateOpt["rootfs"])
-	require.JSONEq(t, `{"portForwardings":[{"port":22,"protocol":"TCP"}]}`,
+	require.JSONEq(t, `{"portForwardings":[{"port":22,"protocol":"TCP"},{"port":18093,"protocol":"TCP"}]}`,
 		capturedInvokeOpt.CreateOpt["network"])
 }
 
@@ -1208,53 +1347,156 @@ func TestGetHandlerReturns404WhenNotFound(t *testing.T) {
 
 // ---- File transfer handler tests ----
 
-func TestParseSingleRange(t *testing.T) {
-	convey.Convey("parseSingleRange should handle various Range headers", t, func() {
-		convey.Convey("valid bytes=<start>-", func() {
-			offset, ok := parseSingleRange("bytes=100-")
-			convey.So(ok, convey.ShouldBeTrue)
-			convey.So(offset, convey.ShouldEqual, 100)
-		})
-		convey.Convey("valid with spaces", func() {
-			offset, ok := parseSingleRange("  bytes=50-  ")
-			convey.So(ok, convey.ShouldBeTrue)
-			convey.So(offset, convey.ShouldEqual, 50)
-		})
-		convey.Convey("case insensitive prefix", func() {
-			offset, ok := parseSingleRange("BYTES=200-")
-			convey.So(ok, convey.ShouldBeTrue)
-			convey.So(offset, convey.ShouldEqual, 200)
-		})
-		convey.Convey("zero offset", func() {
-			offset, ok := parseSingleRange("bytes=0-")
-			convey.So(ok, convey.ShouldBeTrue)
-			convey.So(offset, convey.ShouldEqual, 0)
-		})
-		convey.Convey("suffix range not supported", func() {
-			_, ok := parseSingleRange("bytes=-500")
-			convey.So(ok, convey.ShouldBeFalse)
-		})
-		convey.Convey("missing prefix", func() {
-			_, ok := parseSingleRange("0-100")
-			convey.So(ok, convey.ShouldBeFalse)
-		})
-		convey.Convey("missing dash", func() {
-			_, ok := parseSingleRange("bytes=100")
-			convey.So(ok, convey.ShouldBeFalse)
-		})
-		convey.Convey("empty start", func() {
-			_, ok := parseSingleRange("bytes=-")
-			convey.So(ok, convey.ShouldBeFalse)
-		})
-		convey.Convey("negative offset", func() {
-			_, ok := parseSingleRange("bytes=-1-")
-			convey.So(ok, convey.ShouldBeFalse)
-		})
-		convey.Convey("non-numeric", func() {
-			_, ok := parseSingleRange("bytes=abc-")
-			convey.So(ok, convey.ShouldBeFalse)
-		})
-	})
+func TestFileUploadHandlerForwardsMultipartFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-upload").Reset()
+	captured := stubExecutorTunnel(t, http.StatusOK,
+		http.Header{"Content-Type": []string{"application/json"}},
+		`{"success":true,"path":"/tmp/input.bin","size":7}`)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("path", "/tmp/input.bin"))
+	require.NoError(t, writer.WriteField("mode", "640"))
+	part, err := writer.CreateFormFile("file", "input.bin")
+	require.NoError(t, err)
+	_, err = part.Write([]byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/agent/instance-upload/files/upload?audit=original", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.POST("/api/agent/:instanceId/files/upload", FileUploadHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"success":true,"path":"/tmp/input.bin","size":7}`, recorder.Body.String())
+	require.Equal(t, "audit=original", request.URL.RawQuery)
+	forwarded := <-captured
+	require.NoError(t, forwarded.err)
+	require.Equal(t, http.MethodPut, forwarded.request.Method)
+	require.Equal(t, "/v1/files/upload", forwarded.request.URL.Path)
+	require.Equal(t, "/tmp/input.bin", forwarded.request.URL.Query().Get("path"))
+	require.Equal(t, "640", forwarded.request.URL.Query().Get("mode"))
+	require.Equal(t, []byte("payload"), forwarded.body)
+}
+
+func TestFileUploadHandlerPreservesPublicErrorEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-upload-error").Reset()
+	captured := stubExecutorTunnel(t, http.StatusBadRequest,
+		http.Header{"Content-Type": []string{"application/json"}},
+		`{"message":"invalid mode '888'"}`)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("path", "/tmp/input.bin"))
+	require.NoError(t, writer.WriteField("mode", "888"))
+	part, err := writer.CreateFormFile("file", "input.bin")
+	require.NoError(t, err)
+	_, err = part.Write([]byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/agent/instance-upload-error/files/upload", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.POST("/api/agent/:instanceId/files/upload", FileUploadHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.JSONEq(t, `{"code":400,"message":"invalid mode '888'"}`, recorder.Body.String())
+	forwarded := <-captured
+	require.NoError(t, forwarded.err)
+}
+
+func TestFileDownloadHandlerForwardsRangeAndResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-download").Reset()
+	captured := stubExecutorTunnel(t, http.StatusPartialContent, http.Header{
+		"Content-Type":  []string{"application/octet-stream"},
+		"Content-Range": []string{"bytes 1-3/5"},
+	}, "ell")
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/agent/instance-download/files/download?path=/tmp/file.txt", nil)
+	request.Header.Set("Range", "bytes=1-3")
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.GET("/api/agent/:instanceId/files/download", FileDownloadHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusPartialContent, recorder.Code)
+	require.Equal(t, "bytes 1-3/5", recorder.Header().Get("Content-Range"))
+	require.Equal(t, "ell", recorder.Body.String())
+	forwarded := <-captured
+	require.NoError(t, forwarded.err)
+	require.Equal(t, "bytes=1-3", forwarded.request.Header.Get("Range"))
+	require.Equal(t, "/tmp/file.txt", forwarded.request.URL.Query().Get("path"))
+}
+
+func TestFileDownloadHandlerPreservesRangeErrorHeaderAndEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-download-error").Reset()
+	captured := stubExecutorTunnel(t, http.StatusRequestedRangeNotSatisfiable, http.Header{
+		"Content-Length": []string{"0"},
+		"Content-Range":  []string{"bytes */0"},
+	}, "")
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/agent/instance-download-error/files/download?path=/tmp/empty.txt", nil)
+	request.Header.Set("Range", "bytes=0-")
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.GET("/api/agent/:instanceId/files/download", FileDownloadHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, recorder.Code)
+	require.Equal(t, "bytes */0", recorder.Header().Get("Content-Range"))
+	require.JSONEq(t,
+		`{"code":416,"message":"Requested Range Not Satisfiable"}`, recorder.Body.String())
+	forwarded := <-captured
+	require.NoError(t, forwarded.err)
+}
+
+func TestFileListHandlerForwardsValidatedOptions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-list").Reset()
+	captured := stubExecutorTunnel(t, http.StatusOK,
+		http.Header{"Content-Type": []string{"application/json"}}, `{"items":[]}`)
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/agent/instance-list/files/list?path=/tmp&recursive=true&max_depth=2", nil)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.GET("/api/agent/:instanceId/files/list", FileListHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"items":[]}`, recorder.Body.String())
+	forwarded := <-captured
+	require.NoError(t, forwarded.err)
+	require.Equal(t, "true", forwarded.request.URL.Query().Get("recursive"))
+	require.Equal(t, "2", forwarded.request.URL.Query().Get("max_depth"))
+}
+
+func TestFileListHandlerRejectsInvalidMaxDepth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-list-invalid").Reset()
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/agent/instance-list-invalid/files/list?path=/tmp&max_depth=invalid", nil)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.GET("/api/agent/:instanceId/files/list", FileListHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "max_depth must be a non-negative integer")
 }
 
 func TestCountingReader(t *testing.T) {
@@ -1303,12 +1545,6 @@ func TestWriteFileTransferError(t *testing.T) {
 			writeFileTransferError(ctx, errors.New("upload size exceeds max 512MB"))
 			convey.So(w.Code, convey.ShouldEqual, http.StatusRequestEntityTooLarge)
 		})
-		convey.Convey("contains 'is required' → 400", func() {
-			w := httptest.NewRecorder()
-			ctx, _ := gin.CreateTestContext(w)
-			writeFileTransferError(ctx, errors.New("path is required"))
-			convey.So(w.Code, convey.ShouldEqual, http.StatusBadRequest)
-		})
 		convey.Convey("generic error → 500", func() {
 			w := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(w)
@@ -1340,14 +1576,5 @@ func TestWriteMultipartReadError(t *testing.T) {
 			writeMultipartReadError(ctx, "inst1", io.ErrUnexpectedEOF)
 			convey.So(w.Code, convey.ShouldEqual, http.StatusBadRequest)
 		})
-	})
-}
-
-func TestIsFileNotFoundError(t *testing.T) {
-	convey.Convey("isFileNotFoundError should return false for nil", t, func() {
-		convey.So(isFileNotFoundError(nil), convey.ShouldBeFalse)
-	})
-	convey.Convey("isFileNotFoundError should return false for generic error", t, func() {
-		convey.So(isFileNotFoundError(errors.New("something else")), convey.ShouldBeFalse)
 	})
 }

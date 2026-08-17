@@ -15,15 +15,14 @@ import (
 // These aliases keep the existing transport-focused tests concise while the
 // production routing implementation lives exclusively in proxyrouting.
 const (
-	FrontendProxyCapabilityInvoke       = "faas.invoke"
-	FrontendProxyCapabilityCreate       = "faas.create"
-	FrontendProxyCapabilityKill         = "faas.kill"
-	FrontendProxyCapabilityFileTransfer = "file.transfer"
-	FrontendProxyCapabilityTCPTunnel    = "tcp.tunnel"
-	frontendProxyCapabilityInvoke       = FrontendProxyCapabilityInvoke
-	frontendProxyCapabilityCreate       = FrontendProxyCapabilityCreate
-	frontendProxyCapabilityKill         = FrontendProxyCapabilityKill
-	proxyCapabilityTCPTunnel            = FrontendProxyCapabilityTCPTunnel
+	FrontendProxyCapabilityInvoke    = "faas.invoke"
+	FrontendProxyCapabilityCreate    = "faas.create"
+	FrontendProxyCapabilityKill      = "faas.kill"
+	FrontendProxyCapabilityTCPTunnel = "tcp.tunnel"
+	frontendProxyCapabilityInvoke    = FrontendProxyCapabilityInvoke
+	frontendProxyCapabilityCreate    = FrontendProxyCapabilityCreate
+	frontendProxyCapabilityKill      = FrontendProxyCapabilityKill
+	proxyCapabilityTCPTunnel         = FrontendProxyCapabilityTCPTunnel
 )
 
 type frontendProxyEndpoint struct {
