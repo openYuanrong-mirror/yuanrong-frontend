@@ -545,7 +545,7 @@ func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instance
 	requestID := newFrontendProxyRuntimeRequestID()
 	chunkBuffer := make([]byte, frontendProxyFileTransferChunkSize)
 	var offset int64
-	firstChunk := true
+	sent := false
 	for {
 		n, readErr := reader.Read(chunkBuffer)
 		if n > 0 {
@@ -562,15 +562,38 @@ func (c *grpcFrontendProxyInvokeClient) UploadFile(ctx context.Context, instance
 				Data:       chunkBuffer[:n],
 				IsLast:     errors.Is(readErr, io.EOF),
 			}
-			if firstChunk && permissions != "" {
+			if !sent && permissions != "" {
 				chunk.Permissions = permissions
-				firstChunk = false
 			}
 			if err := stream.Send(chunk); err != nil {
 				return nil, err
 			}
+			sent = true
 		}
 		if errors.Is(readErr, io.EOF) {
+			// Zero-byte file: reader.Read returns (0, io.EOF) on the first
+			// call, so no chunk was ever sent. Send a single empty chunk to
+			// carry permissions and signal completion to the runtime.
+			if !sent {
+				chunk := &frontend_proxy.FileChunk{
+					Context: &frontend_proxy.FrontendRequestContext{
+						FrontendClientID: c.frontendClientID,
+						TenantID:         tenantID,
+						RequestID:        requestID,
+					},
+					InstanceID: instanceID,
+					Path:       path,
+					Offset:     0,
+					Data:       nil,
+					IsLast:     true,
+				}
+				if permissions != "" {
+					chunk.Permissions = permissions
+				}
+				if err := stream.Send(chunk); err != nil {
+					return nil, err
+				}
+			}
 			break
 		}
 		if readErr != nil {
