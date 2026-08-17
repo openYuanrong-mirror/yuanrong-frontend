@@ -70,7 +70,7 @@ type Summary struct {
 	Resources         map[string]Resource
 	// ContainerID is InstanceInfo.containerID (docker containerID or supervisor/runsc sandboxID).
 	ContainerID string
-	// ContainerIP is the container internal IP (docker bridge network only); empty for supervisor/runsc.
+	// ContainerIP is the sandbox internal IP (docker inspect or supervisor create response).
 	ContainerIP string
 	// SandboxType is the executor kind, from createOptions["sandbox_type"].
 	SandboxType string
