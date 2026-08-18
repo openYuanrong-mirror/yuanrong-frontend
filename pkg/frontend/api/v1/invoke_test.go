@@ -19,10 +19,8 @@ package v1
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -37,7 +35,6 @@ import (
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"frontend/pkg/common/faas_common/constant"
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/grpc/pb/function"
 	"frontend/pkg/common/faas_common/localauth"
 	"frontend/pkg/common/faas_common/logger/log"
@@ -103,24 +100,6 @@ func (*directProxyInvokeStub) CreateRaw(util.DirectRawRequest) ([]byte, error) {
 func (*directProxyInvokeStub) InvokeRaw(util.DirectRawRequest) ([]byte, error) { return nil, nil }
 
 func (*directProxyInvokeStub) KillInstance(util.DirectKillRequest) error { return nil }
-
-func (*directProxyInvokeStub) UploadFile(
-	context.Context, string, string, io.Reader, string, string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	return nil, nil
-}
-
-func (*directProxyInvokeStub) DownloadFile(
-	context.Context, string, string, int64, string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	return nil, nil
-}
-
-func (*directProxyInvokeStub) ListFile(
-	context.Context, string, string, bool, int, string,
-) (*frontend_proxy.FileListResponse, error) {
-	return nil, nil
-}
 
 func (f *fakeClient) AcquireInstance(functionKey string, req commontype.AcquireOption) (*commontype.InstanceAllocationInfo, error) {
 	// TODO implement me

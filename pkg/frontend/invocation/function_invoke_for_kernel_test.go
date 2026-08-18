@@ -17,11 +17,9 @@
 package invocation
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"reflect"
 	"strconv"
@@ -38,7 +36,6 @@ import (
 
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/etcd3"
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/snerror"
@@ -246,24 +243,6 @@ func (f *fakeDirectProxyClient) InvokeRaw(util.DirectRawRequest) ([]byte, error)
 
 func (f *fakeDirectProxyClient) KillInstance(util.DirectKillRequest) error {
 	return nil
-}
-
-func (f *fakeDirectProxyClient) UploadFile(
-	context.Context, string, string, io.Reader, string, string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	return nil, nil
-}
-
-func (f *fakeDirectProxyClient) DownloadFile(
-	context.Context, string, string, int64, string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	return nil, nil
-}
-
-func (f *fakeDirectProxyClient) ListFile(
-	context.Context, string, string, bool, int, string,
-) (*frontend_proxy.FileListResponse, error) {
-	return nil, nil
 }
 
 func (f *fakeClient) AcquireInstance(functionKey string, req types.AcquireOption) (*types.InstanceAllocationInfo, error) {

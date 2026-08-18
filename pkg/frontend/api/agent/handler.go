@@ -19,12 +19,14 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,8 +39,6 @@ import (
 
 	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
-	"frontend/pkg/common/faas_common/grpc/pb/common"
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/types"
@@ -51,6 +51,7 @@ import (
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 	"frontend/pkg/frontend/sandboxrouter/route"
 	"frontend/pkg/frontend/schedulerproxy"
+	"frontend/pkg/frontend/wsproxy"
 )
 
 // agentUserPlaceholder is the workspace mount target placeholder. It is replaced with
@@ -62,6 +63,12 @@ const (
 	agentDefaultWorkspaceTarget = "/home/agentos"
 	agentBootstrapCmdEnv        = "YR_RUNTIME_BOOTSTRAP_CMD"
 	agentSandboxTypeSupervisor  = "supervisor"
+	agentExecutorInitEntry      = "yr.agentexecutor.handler.initialize"
+	agentExecutorCallEntry      = "yr.agentexecutor.handler.handle"
+	agentExecutorPreStopEntry   = "yr.agentexecutor.handler.pre_stop"
+	// Keep this port aligned with DEFAULT_EXECUTOR_PORT in yuanrong-agentruntime's
+	// agentexecutor runtime.
+	agentExecutorHTTPPort = 18093
 )
 
 // agentExecutorFormat is the system executor function funcKey pattern. agent reuses the
@@ -84,12 +91,31 @@ type eventCreateParams struct {
 	UserCallEntry string `json:"userCallEntry,omitempty"`
 }
 
+type agentCreateConfig struct {
+	funcKey          string
+	inline           bool
+	spec             *types.FuncSpec
+	platformExecutor bool
+	preStopTimeout   int
+}
+
+type agentExecutorHTTPRequest struct {
+	method        string
+	path          string
+	query         url.Values
+	body          io.Reader
+	contentLength int64
+	headers       http.Header
+}
+
 const (
 	defaultAgentCPU              = 1000
 	defaultAgentMemory           = 2048
 	agentCreateTimeoutSeconds    = 60
 	agentInitTimeoutSeconds      = 305
-	agentGracefulShutdownSeconds = 0
+	agentGracefulShutdownSeconds = 15
+	agentPreStopTimeoutSeconds   = 10
+	agentShutdownReserveSeconds  = 5
 	defaultRecoverRetryTimes     = 3
 	agentDirectoryQuotaMB        = 512
 	agentInstanceType            = "reserved"
@@ -104,11 +130,11 @@ const (
 	sshContainerMountDirectory   = "/run/openyuanrong/ssh"
 )
 
-// getAgentExecutorFuncKey maps the user function runtime to the faas system executor function
-// funcKey (mirrors functionscaler.instancepool.getExecutorFuncKey). agent reuses the faas
+// getAgentExecutorFuncKey maps the requested runtime to the faas system executor function
+// funcKey (mirrors functionscaler.instancepool.getExecutorFuncKey). Agent reuses the faas
 // executor function so function_proxy's funcMetaMap_ has it (loaded at startup) — avoids
 // "invalid function (1015)" since agent does not register its user funcKey into proxy's
-// /yr/functions watch. Falls back to PosixCustom for unknown runtimes.
+// /yr/functions watch.
 func getAgentExecutorFuncKey(runtime string) string {
 	r := strings.ToLower(runtime)
 	switch {
@@ -222,30 +248,61 @@ func CreateHandler(ctx *gin.Context) {
 	if !ok {
 		return
 	}
+	var spec *types.FuncSpec
+	if !inline {
+		if loaded, found := functionmeta.LoadFuncSpec(funcKey); found {
+			spec = loaded
+		}
+	}
+	platformExecutor := inline || spec == nil || strings.TrimSpace(spec.FuncMetaData.Handler) == ""
+	preStopTimeout := resolveAgentPreStopTimeout(spec, platformExecutor)
+	if platformExecutor && !isSupportedAgentPythonRuntime(runtime) {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest,
+			fmt.Errorf("agent executor requires a supported Python runtime "+
+				"(python3.9, python3.10, or python3.11), got %q", runtime))
+		return
+	}
 	funcMeta := api.FunctionMeta{
 		FuncID:    getAgentExecutorFuncKey(runtime),
 		Language:  api.Python,
-		Api:       api.ActorApi,
+		Api:       api.FaaSApi,
 		Namespace: &req.Namespace,
 	}
-	invokeOpts, err := buildAgentInvokeOptions(ctx, req, funcKey, inline)
+	createConfig := agentCreateConfig{
+		funcKey:          funcKey,
+		inline:           inline,
+		spec:             spec,
+		platformExecutor: platformExecutor,
+		preStopTimeout:   preStopTimeout,
+	}
+	invokeOpts, err := buildAgentInvokeOptions(ctx, req, createConfig)
 	if err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
 		return
-	}
-	var spec *types.FuncSpec
-	if !inline {
-		if loaded, ok := functionmeta.LoadFuncSpec(funcKey); ok && loaded != nil {
-			spec = loaded
-		}
 	}
 	resKey := resspeckey.ResourceSpecification{
 		CPU:         int64(invokeOpts.Cpu),
 		Memory:      int64(invokeOpts.Memory),
 		InvokeLabel: "",
 	}
-	args := buildAgentCreateArgs(spec, resKey)
+	args := buildAgentCreateArgs(runtime, spec, resKey, platformExecutor, preStopTimeout)
 	createAgentInstance(ctx, req, funcMeta, invokeOpts, args)
+}
+
+func isSupportedAgentPythonRuntime(runtime string) bool {
+	runtime = strings.ToLower(strings.TrimSpace(runtime))
+	return strings.Contains(runtime, "python3.9") || strings.Contains(runtime, "python3.10") ||
+		strings.Contains(runtime, "python3.11")
+}
+
+func resolveAgentPreStopTimeout(spec *types.FuncSpec, platformExecutor bool) int {
+	if spec != nil && spec.ExtendedMetaData.PreStop.Timeout > 0 {
+		return spec.ExtendedMetaData.PreStop.Timeout
+	}
+	if platformExecutor {
+		return agentPreStopTimeoutSeconds
+	}
+	return 0
 }
 
 // resolveAgentFuncKeyAndRuntime resolves the user function key and runtime for the agent.
@@ -312,10 +369,10 @@ func validateRootfsImageURL(req CreateAgentRequest, funcKey string, inline bool)
 
 // buildAgentInvokeOptions builds the invoke options for agent create.
 // inline=true: container config from req; inline=false: from funcSpecMap by funcKey.
-func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest, funcKey string, inline bool,
-) (api.InvokeOptions, error) {
+func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest,
+	config agentCreateConfig) (api.InvokeOptions, error) {
 	cpu, memory := defaultAgentCPU, defaultAgentMemory
-	if inline && req.RuntimeSpec != nil {
+	if config.inline && req.RuntimeSpec != nil {
 		if req.RuntimeSpec.CPU > 0 {
 			cpu = req.RuntimeSpec.CPU
 		}
@@ -331,7 +388,7 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest, funcKey s
 		CustomExtensions: map[string]string{"lifecycle": "detached", "Concurrency": agentConcurrency},
 	}
 
-	if err := validateRootfsImageURL(req, funcKey, inline); err != nil {
+	if err := validateRootfsImageURL(req, config.funcKey, config.inline); err != nil {
 		return api.InvokeOptions{}, err
 	}
 
@@ -339,16 +396,19 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest, funcKey s
 		return api.InvokeOptions{}, err
 	}
 	applyAgentDynamicEnv(&invokeOpts, req)
-	if inline {
+	if config.inline {
 		applyAgentInlineMeta(&invokeOpts, req)
 	} else {
-		applyAgentFuncMeta(&invokeOpts, funcKey)
-		if spec, ok := functionmeta.LoadFuncSpec(funcKey); ok && spec != nil {
-			applyAgentCodePaths(&invokeOpts, spec)
-		}
+		applyAgentFuncMeta(&invokeOpts, config.funcKey)
+	}
+	if config.platformExecutor {
+		applyAgentExecutorCode(&invokeOpts)
+		ensureAgentExecutorPort(&invokeOpts)
+	} else {
+		applyAgentCodePaths(&invokeOpts, config.spec)
 	}
 	invokeOpts.RecoverRetryTimes = defaultRecoverRetryTimes
-	applyAgentCreateOpts(&invokeOpts, ctx, req, inline, funcKey)
+	applyAgentCreateOpts(&invokeOpts, ctx, req, config)
 	return invokeOpts, nil
 }
 
@@ -392,23 +452,19 @@ func applyAgentFuncMeta(invokeOpts *api.InvokeOptions, funcKey string) {
 	applyAgentCodePath(invokeOpts, spec)
 }
 
-// applyAgentCodePath sinks the user function codePath for local-storage registered functions
-// into createOptions["DELEGATE_DOWNLOAD"] as a LocalMetaData JSON. Mirrors function-scaler's
-// instance_operation_kernel.go: prepareDelegateDownload for storageType=="local". When the
-// storageType is not local or codePath is empty, no DELEGATE_DOWNLOAD is written (the agent
-// fallback is to skip code loading — the container starts but cannot run user code). The
-// function_agent's LocalDeployer parses this and returns deployDir without downloading.
+// applyAgentExecutorCode configures only the lifecycle entries of the platform-owned Executor.
+// The package is preinstalled in the image's Python environment, so it must not consume
+// DELEGATE_DOWNLOAD. That option remains available for an optional user process code package.
+func applyAgentExecutorCode(invokeOpts *api.InvokeOptions) {
+	invokeOpts.CodePaths = []string{agentExecutorInitEntry, agentExecutorCallEntry, agentExecutorPreStopEntry}
+}
+
+// applyAgentCodePath passes an optional local user code package to the runtime. The package may
+// contain a traditional AgentHandler, or it may only contain files and executables started by
+// the platform Executor through YR_RUNTIME_BOOTSTRAP_CMD.
 func applyAgentCodePath(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
-	if spec == nil {
-		log.GetLogger().Infof("[AgentCodePath] spec is nil, skip")
-		return
-	}
-	log.GetLogger().Infof("[AgentCodePath] storageType=%s, codePath=%s, sandboxType=%s",
-		spec.CodeMetaData.StorageType, spec.CodeMetaData.CodePath, spec.SandboxType)
-	if spec.CodeMetaData.StorageType != constants.LocalStorageType {
-		return
-	}
-	if spec.CodeMetaData.CodePath == "" {
+	if spec == nil || spec.CodeMetaData.StorageType != constants.LocalStorageType ||
+		spec.CodeMetaData.CodePath == "" {
 		return
 	}
 	delegateDownloadValue := types.LocalMetaData{
@@ -417,47 +473,72 @@ func applyAgentCodePath(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
 	}
 	data, err := json.Marshal(delegateDownloadValue)
 	if err != nil {
-		log.GetLogger().Warnf("failed to marshal agent delegate download: %v", err)
+		log.GetLogger().Warnf("failed to marshal agent user code delegate download: %v", err)
 		return
 	}
-	log.GetLogger().Infof("[AgentCodePath] set DELEGATE_DOWNLOAD=%s", string(data))
+	log.GetLogger().Infof("[AgentCodePath] set user code DELEGATE_DOWNLOAD=%s", string(data))
 	invokeOpts.CreateOpt[constant.DelegateDownloadKey] = string(data)
 }
 
-// applyAgentCodePaths builds invokeOpts.CodePaths from the spec's init/handler/preStop entries.
-// Mirrors function-scaler instance_operation_kernel.go:309-312. The executor process reads
-// CodePaths to know which entry symbols to load and run for each lifecycle hook.
 func applyAgentCodePaths(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
 	if spec == nil {
 		return
 	}
-	codeEntrys := []string{
-		spec.ExtendedMetaData.Initializer.Handler,
-		spec.FuncMetaData.Handler,
-	}
+	entries := []string{spec.ExtendedMetaData.Initializer.Handler, spec.FuncMetaData.Handler}
 	if spec.ExtendedMetaData.PreStop.Handler != "" {
-		codeEntrys = append(codeEntrys, spec.ExtendedMetaData.PreStop.Handler)
+		entries = append(entries, spec.ExtendedMetaData.PreStop.Handler)
 	}
-	invokeOpts.CodePaths = codeEntrys
+	invokeOpts.CodePaths = entries
 }
 
 // buildAgentCreateArgs builds the libruntime CreateInstance args array for the agent create
 // path. Mirrors function-scaler instance_operation_kernel.go:1170-1199, 1202-1235 for the
-// non-HTTP / non-CustomContainer local-codePath path. It returns four args: funcSpecData is an
-// empty JSON object because agent has no funcSpec payload (the executor is the system
-// faasExecutor function, and user-code config travels via createOptions); createParamsData
+// non-HTTP / non-CustomContainer local-codePath path. It returns four args: funcSpecData carries
+// the platform Executor lifecycle metadata; createParamsData
 // carries instanceLabel plus the userInitEntry and userCallEntry; schedulerData is an empty JSON
 // object because agent instances are not scheduler-managed; createEvent is an empty JSON object
 // because agent has no event payload.
 //
-// When spec is nil (inline mode or uncached registered funcKey), createParamsData falls back to
-// empty init/call entries. resKey mirrors the ResourceSpecification built by
-// buildAgentResourceSpecJSON (same CPU/Memory source, InvokeLabel empty since agent create does
-// not set one).
-func buildAgentCreateArgs(spec *types.FuncSpec, resKey resspeckey.ResourceSpecification) []api.Arg {
-	userInitEntry := ""
-	userCallEntry := ""
-	if spec != nil {
+// resKey mirrors the ResourceSpecification built by buildAgentResourceSpecJSON (same CPU/Memory
+// source, InvokeLabel empty since agent create does not set one).
+func buildAgentCreateArgs(runtime string, spec *types.FuncSpec, resKey resspeckey.ResourceSpecification,
+	platformExecutor bool, preStopTimeout int,
+) []api.Arg {
+	funcSpecData := []byte("{}")
+	userInitEntry, userCallEntry := "", ""
+	if platformExecutor {
+		executorSpec := types.FuncSpec{
+			FuncMetaData: types.FuncMetaData{
+				Handler: agentExecutorCallEntry,
+				Runtime: runtime,
+				Timeout: agentCreateTimeoutSeconds,
+			},
+			ResourceMetaData: types.ResourceMetaData{CPU: resKey.CPU, Memory: resKey.Memory},
+			ExtendedMetaData: types.ExtendedMetaData{
+				Initializer: types.Initializer{Handler: agentExecutorInitEntry, Timeout: agentInitTimeoutSeconds},
+				PreStop: types.PreStop{
+					Handler: agentExecutorPreStopEntry,
+					Timeout: preStopTimeout,
+				},
+			},
+		}
+		var err error
+		funcSpecData, err = json.Marshal(executorSpec)
+		if err != nil {
+			log.GetLogger().Warnf("failed to marshal agent executor func spec: %v", err)
+			funcSpecData = []byte("{}")
+		}
+		userInitEntry, userCallEntry = agentExecutorInitEntry, agentExecutorCallEntry
+	} else if spec != nil {
+		userSpec := *spec
+		userSpec.ResourceMetaData.CPU = resKey.CPU
+		userSpec.ResourceMetaData.Memory = resKey.Memory
+		var err error
+		funcSpecData, err = json.Marshal(userSpec)
+		if err != nil {
+			log.GetLogger().Warnf("failed to marshal user agent func spec: %v", err)
+			funcSpecData = []byte("{}")
+		}
 		userInitEntry = spec.ExtendedMetaData.Initializer.Handler
 		userCallEntry = spec.FuncMetaData.Handler
 	}
@@ -474,7 +555,7 @@ func buildAgentCreateArgs(spec *types.FuncSpec, resKey resspeckey.ResourceSpecif
 		createParamsData = []byte("{}")
 	}
 	return []api.Arg{
-		{Type: api.Value, Data: []byte("{}")},
+		{Type: api.Value, Data: funcSpecData},
 		{Type: api.Value, Data: createParamsData},
 		{Type: api.Value, Data: []byte("{}")},
 		{Type: api.Value, Data: []byte("{}")},
@@ -587,6 +668,34 @@ func applyAgentPorts(invokeOpts *api.InvokeOptions, ports []string) {
 		return
 	}
 	invokeOpts.CreateOpt["network"] = string(networkJSON)
+}
+
+// ensureAgentExecutorPort adds the platform-reserved HTTP port without dropping user ports.
+func ensureAgentExecutorPort(invokeOpts *api.InvokeOptions) {
+	var network struct {
+		PortForwardings []map[string]interface{} `json:"portForwardings"`
+	}
+	if raw := invokeOpts.CreateOpt["network"]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &network); err != nil {
+			log.GetLogger().Warnf("failed to unmarshal agent network while adding executor port: %v", err)
+			network.PortForwardings = nil
+		}
+	}
+	for _, forwarding := range network.PortForwardings {
+		port, portOK := forwarding["port"].(float64)
+		protocol, _ := forwarding["protocol"].(string)
+		if portOK && int(port) == agentExecutorHTTPPort && strings.EqualFold(protocol, "TCP") {
+			return
+		}
+	}
+	network.PortForwardings = append(network.PortForwardings,
+		map[string]interface{}{"port": agentExecutorHTTPPort, "protocol": "TCP"})
+	data, err := json.Marshal(network)
+	if err != nil {
+		log.GetLogger().Warnf("failed to marshal agent executor port forwarding: %v", err)
+		return
+	}
+	invokeOpts.CreateOpt["network"] = string(data)
 }
 
 // mergeAgentStaticEnv merges the function's static environment (funcSpec.EnvMetaData.Environment,
@@ -735,14 +844,14 @@ func applyAgentDynamicEnv(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 // applyAgentCreateOpts sets the common createOptions shared across agent instances.
 // funcKeyNote: inline mode uses funcKey; registered mode uses urn.
 func applyAgentCreateOpts(invokeOpts *api.InvokeOptions, ctx *gin.Context, req CreateAgentRequest,
-	inline bool, funcKey string) {
+	config agentCreateConfig) {
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
 	if tenantID == "" {
 		tenantID = "default"
 	}
 	invokeOpts.CreateOpt["tenantId"] = tenantID
-	if inline {
-		invokeOpts.CreateOpt[constant.FunctionKeyNote] = funcKey
+	if config.inline {
+		invokeOpts.CreateOpt[constant.FunctionKeyNote] = config.funcKey
 	} else {
 		invokeOpts.CreateOpt[constant.FunctionKeyNote] = req.Urn
 	}
@@ -750,7 +859,11 @@ func applyAgentCreateOpts(invokeOpts *api.InvokeOptions, ctx *gin.Context, req C
 	invokeOpts.CreateOpt[constant.SchedulerManagedNote] = strconv.FormatBool(false)
 	invokeOpts.CreateOpt["call_timeout"] = strconv.Itoa(agentCreateTimeoutSeconds)
 	invokeOpts.CreateOpt["init_call_timeout"] = strconv.Itoa(agentInitTimeoutSeconds)
-	invokeOpts.CreateOpt["GRACEFUL_SHUTDOWN_TIME"] = strconv.Itoa(agentGracefulShutdownSeconds)
+	gracefulShutdownSeconds := agentGracefulShutdownSeconds
+	if config.preStopTimeout+agentShutdownReserveSeconds > gracefulShutdownSeconds {
+		gracefulShutdownSeconds = config.preStopTimeout + agentShutdownReserveSeconds
+	}
+	invokeOpts.CreateOpt["GRACEFUL_SHUTDOWN_TIME"] = strconv.Itoa(gracefulShutdownSeconds)
 	invokeOpts.CreateOpt["DELEGATE_DIRECTORY_INFO"] = agentDelegateDirectory
 	invokeOpts.CreateOpt["DELEGATE_DIRECTORY_QUOTA"] = strconv.Itoa(agentDirectoryQuotaMB)
 	invokeOpts.CreateOpt["ConcurrentNum"] = agentConcurrency
@@ -1085,14 +1198,20 @@ func parseEnvVars(envStr string) map[string]string {
 	return nil
 }
 
-// maxFileUploadSize is the per-request upload size cap (512MB). It is enforced
+// maxFileUploadSize is the per-file upload size cap (512MB). Keep it aligned
+// with DEFAULT_MAX_FILE_SIZE in yuanrong-agentruntime's FileHandler. It is enforced
 // both via Content-Length and by accumulating bytes read from the multipart
 // file so a client lying about Content-Length cannot bypass it.
 const maxFileUploadSize int64 = 512 * 1024 * 1024
+const maxMultipartOverhead int64 = 1024 * 1024
 
 // fileTransferWaitTimeout bounds how long the file-transfer handlers wait for
 // an instance to appear in the watcher cache before returning 404.
 const fileTransferWaitTimeout = 5 * time.Second
+
+// Kept indirect so handler tests can exercise the complete HTTP adaptation
+// without opening a real FunctionProxy tunnel.
+var dialAgentSandboxTunnel = wsproxy.DialSandboxTunnel
 
 // waitForAgentInstanceExist returns the instance spec for instanceID if it is
 // present in the watcher cache within fileTransferWaitTimeout. It reuses the
@@ -1103,23 +1222,9 @@ func waitForAgentInstanceExist(instanceID string) (*types.InstanceSpecification,
 	return instancemanager.WaitInstanceByID(ctx, instanceID)
 }
 
-// fileTransferClient returns the fixed direct-proxy file transfer client.
-func fileTransferClient() (util.FileTransferClient, error) {
-	return util.GetDirectProxyClient(), nil
-}
-
-// isFileNotFoundError reports whether err indicates the file/path does not
-// exist on the owning proxy. It delegates to util.IsFileTransferNotFoundError,
-// which inspects both the grpc status code (NotFound) and the frontend proxy
-// business/status error envelopes so download handlers can map the failure to
-// 404 without depending on the unexported error types.
-func isFileNotFoundError(err error) bool {
-	return util.IsFileTransferNotFoundError(err)
-}
-
 // FileUploadHandler handles POST /api/agent/:instanceId/files/upload.
-// It streams the uploaded file to the owning proxy of the instance, validating
-// the file extension whitelist and the 512MB size cap before dispatching.
+// It retains the public multipart contract, then streams the file part over the
+// existing HTTP-over-TCP tunnel to the Agent Executor HTTP server.
 //
 // The multipart form must include a "path" text field and a "file" file field.
 // The "path" field should precede "file" so the target is known before the
@@ -1137,10 +1242,11 @@ func FileUploadHandler(ctx *gin.Context) {
 	}
 	// Validate Content-Length against the size cap before reading the body so
 	// an oversized request is rejected without buffering it.
-	if contentLength := ctx.Request.ContentLength; contentLength > maxFileUploadSize {
+	maxRequestSize := maxFileUploadSize + maxMultipartOverhead
+	if contentLength := ctx.Request.ContentLength; contentLength > maxRequestSize {
 		ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
 			"code":    http.StatusRequestEntityTooLarge,
-			"message": fmt.Sprintf("upload size %d exceeds max %d", contentLength, maxFileUploadSize),
+			"message": fmt.Sprintf("request size %d exceeds max %d", contentLength, maxRequestSize),
 		})
 		return
 	}
@@ -1158,7 +1264,7 @@ func FileUploadHandler(ctx *gin.Context) {
 
 	// Limit the multipart reader memory to the cap so a malicious payload is
 	// rejected at the parse boundary instead of exhausting memory.
-	ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, maxFileUploadSize)
+	ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, maxRequestSize)
 	reader, err := ctx.Request.MultipartReader()
 	if err != nil {
 		log.GetLogger().Warnf("file upload multipart read failed instance %s: %v", instanceID, err)
@@ -1218,29 +1324,23 @@ func FileUploadHandler(ctx *gin.Context) {
 				})
 				return
 			}
-			// Wrap the part so cumulative size is checked against the cap while
-			// bytes are streamed straight to the owning proxy.
+			// Keep the public multipart parsing in Frontend. The Executor receives
+			// only raw bytes and owns the actual filesystem operation.
 			countingReader := &countingReader{reader: part}
-			resp, uploadErr := uploadInstanceFile(ctx, instanceID, targetPath, countingReader, tenantID, fileMode)
-			if uploadErr != nil {
+			query := url.Values{"path": []string{targetPath}}
+			if fileMode != "" {
+				query.Set("mode", fileMode)
+			}
+			headers := http.Header{"Content-Type": []string{"application/octet-stream"}}
+			request := agentExecutorHTTPRequest{
+				method: http.MethodPut, path: "/v1/files/upload", query: query,
+				body: countingReader, contentLength: -1, headers: headers,
+			}
+			if uploadErr := forwardAgentExecutorHTTP(ctx, instanceID, tenantID, request); uploadErr != nil {
 				log.GetLogger().Errorf("file upload failed instance %s path %s: %v",
 					instanceID, targetPath, uploadErr)
 				writeFileTransferError(ctx, uploadErr)
-				return
 			}
-			if resp != nil {
-				ctx.JSON(http.StatusOK, gin.H{
-					"success": true,
-					"path":    resp.GetPath(),
-					"size":    resp.GetSize(),
-				})
-				return
-			}
-			ctx.JSON(http.StatusOK, gin.H{
-				"success": true,
-				"path":    targetPath,
-				"size":    countingReader.count,
-			})
 			return
 		default:
 			// Skip unknown parts; only path and file are consumed.
@@ -1290,22 +1390,6 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// uploadInstanceFile resolves the file transfer client and dispatches the
-// upload. It centralizes the client resolution so the handler stays focused
-// on HTTP concerns.
-func uploadInstanceFile(ctx *gin.Context, instanceID, path string,
-	reader io.Reader, tenantID string, fileMode string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	if path == "" {
-		return nil, fmt.Errorf("path is required")
-	}
-	transferClient, err := fileTransferClient()
-	if err != nil {
-		return nil, err
-	}
-	return transferClient.UploadFile(ctx.Request.Context(), instanceID, path, reader, tenantID, fileMode)
-}
-
 // FileListHandler handles GET /api/agent/:instanceId/files/list.
 // It returns a JSON array of files and directories at the given path
 // inside the instance's filesystem.
@@ -1327,11 +1411,6 @@ func FileListHandler(ctx *gin.Context) {
 		})
 		return
 	}
-	recursive := ctx.Query("recursive") == "true"
-	maxDepth, err := strconv.Atoi(ctx.Query("max_depth"))
-	if err != nil || maxDepth < 0 {
-		maxDepth = 0
-	}
 	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
 		log.GetLogger().Warnf("file list instance not found %s: %v", instanceID, err)
 		ctx.JSON(http.StatusNotFound, gin.H{
@@ -1340,67 +1419,45 @@ func FileListHandler(ctx *gin.Context) {
 		})
 		return
 	}
-	transferClient, err := fileTransferClient()
-	if err != nil {
-		log.GetLogger().Errorf("file list client unavailable instance %s: %v", instanceID, err)
-		ctx.JSON(http.StatusServiceUnavailable, gin.H{
-			"code":    http.StatusServiceUnavailable,
-			"message": err.Error(),
-		})
-		return
+	query := url.Values{"path": []string{targetPath}}
+	if recursive := ctx.Query("recursive"); recursive != "" {
+		query.Set("recursive", recursive)
 	}
-	resp, err := transferClient.ListFile(ctx.Request.Context(), instanceID, targetPath, recursive, maxDepth, tenantID)
-	if err != nil {
+	if rawMaxDepth := ctx.Query("max_depth"); rawMaxDepth != "" {
+		maxDepth, err := strconv.Atoi(rawMaxDepth)
+		if err != nil || maxDepth < 0 {
+			ctx.JSON(http.StatusBadRequest, gin.H{
+				"code":    http.StatusBadRequest,
+				"message": "max_depth must be a non-negative integer",
+			})
+			return
+		}
+		query.Set("max_depth", strconv.Itoa(maxDepth))
+	}
+	request := agentExecutorHTTPRequest{
+		method: http.MethodGet, path: "/v1/files/list", query: query,
+		headers: http.Header{"Accept": []string{"application/json"}},
+	}
+	if err := forwardAgentExecutorHTTP(ctx, instanceID, tenantID, request); err != nil {
 		writeFileTransferError(ctx, err)
-		return
 	}
-	if resp == nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{
-			"code":    http.StatusInternalServerError,
-			"message": "file list response is nil",
-		})
-		return
-	}
-	if resp.GetStatus().GetCode() != common.ErrorCode_ERR_NONE {
-		writeFileTransferError(ctx, fmt.Errorf("list failed: %s", resp.GetStatus().GetMessage()))
-		return
-	}
-	ctx.Header("Content-Type", "application/json")
-	ctx.String(http.StatusOK, resp.GetItemsJson())
 }
 
 // writeFileTransferError maps a file transfer error to the most appropriate
-// HTTP status. Business/instance-not-found errors map to 404, path-not-found
-// errors map to 404, size overflow to 413, invalid input to 400, everything
-// else to 500.
+// HTTP status. Executor HTTP statuses are forwarded directly; errors reaching
+// this helper are local streaming failures, where size overflow maps to 413
+// and everything else maps to 500.
 func writeFileTransferError(ctx *gin.Context, err error) {
 	if err == nil {
 		return
 	}
-	if isFileNotFoundError(err) {
-		ctx.JSON(http.StatusNotFound, gin.H{
-			"code":    http.StatusNotFound,
-			"message": err.Error(),
-		})
-		return
-	}
-	if strings.Contains(err.Error(), "path not found") || strings.Contains(err.Error(), "No such file or directory") {
-		ctx.JSON(http.StatusNotFound, gin.H{
-			"code":    http.StatusNotFound,
-			"message": err.Error(),
-		})
+	if ctx.Writer.Written() {
+		log.GetLogger().Warnf("file transfer failed after response started: %v", err)
 		return
 	}
 	if strings.Contains(err.Error(), "exceeds max") {
 		ctx.JSON(http.StatusRequestEntityTooLarge, gin.H{
 			"code":    http.StatusRequestEntityTooLarge,
-			"message": err.Error(),
-		})
-		return
-	}
-	if strings.Contains(err.Error(), "is required") {
-		ctx.JSON(http.StatusBadRequest, gin.H{
-			"code":    http.StatusBadRequest,
 			"message": err.Error(),
 		})
 		return
@@ -1412,9 +1469,8 @@ func writeFileTransferError(ctx *gin.Context, err error) {
 }
 
 // FileDownloadHandler handles GET /api/agent/:instanceId/files/download.
-// It streams the file from the owning proxy to the HTTP response, honoring the
-// Range header for partial downloads. The file is never buffered in memory in
-// full; each gRPC chunk is flushed to the response writer.
+// It forwards the request through the existing TCP tunnel. The Executor owns
+// Range handling and streams the HTTP response directly back through Frontend.
 func FileDownloadHandler(ctx *gin.Context) {
 	instanceID := ctx.Param("instanceId")
 	if instanceID == "" {
@@ -1445,138 +1501,109 @@ func FileDownloadHandler(ctx *gin.Context) {
 		return
 	}
 
-	// Parse the Range header for byte-offset downloads. Only a single byte
-	// range of the form "bytes=<start>-" is supported, mirroring the proxy's
-	// offset-based download contract.
-	var offset int64
-	hasRange := false
+	headers := http.Header{}
 	if rangeHeader := ctx.GetHeader("Range"); rangeHeader != "" {
-		if parsed, ok := parseSingleRange(rangeHeader); ok {
-			offset = parsed
-			hasRange = true
-		} else {
-			ctx.Header("Content-Range", "bytes=*/0")
-			ctx.JSON(http.StatusRequestedRangeNotSatisfiable, gin.H{
-				"code":    http.StatusRequestedRangeNotSatisfiable,
-				"message": "unsupported range request",
-			})
-			return
-		}
+		headers.Set("Range", rangeHeader)
 	}
-
-	transferClient, err := fileTransferClient()
-	if err != nil {
-		log.GetLogger().Errorf("file download client unavailable instance %s: %v", instanceID, err)
-		ctx.JSON(http.StatusServiceUnavailable, gin.H{
-			"code":    http.StatusServiceUnavailable,
-			"message": err.Error(),
-		})
-		return
+	query := url.Values{"path": []string{targetPath}}
+	request := agentExecutorHTTPRequest{
+		method: http.MethodGet, path: "/v1/files/download", query: query, headers: headers,
 	}
-
-	stream, err := transferClient.DownloadFile(ctx.Request.Context(), instanceID, targetPath, offset, tenantID)
-	if err != nil {
-		log.GetLogger().Errorf("file download open stream failed instance %s path %s: %v",
-			instanceID, targetPath, err)
+	if err := forwardAgentExecutorHTTP(ctx, instanceID, tenantID, request); err != nil {
 		writeFileTransferError(ctx, err)
-		return
-	}
-	// Server-streaming clients (grpc.ServerStreamingClient) have no Close
-	// method; the underlying connection is managed by the pooled gRPC client.
-	// Reading until io.EOF signals the end of the stream.
-
-	// Set response headers before the first byte is written. Once Write is
-	// called the status defaults to 200, so for Range requests we emit the
-	// 206 status up front; the proxy does not pre-declare total size, so the
-	// Content-Range uses the unknown-length form "bytes <start>-*".
-	ctx.Writer.Header().Set("Content-Type", "application/octet-stream")
-	ctx.Writer.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`,
-		filepath.Base(targetPath)))
-	ctx.Writer.Header().Set("Accept-Ranges", "bytes")
-	if hasRange {
-		ctx.Writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-*/*", offset))
-		ctx.Writer.WriteHeader(http.StatusPartialContent)
-	}
-
-	// Stream each FileChunk directly to the response writer, flushing after
-	// every chunk so large files do not accumulate in memory or buffers.
-	var bytesWritten int64
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			if bytesWritten == 0 && !hasRange {
-				// No bytes have been written to the client yet; we can still
-				// return a clean status code. A not-found error from the proxy
-				// before any data was sent maps to 404.
-				writeFileTransferError(ctx, err)
-				return
-			}
-			// The response is already committed (status/headers sent). Log and
-			// abort the connection rather than sending a misleading status.
-			log.GetLogger().Errorf("file download stream interrupted instance %s path %s after %d bytes: %v",
-				instanceID, targetPath, bytesWritten, err)
-			return
-		}
-		if chunk == nil {
-			continue
-		}
-		data := chunk.GetData()
-		if len(data) == 0 {
-			continue
-		}
-		n, err := ctx.Writer.Write(data)
-		bytesWritten += int64(n)
-		if err != nil {
-			log.GetLogger().Warnf("file download client write failed instance %s path %s: %v",
-				instanceID, targetPath, err)
-			return
-		}
-		ctx.Writer.Flush()
-	}
-
-	// If nothing was streamed at all and the status is still uncommitted, the
-	// path did not exist on the proxy but the stream opened and closed cleanly
-	// (Recv returned EOF immediately). Surface that as 404 so clients can
-	// distinguish empty/missing files. For ranged requests the 206 status was
-	// already committed before streaming, so we cannot rewrite it to 404.
-	if bytesWritten == 0 && !hasRange {
-		ctx.JSON(http.StatusNotFound, gin.H{
-			"code":    http.StatusNotFound,
-			"message": fmt.Sprintf("file %s not found in instance %s", targetPath, instanceID),
-		})
-		return
 	}
 }
 
-// parseSingleRange parses a Range header of the form "bytes=<start>-" and
-// returns the start offset. Only single-range open-ended requests are
-// supported because the underlying proxy download is offset-based.
-func parseSingleRange(rangeHeader string) (int64, bool) {
-	const (
-		prefix       = "bytes="
-		decimalBase  = 10
-		int64BitSize = 64
-	)
-	trimmed := strings.ToLower(strings.TrimSpace(rangeHeader))
-	if !strings.HasPrefix(trimmed, prefix) {
-		return 0, false
+// forwardAgentExecutorHTTP adapts the public Agent file API to the Executor's
+// internal HTTP API while reusing the same authenticated TCP tunnel as SSH,
+// WebSocket, and generic HTTP passthrough.
+func forwardAgentExecutorHTTP(ctx *gin.Context, instanceID, tenantID string,
+	executorRequest agentExecutorHTTPRequest) error {
+	tunnelRequest := ctx.Request.Clone(ctx.Request.Context())
+	tunnelURL := *ctx.Request.URL
+	tunnelRequest.URL = &tunnelURL
+	routeQuery := tunnelRequest.URL.Query()
+	routeQuery.Set("instance", instanceID)
+	routeQuery.Set("port", strconv.Itoa(agentExecutorHTTPPort))
+	if routeQuery.Get("tenant_id") == "" {
+		routeQuery.Set("tenant_id", tenantID)
 	}
-	rest := strings.TrimSpace(trimmed[len(prefix):])
-	dash := strings.Index(rest, "-")
-	if dash < 0 {
-		return 0, false
+	tunnelRequest.URL.RawQuery = routeQuery.Encode()
+	tunnel, ok := dialAgentSandboxTunnel(ctx.Writer, tunnelRequest)
+	if !ok {
+		return nil
 	}
-	startStr := strings.TrimSpace(rest[:dash])
-	if startStr == "" {
-		// Suffix range "bytes=-N" is not supported by the offset-only proxy.
-		return 0, false
+	defer tunnel.Close()
+
+	targetURL := "http://agent-executor" + executorRequest.path
+	if encoded := executorRequest.query.Encode(); encoded != "" {
+		targetURL += "?" + encoded
 	}
-	start, err := strconv.ParseInt(startStr, decimalBase, int64BitSize)
-	if err != nil || start < 0 {
-		return 0, false
+	request, err := http.NewRequestWithContext(
+		ctx.Request.Context(), executorRequest.method, targetURL, executorRequest.body)
+	if err != nil {
+		return fmt.Errorf("build executor request: %w", err)
 	}
-	return start, true
+	request.ContentLength = executorRequest.contentLength
+	request.Header = executorRequest.headers.Clone()
+	if traceID := ctx.GetHeader("X-Trace-ID"); traceID != "" {
+		request.Header.Set("X-Trace-ID", traceID)
+	}
+	if err := request.Write(tunnel); err != nil {
+		return fmt.Errorf("write executor request: %w", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(tunnel), request)
+	if err != nil {
+		return fmt.Errorf("read executor response: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= http.StatusBadRequest {
+		return writeAgentExecutorErrorResponse(ctx, response)
+	}
+	copyResponseHeaders(ctx.Writer.Header(), response.Header)
+	ctx.Status(response.StatusCode)
+	if _, err := io.Copy(ctx.Writer, response.Body); err != nil {
+		return fmt.Errorf("stream executor response: %w", err)
+	}
+	return nil
+}
+
+// writeAgentExecutorErrorResponse preserves the public Agent file API error
+// envelope while keeping the Executor HTTP API internal. Executor errors use a
+// small {"message":"..."} body; Frontend adds the HTTP status as "code", as
+// the previous file-transfer implementation did.
+func writeAgentExecutorErrorResponse(ctx *gin.Context, response *http.Response) error {
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		return fmt.Errorf("read executor error response: %w", err)
+	}
+	var executorError struct {
+		Message string `json:"message"`
+	}
+	message := ""
+	if err := json.Unmarshal(data, &executorError); err == nil {
+		message = strings.TrimSpace(executorError.Message)
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(data))
+	}
+	if message == "" {
+		message = http.StatusText(response.StatusCode)
+	}
+	copyResponseHeaders(ctx.Writer.Header(), response.Header)
+	ctx.Writer.Header().Del("Content-Length")
+	ctx.Writer.Header().Del("Content-Type")
+	ctx.JSON(response.StatusCode, gin.H{
+		"code":    response.StatusCode,
+		"message": message,
+	})
+	return nil
+}
+
+func copyResponseHeaders(destination, source http.Header) {
+	for key, values := range source {
+		for _, value := range values {
+			destination.Add(key, value)
+		}
+	}
 }

@@ -42,7 +42,6 @@ import (
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/grpc/pb/common"
 	"frontend/pkg/common/faas_common/grpc/pb/core"
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/grpc/pb/runtime"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/job"
@@ -152,24 +151,6 @@ func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
 	return r.runtime.Kill(req.InstanceID, req.Signal, req.Payload, req.AdaptedInvokeOptions())
 }
 
-func (r *directRuntimeStub) UploadFile(ctx context.Context, instanceID, path string, reader io.Reader,
-	tenantID string, permissions string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	return r.runtime.UploadFile(ctx, instanceID, path, reader, tenantID, permissions)
-}
-
-func (r *directRuntimeStub) DownloadFile(ctx context.Context, instanceID, path string, offset int64,
-	tenantID string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	return r.runtime.DownloadFile(ctx, instanceID, path, offset, tenantID)
-}
-
-func (r *directRuntimeStub) ListFile(ctx context.Context, instanceID, path string,
-	recursive bool, maxDepth int, tenantID string,
-) (*frontend_proxy.FileListResponse, error) {
-	return r.runtime.ListFile(ctx, instanceID, path, recursive, maxDepth, tenantID)
-}
-
 func (r *runtimeStub) Invoke(util.InvokeRequest) ([]byte, error) {
 	return nil, nil
 }
@@ -268,24 +249,6 @@ func (r *runtimeStub) CreateInstanceRawContext(
 		return nil, err
 	}
 	return r.createInstanceRawContext(ctx, &createReq, option)
-}
-
-func (r *runtimeStub) UploadFile(
-	context.Context, string, string, io.Reader, string, string,
-) (*frontend_proxy.FileTransferResponse, error) {
-	return nil, nil
-}
-
-func (r *runtimeStub) DownloadFile(
-	context.Context, string, string, int64, string,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	return nil, nil
-}
-
-func (r *runtimeStub) ListFile(
-	context.Context, string, string, bool, int, string,
-) (*frontend_proxy.FileListResponse, error) {
-	return nil, nil
 }
 
 func invokeOptionsFromRawCreate(createReq *core.CreateRequest) api.InvokeOptions {

@@ -194,24 +194,6 @@ func (f *fakeFrontendProxyServiceClient) KillInstance(ctx context.Context, in *f
 	return f.killResp, f.err
 }
 
-func (f *fakeFrontendProxyServiceClient) UploadFile(_ context.Context,
-	_ ...grpc.CallOption,
-) (frontend_proxy.FrontendProxyService_UploadFileClient, error) {
-	return nil, f.err
-}
-
-func (f *fakeFrontendProxyServiceClient) DownloadFile(_ context.Context,
-	_ *frontend_proxy.FileTransferRequest, _ ...grpc.CallOption,
-) (frontend_proxy.FrontendProxyService_DownloadFileClient, error) {
-	return nil, f.err
-}
-
-func (f *fakeFrontendProxyServiceClient) ListFile(_ context.Context,
-	_ *frontend_proxy.FileListRequest, _ ...grpc.CallOption,
-) (*frontend_proxy.FileListResponse, error) {
-	return nil, f.err
-}
-
 func createResponseWithUnknownReadyCallResult(
 	t *testing.T,
 	callResult *core.CallResult,
@@ -772,7 +754,8 @@ func TestGRPCFrontendProxyLifecycleClientBuildsCreateRequestAndReturnsInstanceID
 	require.Equal(t, common.Arg_VALUE, fakeService.createReq.Create.Args[0].Type)
 	require.NotEmpty(t, fakeService.createReq.Create.Args[0].Value)
 	require.Equal(t, common.Arg_VALUE, fakeService.createReq.Create.Args[1].Type)
-	require.Equal(t, []byte("create-arg"), fakeService.createReq.Create.Args[1].Value)
+	require.Equal(t, []byte(simpleRuntimeFaaSMetaPrefix+"create-arg"),
+		fakeService.createReq.Create.Args[1].Value)
 	require.Equal(t, []string{"nested-1"}, fakeService.createReq.Create.Args[1].NestedRefs)
 	require.Equal(t, "value-a", fakeService.createReq.Create.CreateOptions["custom-a"])
 	require.Equal(t, "value-b", fakeService.createReq.Create.CreateOptions["create-a"])
@@ -842,6 +825,58 @@ func TestGRPCFrontendProxyLifecycleClientBuildsCreateRequestUsesRequestTenantWhe
 	require.NoError(t, err)
 	require.NotNil(t, fakeService.createReq)
 	require.Equal(t, "tenant-from-runtime", fakeService.createReq.Context.TenantID)
+}
+
+func TestConvertSimpleRuntimeCreateArgsPreservesFaaSCodePathsAndValuePrefix(t *testing.T) {
+	codePaths := []string{
+		"yr.agentexecutor.handler.initialize",
+		"yr.agentexecutor.handler.handle",
+		"yr.agentexecutor.handler.pre_stop",
+	}
+	converted := convertSimpleRuntimeCreateArgs(
+		api.FunctionMeta{FuncID: "default/executor/$latest", Api: api.FaaSApi},
+		[]api.Arg{{Type: api.Value, Data: []byte(`{"handler":"executor"}`)}},
+		codePaths,
+	)
+
+	require.Len(t, converted, 2)
+	require.Equal(t, []byte(simpleRuntimeFaaSMetaPrefix+`{"handler":"executor"}`), converted[1].GetValue())
+
+	metadata := converted[0].GetValue()
+	var config []byte
+	for len(metadata) > 0 {
+		number, wireType, tagSize := protowire.ConsumeTag(metadata)
+		require.Greater(t, tagSize, 0)
+		metadata = metadata[tagSize:]
+		if number == metaDataConfigField {
+			var valueSize int
+			config, valueSize = protowire.ConsumeBytes(metadata)
+			require.GreaterOrEqual(t, valueSize, 0)
+			break
+		}
+		fieldSize := protowire.ConsumeFieldValue(number, wireType, metadata)
+		require.GreaterOrEqual(t, fieldSize, 0)
+		metadata = metadata[fieldSize:]
+	}
+	require.NotEmpty(t, config)
+
+	actualCodePaths := make([]string, 0, len(codePaths))
+	for len(config) > 0 {
+		number, wireType, tagSize := protowire.ConsumeTag(config)
+		require.Greater(t, tagSize, 0)
+		config = config[tagSize:]
+		if number == metaConfigCodePathsField {
+			value, valueSize := protowire.ConsumeBytes(config)
+			require.GreaterOrEqual(t, valueSize, 0)
+			actualCodePaths = append(actualCodePaths, string(value))
+			config = config[valueSize:]
+			continue
+		}
+		fieldSize := protowire.ConsumeFieldValue(number, wireType, config)
+		require.GreaterOrEqual(t, fieldSize, 0)
+		config = config[fieldSize:]
+	}
+	require.Equal(t, codePaths, actualCodePaths)
 }
 
 func TestGRPCFrontendProxyLifecycleClientCreateInstanceRawReturnsReadyNotify(t *testing.T) {

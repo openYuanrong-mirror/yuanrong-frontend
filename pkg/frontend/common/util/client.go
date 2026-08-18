@@ -18,13 +18,10 @@
 package util
 
 import (
-	"context"
 	"fmt"
-	"io"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
-	"frontend/pkg/common/faas_common/grpc/pb/frontend_proxy"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/common/faas_common/utils"
@@ -348,21 +345,4 @@ func (c *defaultClient) IsHealth() bool {
 
 func (c *defaultClient) IsDsHealth() bool {
 	return c.clientLibruntime.IsDsHealth()
-}
-
-// FileTransferClient streams files through an instance's owning proxy.
-type FileTransferClient interface {
-	// UploadFile streams reader to the owning proxy of instanceID. The proxy
-	// writes the bytes to path inside the instance's filesystem sandbox.
-	UploadFile(ctx context.Context, instanceID string, path string,
-		reader io.Reader, tenantID string, permissions string) (*frontend_proxy.FileTransferResponse, error)
-	// DownloadFile opens a server-streaming download for path at offset.
-	// The returned stream yields FileChunk messages; the caller reads until
-	// io.EOF and must close the stream when finished.
-	DownloadFile(ctx context.Context, instanceID string, path string,
-		offset int64, tenantID string) (frontend_proxy.FrontendProxyService_DownloadFileClient, error)
-	// ListFile lists files and directories at path inside the instance's
-	// filesystem. The returned items_json is a JSON array string.
-	ListFile(ctx context.Context, instanceID string, path string,
-		recursive bool, maxDepth int, tenantID string) (*frontend_proxy.FileListResponse, error)
 }

@@ -97,7 +97,7 @@ func dialSandboxTunnel(w http.ResponseWriter, r *http.Request) (tunnelContext, b
 
 // DialSandboxTunnel is the exported entry point for sibling packages (e.g.
 // httpproxy) that need the same authenticated, resolved, authorized tunnel to
-// the in-sandbox AgentServer but drive the post-dial protocol themselves.
+// an in-sandbox TCP target but drive the post-dial protocol themselves.
 // It runs the full dialSandboxTunnel pipeline (authenticate -> resolve ->
 // authorize -> dialTunnel), writing a clean 4xx/502 on any failure exactly
 // like the WS path, and returns the established net.Conn on success. The caller
