@@ -66,8 +66,9 @@ const (
 	agentExecutorInitEntry      = "yr.agentexecutor.handler.initialize"
 	agentExecutorCallEntry      = "yr.agentexecutor.handler.handle"
 	agentExecutorPreStopEntry   = "yr.agentexecutor.handler.pre_stop"
-	// Keep this port aligned with DEFAULT_EXECUTOR_PORT in yuanrong-agentruntime's
-	// agentexecutor runtime.
+	// Keep this container-internal tunnel target aligned with DEFAULT_EXECUTOR_PORT
+	// in yuanrong-agentruntime's agentexecutor runtime. It must not be added to
+	// rootfs portForwardings: the owner proxy reaches it through containerIP:port.
 	agentExecutorHTTPPort = 18093
 )
 
@@ -403,7 +404,6 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest,
 	}
 	if config.platformExecutor {
 		applyAgentExecutorCode(&invokeOpts)
-		ensureAgentExecutorPort(&invokeOpts)
 	} else {
 		applyAgentCodePaths(&invokeOpts, config.spec)
 	}
@@ -668,34 +668,6 @@ func applyAgentPorts(invokeOpts *api.InvokeOptions, ports []string) {
 		return
 	}
 	invokeOpts.CreateOpt["network"] = string(networkJSON)
-}
-
-// ensureAgentExecutorPort adds the platform-reserved HTTP port without dropping user ports.
-func ensureAgentExecutorPort(invokeOpts *api.InvokeOptions) {
-	var network struct {
-		PortForwardings []map[string]interface{} `json:"portForwardings"`
-	}
-	if raw := invokeOpts.CreateOpt["network"]; raw != "" {
-		if err := json.Unmarshal([]byte(raw), &network); err != nil {
-			log.GetLogger().Warnf("failed to unmarshal agent network while adding executor port: %v", err)
-			network.PortForwardings = nil
-		}
-	}
-	for _, forwarding := range network.PortForwardings {
-		port, portOK := forwarding["port"].(float64)
-		protocol, _ := forwarding["protocol"].(string)
-		if portOK && int(port) == agentExecutorHTTPPort && strings.EqualFold(protocol, "TCP") {
-			return
-		}
-	}
-	network.PortForwardings = append(network.PortForwardings,
-		map[string]interface{}{"port": agentExecutorHTTPPort, "protocol": "TCP"})
-	data, err := json.Marshal(network)
-	if err != nil {
-		log.GetLogger().Warnf("failed to marshal agent executor port forwarding: %v", err)
-		return
-	}
-	invokeOpts.CreateOpt["network"] = string(data)
 }
 
 // mergeAgentStaticEnv merges the function's static environment (funcSpec.EnvMetaData.Environment,

@@ -983,7 +983,7 @@ func TestCreateHandlerInlineBuildsFuncMeta(t *testing.T) {
 		`{"mounts":[{"source":"/home/snuser/workspaceA","target":"/home/agentos","readonly":false}],
 		  "type":"image","imageurl":"yr-docker-runtime:v0"}`,
 		capturedInvokeOpt.CreateOpt["rootfs"])
-	require.JSONEq(t, `{"portForwardings":[{"port":22,"protocol":"TCP"},{"port":18093,"protocol":"TCP"}]}`,
+	require.JSONEq(t, `{"portForwardings":[{"port":22,"protocol":"TCP"}]}`,
 		capturedInvokeOpt.CreateOpt["network"])
 }
 
