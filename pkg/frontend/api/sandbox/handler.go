@@ -106,6 +106,7 @@ const (
 	sandboxStorageResourceName     = "storage"
 	sandboxStorageLimitExtension   = "STORAGE_LIMIT"
 	bytesPerMiB                    = 1024 * 1024
+	decimalRadix                   = 10
 )
 
 var selectSandboxSchedulerID = func(funcKey string) (string, error) {
@@ -1490,7 +1491,7 @@ func fillSandboxCustomExtensions(
 	if req.StorageLimit > 0 {
 		invokeOpts.CustomExtensions[sandboxStorageLimitExtension] = strconv.FormatInt(
 			req.StorageLimit*bytesPerMiB,
-			10,
+			decimalRadix,
 		)
 	}
 	if rootfs != "" {

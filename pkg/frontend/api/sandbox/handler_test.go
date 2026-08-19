@@ -1505,7 +1505,7 @@ func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 	)
 	require.Equal(
 		t,
-		strconv.FormatInt(storageLimit*bytesPerMiB, 10),
+		strconv.FormatInt(storageLimit*bytesPerMiB, decimalRadix),
 		capturedCreateReq.GetSchedulingOps().GetExtension()[sandboxStorageLimitExtension],
 	)
 	var resourceSpec resspeckey.ResourceSpecification
@@ -1558,7 +1558,7 @@ func TestCreateV1HandlerUsesStandaloneStorageLimitAsReservation(t *testing.T) {
 	)
 	require.Equal(
 		t,
-		strconv.FormatInt(storageLimit*bytesPerMiB, 10),
+		strconv.FormatInt(storageLimit*bytesPerMiB, decimalRadix),
 		capturedCreateReq.GetSchedulingOps().GetExtension()[sandboxStorageLimitExtension],
 	)
 }

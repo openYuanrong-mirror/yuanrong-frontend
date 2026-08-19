@@ -300,8 +300,10 @@ const validAgentURN = "urn:sn:default:agentTenant:sign:agentFunc:1"
 const (
 	// testAgentCPU/testAgentMemory are the resource values stubbed into funcMeta and asserted
 	// in resource-sinking tests (registered mode sinks them from funcMeta.ResourceMetaData).
-	testAgentCPU    = 600
-	testAgentMemory = 512
+	testAgentCPU          = 600
+	testAgentMemory       = 512
+	testAgentStorageMiB   = 200
+	testAgentStorageLimit = 300
 )
 
 // newAgentCreateRecorder builds a gin test context with a JSON CreateAgentRequest body.
@@ -1217,8 +1219,11 @@ func sampleAgentSummaries() []execendpoint.Summary {
 			SandboxType: "docker",
 			StartTime:   "2026-07-30T03:00:00Z",
 			Resources: map[string]execendpoint.Resource{
-				"CPU":                    newScalarResource(600, 1000),
-				agentStorageResourceName: newScalarResource(200*agentStorageBytesPerMiB, 300*agentStorageBytesPerMiB),
+				"CPU": newScalarResource(600, 1000),
+				agentStorageResourceName: newScalarResource(
+					testAgentStorageMiB*agentStorageBytesPerMiB,
+					testAgentStorageLimit*agentStorageBytesPerMiB,
+				),
 			},
 			CreateOptions: map[string]string{
 				"sandbox_type":     "docker",
@@ -1350,8 +1355,8 @@ func TestFlattenResourcesConvertsStorageBytesToMiB(t *testing.T) {
 	cpu := execendpoint.Resource{}
 	cpu.Scalar.Value = 600
 	storage := execendpoint.Resource{}
-	storage.Scalar.Value = 200 * agentStorageBytesPerMiB
-	storage.Scalar.Limit = 300 * agentStorageBytesPerMiB
+	storage.Scalar.Value = testAgentStorageMiB * agentStorageBytesPerMiB
+	storage.Scalar.Limit = testAgentStorageLimit * agentStorageBytesPerMiB
 
 	resources := flattenResources(map[string]execendpoint.Resource{
 		"CPU":                    cpu,
