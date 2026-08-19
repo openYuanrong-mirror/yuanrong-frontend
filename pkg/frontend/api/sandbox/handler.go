@@ -104,6 +104,7 @@ const (
 	sandboxRawRequestSequence      = "00"
 	sandboxXPUFieldCount           = 3
 	sandboxStorageResourceName     = "storage"
+	sandboxStorageLimitExtension   = "STORAGE_LIMIT"
 	bytesPerMiB                    = 1024 * 1024
 )
 
@@ -148,16 +149,17 @@ type CreateRequest struct {
 	// It is deliberately not part of the public SDK request contract.
 	portRouteKinds map[int]string
 	// Resource and runtime extras (honored by v1 create; 0/nil = use default).
-	Cpu         int                      `json:"cpu"`
-	Memory      int                      `json:"memory"`
-	CpuLimit    int                      `json:"cpu_limit"`
-	MemLimit    int                      `json:"mem_limit"`
-	Env         map[string]string        `json:"env"`
-	Mounts      []map[string]interface{} `json:"mounts"`
-	ExtraConfig map[string]interface{}   `json:"extra_config"`
-	XPU         string                   `json:"xpu"`
-	StorageMb   *int64                   `json:"storageMb,omitempty"`
-	Network     *SandboxNetworkPolicy    `json:"network,omitempty"`
+	Cpu          int                      `json:"cpu"`
+	Memory       int                      `json:"memory"`
+	CpuLimit     int                      `json:"cpu_limit"`
+	MemLimit     int                      `json:"mem_limit"`
+	Env          map[string]string        `json:"env"`
+	Mounts       []map[string]interface{} `json:"mounts"`
+	ExtraConfig  map[string]interface{}   `json:"extra_config"`
+	XPU          string                   `json:"xpu"`
+	StorageMb    *int64                   `json:"storageMb,omitempty"`
+	StorageLimit int64                    `json:"storage_limit"`
+	Network      *SandboxNetworkPolicy    `json:"network,omitempty"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -219,6 +221,7 @@ type CreateV1Request struct {
 	ExtraConfig            map[string]interface{}   `json:"extra_config"`
 	XPU                    string                   `json:"xpu"`
 	StorageMb              *int64                   `json:"storageMb,omitempty"`
+	StorageLimit           int64                    `json:"storage_limit"`
 	ScheduleAffinities     []api.Affinity           `json:"scheduleAffinities,omitempty"`
 	Tunnel                 TunnelSpec               `json:"tunnel,omitempty"`
 	Network                *SandboxNetworkPolicy    `json:"network,omitempty"`
@@ -557,7 +560,7 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if xpu != nil {
 		req.XPU = xpu.normalized
 	}
-	if err := validateSandboxStorageMb(req.StorageMb); err != nil {
+	if err := validateSandboxStorage(req.StorageMb, req.StorageLimit); err != nil {
 		return "", nil, err
 	}
 	rootfs, err := buildRootfsOption(req.Rootfs, req.Image)
@@ -611,7 +614,13 @@ func parseSandboxXPU(value string) (*sandboxXPURequest, error) {
 	}, nil
 }
 
-func validateSandboxStorageMb(storageMb *int64) error {
+func validateSandboxStorage(storageMb *int64, storageLimit int64) error {
+	if storageLimit < 0 {
+		return fmt.Errorf("storage_limit must be 0 or a positive integer")
+	}
+	if storageLimit > math.MaxInt64/bytesPerMiB {
+		return fmt.Errorf("storage_limit is too large")
+	}
 	if storageMb == nil {
 		return nil
 	}
@@ -620,6 +629,9 @@ func validateSandboxStorageMb(storageMb *int64) error {
 	}
 	if *storageMb > math.MaxInt64/bytesPerMiB {
 		return fmt.Errorf("storageMb is too large")
+	}
+	if storageLimit > 0 && storageLimit < *storageMb {
+		return fmt.Errorf("storage_limit must be greater than or equal to storageMb")
 	}
 	return nil
 }
@@ -748,6 +760,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		ExtraConfig:            req.ExtraConfig,
 		XPU:                    req.XPU,
 		StorageMb:              req.StorageMb,
+		StorageLimit:           req.StorageLimit,
 		Network:                req.Network,
 		ScheduleAffinities:     req.ScheduleAffinities,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
@@ -1394,7 +1407,7 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions,
 	if err != nil {
 		return api.InvokeOptions{}, err
 	}
-	if err := validateSandboxStorageMb(req.createReq.StorageMb); err != nil {
+	if err := validateSandboxStorage(req.createReq.StorageMb, req.createReq.StorageLimit); err != nil {
 		return api.InvokeOptions{}, err
 	}
 	createTimeoutSeconds, scheduleTimeoutSeconds, err := resolveSandboxCreateTimeouts(
@@ -1418,7 +1431,7 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions,
 			"Concurrency": sandboxConcurrency,
 		},
 	}
-	if xpu != nil || req.createReq.StorageMb != nil {
+	if xpu != nil || req.createReq.StorageMb != nil || req.createReq.StorageLimit > 0 {
 		invokeOpts.CustomResources = make(map[string]float64, 2)
 	}
 	if xpu != nil {
@@ -1427,6 +1440,10 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions,
 	if req.createReq.StorageMb != nil {
 		invokeOpts.CustomResources[sandboxStorageResourceName] =
 			float64(*req.createReq.StorageMb) * bytesPerMiB
+	} else if req.createReq.StorageLimit > 0 {
+		// A standalone limit also reserves that capacity from the scheduler.
+		invokeOpts.CustomResources[sandboxStorageResourceName] =
+			float64(req.createReq.StorageLimit) * bytesPerMiB
 	}
 	fillSandboxCustomExtensions(
 		&invokeOpts,
@@ -1469,6 +1486,12 @@ func fillSandboxCustomExtensions(
 	}
 	if req.MemLimit > 0 {
 		invokeOpts.CustomExtensions["Memory_LIMIT"] = strconv.Itoa(req.MemLimit)
+	}
+	if req.StorageLimit > 0 {
+		invokeOpts.CustomExtensions[sandboxStorageLimitExtension] = strconv.FormatInt(
+			req.StorageLimit*bytesPerMiB,
+			10,
+		)
 	}
 	if rootfs != "" {
 		invokeOpts.CustomExtensions["rootfs"] = rootfs
