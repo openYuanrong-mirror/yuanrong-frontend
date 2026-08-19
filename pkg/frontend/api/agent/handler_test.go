@@ -1198,6 +1198,13 @@ func newAgentGetRecorder(t *testing.T, method, target string) (*httptest.Respons
 	return recorder, ctx
 }
 
+func newScalarResource(value, limit float64) execendpoint.Resource {
+	resource := execendpoint.Resource{}
+	resource.Scalar.Value = value
+	resource.Scalar.Limit = limit
+	return resource
+}
+
 // sampleAgentSummaries builds two canned summaries (docker + supervisor) for List/Get tests.
 func sampleAgentSummaries() []execendpoint.Summary {
 	return []execendpoint.Summary{
@@ -1209,6 +1216,10 @@ func sampleAgentSummaries() []execendpoint.Summary {
 			ContainerIP: "172.17.0.5",
 			SandboxType: "docker",
 			StartTime:   "2026-07-30T03:00:00Z",
+			Resources: map[string]execendpoint.Resource{
+				"CPU":                    newScalarResource(600, 1000),
+				agentStorageResourceName: newScalarResource(200*agentStorageBytesPerMiB, 300*agentStorageBytesPerMiB),
+			},
 			CreateOptions: map[string]string{
 				"sandbox_type":     "docker",
 				"host_user":        "agentos",
@@ -1322,6 +1333,8 @@ func TestGetHandlerReturnsSingleInstance(t *testing.T) {
 	require.Equal(t, "172.17.0.5", d.SandboxIP)
 	require.Equal(t, "docker", d.SandboxType)
 	require.Equal(t, "4fb6aa1c", d.SandboxID)
+	require.Equal(t, float64(600), d.Resources["CPU"])
+	require.Equal(t, float64(200), d.Resources[agentStorageResourceName])
 	require.Equal(t, "agentos", d.HostUser)
 	require.Equal(t, "bar", d.EnvVars["FOO"])
 	require.Equal(t, []string{"tcp:22"}, d.Ports)
@@ -1331,6 +1344,22 @@ func TestGetHandlerReturnsSingleInstance(t *testing.T) {
 	require.Len(t, d.Rootfs.Mounts, 1)
 	require.Equal(t, "/data", d.Rootfs.Mounts[0].Source)
 	require.False(t, d.Rootfs.Mounts[0].ReadOnly)
+}
+
+func TestFlattenResourcesConvertsStorageBytesToMiB(t *testing.T) {
+	cpu := execendpoint.Resource{}
+	cpu.Scalar.Value = 600
+	storage := execendpoint.Resource{}
+	storage.Scalar.Value = 200 * agentStorageBytesPerMiB
+	storage.Scalar.Limit = 300 * agentStorageBytesPerMiB
+
+	resources := flattenResources(map[string]execendpoint.Resource{
+		"CPU":                    cpu,
+		agentStorageResourceName: storage,
+	})
+
+	require.Equal(t, float64(600), resources["CPU"])
+	require.Equal(t, float64(200), resources[agentStorageResourceName])
 }
 
 func TestGetHandlerReturns404WhenNotFound(t *testing.T) {
