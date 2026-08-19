@@ -1463,6 +1463,7 @@ func TestCreateV1HandlerConvertsNormalizedXPUToFunctionSystemResource(t *testing
 
 func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 	const storageMb int64 = 153600
+	const storageLimitMb int64 = 204800
 
 	var capturedCreateReq *core.CreateRequest
 	setAPIClientsForTest(t, &runtimeStub{
@@ -1480,7 +1481,8 @@ func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 	body := []byte(`{
 		"image":"ubuntu:22.04",
 		"xpu":"gpu:L20:1",
-		"storageMb":153600
+		"storageMb":153600,
+		"storage_limit_mb":204800
 	}`)
 	var err error
 	ctx.Request, err = http.NewRequest(
@@ -1501,6 +1503,11 @@ func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 		float64(storageMb*bytesPerMiB),
 		resources[sandboxStorageResourceName],
 	)
+	require.Equal(
+		t,
+		strconv.FormatInt(storageLimitMb*bytesPerMiB, decimalRadix),
+		capturedCreateReq.GetSchedulingOps().GetExtension()[sandboxStorageLimitExtension],
+	)
 	var resourceSpec resspeckey.ResourceSpecification
 	require.NoError(
 		t,
@@ -1516,11 +1523,54 @@ func TestCreateV1HandlerPassesStorageToFunctionSystem(t *testing.T) {
 	)
 }
 
+func TestCreateV1HandlerUsesStandaloneStorageLimitMbAsReservation(t *testing.T) {
+	const storageLimitMb int64 = 1024
+
+	var capturedCreateReq *core.CreateRequest
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstanceRaw: func(
+			createReq *core.CreateRequest,
+			_ api.RawRequestOption,
+		) ([]byte, error) {
+			capturedCreateReq = cloneCreateRequest(t, createReq)
+			return rawCreateNotify(0, ""), nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request, err := http.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes",
+		strings.NewReader(`{"image":"ubuntu:22.04","storage_limit_mb":1024}`),
+	)
+	require.NoError(t, err)
+	ctx.Request = request
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, capturedCreateReq)
+	require.Equal(
+		t,
+		float64(storageLimitMb*bytesPerMiB),
+		capturedCreateReq.GetSchedulingOps().GetResources()[sandboxStorageResourceName],
+	)
+	require.Equal(
+		t,
+		strconv.FormatInt(storageLimitMb*bytesPerMiB, decimalRadix),
+		capturedCreateReq.GetSchedulingOps().GetExtension()[sandboxStorageLimitExtension],
+	)
+}
+
 func TestCreateV1HandlerRejectsInvalidStorage(t *testing.T) {
 	invalidBodies := []string{
 		`{"storageMb":0}`,
 		`{"storageMb":-1}`,
 		`{"storageMb":"1024"}`,
+		`{"storage_limit_mb":-1}`,
+		`{"storage_limit_mb":"1024"}`,
+		`{"storageMb":2048,"storage_limit_mb":1024}`,
 	}
 	for _, body := range invalidBodies {
 		t.Run(body, func(t *testing.T) {

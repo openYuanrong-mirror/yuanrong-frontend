@@ -126,6 +126,8 @@ const (
 	agentRunningPollTimeout      = 5 * time.Second
 	agentRunningPollInterval     = 200 * time.Millisecond
 	agentCreateTimeoutCode       = 3002
+	agentStorageResourceName     = "storage"
+	agentStorageBytesPerMiB      = 1024 * 1024
 	sshEnableEnv                 = "YR_FRONTEND_SSH_ENABLE"
 	sshPublicKeyDirectoryEnv     = "YR_SSH_BACKEND_PUBLIC_KEY_DIR"
 	sshContainerMountDirectory   = "/run/openyuanrong/ssh"
@@ -1089,14 +1091,19 @@ func GetHandler(ctx *gin.Context) {
 }
 
 // flattenResources collapses the scalar-resource map (e.g. {"CPU":{"scalar":{"value":600,"limit":0}}})
-// to {"CPU":600}, exposing only the scalar value. limit is dropped.
+// to {"CPU":600}, exposing only the scalar value. limit is dropped. Storage is
+// carried internally in bytes and converted back to MiB for the public API.
 func flattenResources(in map[string]execendpoint.Resource) map[string]float64 {
 	if len(in) == 0 {
 		return nil
 	}
 	out := make(map[string]float64, len(in))
 	for name, r := range in {
-		out[name] = r.Scalar.Value
+		value := r.Scalar.Value
+		if name == agentStorageResourceName {
+			value /= agentStorageBytesPerMiB
+		}
+		out[name] = value
 	}
 	return out
 }
