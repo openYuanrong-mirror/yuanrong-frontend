@@ -1533,6 +1533,45 @@ func TestFileListHandlerRejectsInvalidMaxDepth(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "max_depth must be a non-negative integer")
 }
 
+func TestFileMkdirHandlerForwardsValidatedOptions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-mkdir").Reset()
+	captured := stubExecutorTunnel(t, http.StatusOK,
+		http.Header{"Content-Type": []string{"application/json"}},
+		`{"success":true,"path":"/tmp/sub","created":true}`)
+
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/agent/instance-mkdir/files/mkdir?path=/tmp/sub&mode=0755&recursive=true", nil)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.POST("/api/agent/:instanceId/files/mkdir", FileMkdirHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"success":true,"path":"/tmp/sub","created":true}`, recorder.Body.String())
+	forwarded := <-captured
+	require.NoError(t, forwarded.err)
+	require.Equal(t, http.MethodPost, forwarded.request.Method)
+	require.Equal(t, "/v1/files/mkdir", forwarded.request.URL.Path)
+	require.Equal(t, "/tmp/sub", forwarded.request.URL.Query().Get("path"))
+	require.Equal(t, "0755", forwarded.request.URL.Query().Get("mode"))
+	require.Equal(t, "true", forwarded.request.URL.Query().Get("recursive"))
+}
+
+func TestFileMkdirHandlerRejectsMissingPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "instance-mkdir-missing-path").Reset()
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/agent/instance-mkdir-missing-path/files/mkdir?mode=0755", nil)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.POST("/api/agent/:instanceId/files/mkdir", FileMkdirHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "path query parameter is required")
+}
+
 func TestCountingReader(t *testing.T) {
 	convey.Convey("countingReader should count bytes", t, func() {
 		data := bytes.Repeat([]byte("A"), 100)
