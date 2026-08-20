@@ -112,7 +112,8 @@ type agentExecutorHTTPRequest struct {
 const (
 	defaultAgentCPU              = 1000
 	defaultAgentMemory           = 2048
-	agentCreateTimeoutSeconds    = 60
+	agentCreateGrpcDeadlineSeconds = 70
+	agentCreateBusinessTimeoutSeconds = 70
 	agentInitTimeoutSeconds      = 305
 	agentGracefulShutdownSeconds = 15
 	agentPreStopTimeoutSeconds   = 10
@@ -386,8 +387,8 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest,
 	invokeOpts := api.InvokeOptions{
 		Cpu:              cpu,
 		Memory:           memory,
-		Timeout:          agentCreateTimeoutSeconds,
-		CreateOpt:        map[string]string{},
+		Timeout:          agentCreateGrpcDeadlineSeconds,
+		CreateOpt:        map[string]string{"create_error_policy": "last_failure_on_timeout"},
 		CustomExtensions: map[string]string{"lifecycle": "detached", "Concurrency": agentConcurrency},
 	}
 
@@ -513,7 +514,7 @@ func buildAgentCreateArgs(runtime string, spec *types.FuncSpec, resKey resspecke
 			FuncMetaData: types.FuncMetaData{
 				Handler: agentExecutorCallEntry,
 				Runtime: runtime,
-				Timeout: agentCreateTimeoutSeconds,
+				Timeout: agentCreateBusinessTimeoutSeconds,
 			},
 			ResourceMetaData: types.ResourceMetaData{CPU: resKey.CPU, Memory: resKey.Memory},
 			ExtendedMetaData: types.ExtendedMetaData{
@@ -831,7 +832,7 @@ func applyAgentCreateOpts(invokeOpts *api.InvokeOptions, ctx *gin.Context, req C
 	}
 	invokeOpts.CreateOpt[constant.InstanceTypeNote] = agentInstanceType
 	invokeOpts.CreateOpt[constant.SchedulerManagedNote] = strconv.FormatBool(false)
-	invokeOpts.CreateOpt["call_timeout"] = strconv.Itoa(agentCreateTimeoutSeconds)
+	invokeOpts.CreateOpt["call_timeout"] = strconv.Itoa(agentCreateBusinessTimeoutSeconds)
 	invokeOpts.CreateOpt["init_call_timeout"] = strconv.Itoa(agentInitTimeoutSeconds)
 	gracefulShutdownSeconds := agentGracefulShutdownSeconds
 	if config.preStopTimeout+agentShutdownReserveSeconds > gracefulShutdownSeconds {
