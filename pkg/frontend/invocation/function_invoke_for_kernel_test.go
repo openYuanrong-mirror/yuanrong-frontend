@@ -36,6 +36,8 @@ import (
 
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/etcd3"
+	"frontend/pkg/common/faas_common/grpc/pb/common"
+	"frontend/pkg/common/faas_common/grpc/pb/core"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/snerror"
@@ -245,6 +247,11 @@ func (f *fakeDirectProxyClient) KillInstance(util.DirectKillRequest) error {
 	return nil
 }
 
+func (f *fakeDirectProxyClient) KillInstanceWithResponse(
+	util.DirectKillRequest,
+) (*core.KillResponse, error) {
+	return &core.KillResponse{Code: common.ErrorCode_ERR_NONE}, nil
+}
 func (f *fakeClient) AcquireInstance(functionKey string, req types.AcquireOption) (*types.InstanceAllocationInfo, error) {
 	// TODO implement me
 	panic("implement me")

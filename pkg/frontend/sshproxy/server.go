@@ -32,6 +32,7 @@ import (
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/proxyrouting"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
 
 type server struct {
@@ -213,6 +214,9 @@ func (s *server) dialBackend(instance *types.InstanceSpecification, tunnelAddres
 }
 
 func (s *server) resolveInstance(target route) (*types.InstanceSpecification, string, error) {
+	if execendpoint.Default().IsPaused(target.InstanceID) {
+		return nil, "", execendpoint.NewInstancePausedError(target.InstanceID)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.config.routeWait)
 	defer cancel()
 	ownerRoute, err := proxyrouting.Wait(

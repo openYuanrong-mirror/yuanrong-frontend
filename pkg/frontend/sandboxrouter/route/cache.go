@@ -24,6 +24,10 @@ import (
 // ErrRouteNotFound is returned by Cache.Get when no route matches the key.
 var ErrRouteNotFound = errors.New("route not found")
 
+// ErrInstancePaused is returned when the logical instance exists but its
+// runtime routes have intentionally been removed during PAUSED.
+var ErrInstancePaused = errors.New("instance paused")
+
 // cacheEntry records the owning instanceID alongside the target so that
 // DeleteInstance only removes keys an instance still owns (matters when two
 // instances sanitize to the same Key; last writer wins).

@@ -41,6 +41,8 @@ import (
 
 	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/common"
+	"frontend/pkg/common/faas_common/grpc/pb/core"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/common/util"
@@ -124,6 +126,17 @@ func setAPIClientsForTest(t *testing.T, runtime *runtimeStub) {
 
 type directRuntimeStub struct{ runtime *runtimeStub }
 
+func TestWaitForAgentInstanceExistRejectsPaused(t *testing.T) {
+	const instanceID = "paused-file-transfer"
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instanceID, NodeID: "InstanceManagerOwner", StatusCode: 13,
+	})
+	t.Cleanup(func() { execendpoint.Default().Delete(instanceID) })
+
+	_, err := waitForAgentInstanceExist(instanceID)
+	require.EqualError(t, err, "instance paused-file-transfer is paused")
+}
+
 func (r *directRuntimeStub) Invoke(util.DirectInvokeRequest) ([]byte, error) { return nil, nil }
 
 func (r *directRuntimeStub) CreateInstance(req util.DirectCreateRequest) (string, error) {
@@ -138,6 +151,9 @@ func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
 	return r.runtime.Kill(req.InstanceID, req.Signal, req.Payload, req.AdaptedInvokeOptions())
 }
 
+func (r *directRuntimeStub) KillInstanceWithResponse(req util.DirectKillRequest) (*core.KillResponse, error) {
+	return &core.KillResponse{Code: common.ErrorCode_ERR_NONE}, r.KillInstance(req)
+}
 func (r *runtimeStub) Invoke(util.InvokeRequest) ([]byte, error) {
 	return nil, nil
 }

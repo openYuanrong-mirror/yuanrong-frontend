@@ -18,13 +18,29 @@ package wsproxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"testing"
+
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
+
+func TestResolveInstanceRejectsPausedBeforeTunnelRouting(t *testing.T) {
+	const instanceID = "paused-ws"
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instanceID, NodeID: "InstanceManagerOwner", StatusCode: 13,
+	})
+	t.Cleanup(func() { execendpoint.Default().Delete(instanceID) })
+
+	_, _, err := resolveInstance(context.Background(), instanceID)
+	if err == nil || err.Error() != "instance paused-ws is paused" {
+		t.Fatalf("resolveInstance paused error = %v", err)
+	}
+}
 
 // TestFramedJSONRoundTrip verifies the function_proxy tcp.tunnel negotiation
 // frame format that wsproxy must speak byte-for-byte: a tunnelFrameSizeBytes

@@ -1208,9 +1208,22 @@ var dialAgentSandboxTunnel = wsproxy.DialSandboxTunnel
 // present in the watcher cache within fileTransferWaitTimeout. It reuses the
 // same WaitInstanceByID primitive the rest of the lifecycle path relies on.
 func waitForAgentInstanceExist(instanceID string) (*types.InstanceSpecification, error) {
+	if execendpoint.Default().IsPaused(instanceID) {
+		return nil, execendpoint.NewInstancePausedError(instanceID)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), fileTransferWaitTimeout)
 	defer cancel()
 	return instancemanager.WaitInstanceByID(ctx, instanceID)
+}
+
+func writeFileTransferInstanceError(ctx *gin.Context, instanceID string, err error) {
+	statusCode := http.StatusNotFound
+	message := fmt.Sprintf("instance %s not found", instanceID)
+	if errors.Is(err, execendpoint.ErrInstancePaused) {
+		statusCode = http.StatusConflict
+		message = err.Error()
+	}
+	ctx.JSON(statusCode, gin.H{"code": statusCode, "message": message})
 }
 
 // FileUploadHandler handles POST /api/agent/:instanceId/files/upload.
@@ -1246,10 +1259,7 @@ func FileUploadHandler(ctx *gin.Context) {
 	// instance cannot receive files.
 	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
 		log.GetLogger().Warnf("file upload instance not found %s: %v", instanceID, err)
-		ctx.JSON(http.StatusNotFound, gin.H{
-			"code":    http.StatusNotFound,
-			"message": fmt.Sprintf("instance %s not found", instanceID),
-		})
+		writeFileTransferInstanceError(ctx, instanceID, err)
 		return
 	}
 
@@ -1530,10 +1540,7 @@ func FileDownloadHandler(ctx *gin.Context) {
 	// Verify the instance exists before resolving the download route.
 	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
 		log.GetLogger().Warnf("file download instance not found %s: %v", instanceID, err)
-		ctx.JSON(http.StatusNotFound, gin.H{
-			"code":    http.StatusNotFound,
-			"message": fmt.Sprintf("instance %s not found", instanceID),
-		})
+		writeFileTransferInstanceError(ctx, instanceID, err)
 		return
 	}
 

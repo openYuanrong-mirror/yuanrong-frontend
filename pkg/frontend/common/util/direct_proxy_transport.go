@@ -21,6 +21,7 @@ import (
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
+	"frontend/pkg/common/faas_common/grpc/pb/core"
 	"frontend/pkg/common/faas_common/types"
 )
 
@@ -57,6 +58,7 @@ type simpleRuntimeKillRequest struct {
 	tenantID   string
 	signal     int
 	payload    []byte
+	requestID  string
 	options    api.InvokeOptions
 }
 
@@ -70,4 +72,5 @@ type frontendProxyLifecycleClient interface {
 	CreateInstance(simpleRuntimeCreateRequest) (string, error)
 	CreateInstanceRaw(simpleRuntimeRawCreateRequest) ([]byte, error)
 	KillInstance(simpleRuntimeKillRequest) error
+	KillInstanceWithResponse(simpleRuntimeKillRequest) (*core.KillResponse, error)
 }

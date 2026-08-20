@@ -47,6 +47,7 @@ import (
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/instancemanager"
 	"frontend/pkg/frontend/proxyrouting"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
 
 const (
@@ -194,6 +195,67 @@ func (f *fakeFrontendProxyServiceClient) KillInstance(ctx context.Context, in *f
 	return f.killResp, f.err
 }
 
+func TestGRPCFrontendProxyLifecycleKillReturnsExactPayload(t *testing.T) {
+	instanceID := "default-sandbox-1"
+	instancemanager.RecordRouteOnlyInstance("tenant/sandbox/$latest", instanceID, "proxy-before-pause")
+	defer instancemanager.RemoveRouteOnlyInstance(instanceID)
+	expected := &core.KillResponse{
+		Code:    common.ErrorCode_ERR_NONE,
+		Payload: []byte("snapshot-result"),
+	}
+	fakeService := &fakeFrontendProxyServiceClient{
+		killResp: &frontend_proxy.KillInstanceResponse{
+			Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			Kill:   expected,
+		},
+	}
+	client := newGRPCFrontendProxyLifecycleClient(fakeService, "frontend-test")
+
+	actual, err := client.KillInstanceWithResponse(simpleRuntimeKillRequest{
+		instanceID: instanceID,
+		tenantID:   "0",
+		signal:     18,
+		payload:    []byte("pause-options"),
+		requestID:  "pause-request-1",
+	})
+
+	require.NoError(t, err)
+	require.True(t, proto.Equal(expected, actual))
+	require.Equal(t, "pause-request-1", fakeService.killReq.GetKill().GetRequestID())
+	require.Equal(t, "InstanceManagerOwner",
+		instancemanager.SnapshotRouteOnlyInstance(instanceID).FunctionProxyID)
+}
+
+func TestGRPCFrontendProxyLifecycleResumePublishesWinnerRoute(t *testing.T) {
+	instanceID := "default-sandbox-resume"
+	instancemanager.RecordRouteOnlyInstance("tenant/sandbox/$latest", instanceID, "proxy-before-resume")
+	defer instancemanager.RemoveRouteOnlyInstance(instanceID)
+	payload, err := proto.Marshal(&core.SnapStartedInfo{
+		InstanceID:      instanceID,
+		RouteAddress:    "10.0.0.8:9000",
+		FunctionProxyID: "proxy-after-resume",
+	})
+	require.NoError(t, err)
+	fakeService := &fakeFrontendProxyServiceClient{
+		killResp: &frontend_proxy.KillInstanceResponse{
+			Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			Kill:   &core.KillResponse{Code: common.ErrorCode_ERR_NONE, Payload: payload},
+		},
+	}
+	client := newGRPCFrontendProxyLifecycleClient(fakeService, "frontend-test")
+
+	_, err = client.KillInstanceWithResponse(simpleRuntimeKillRequest{
+		instanceID: instanceID,
+		tenantID:   "0",
+		signal:     frontendResumeSnapshotSignal,
+		requestID:  "resume-request-1",
+	})
+
+	require.NoError(t, err)
+	route := instancemanager.SnapshotRouteOnlyInstance(instanceID)
+	require.Equal(t, "tenant/sandbox/$latest", route.Function)
+	require.Equal(t, "proxy-after-resume", route.FunctionProxyID)
+}
 func createResponseWithUnknownReadyCallResult(
 	t *testing.T,
 	callResult *core.CallResult,
@@ -2848,6 +2910,109 @@ func TestRoutingFrontendProxyLifecycleClientSelectsKillCapabilityEndpoint(t *tes
 	require.Equal(t, "10.0.0.12:22769", factory.address)
 	require.NotNil(t, fakeService.killReq)
 	require.Equal(t, "frontend-test", fakeService.killReq.Context.FrontendClientID)
+}
+
+func TestRoutingFrontendProxyLifecyclePausedResumeUsesHealthyGatewayInsteadOfSourceOwner(t *testing.T) {
+	const instanceID = "paused-resume-through-master"
+	discovery := newMemoryFrontendProxyDiscovery()
+	discovery.ReplaceSnapshot([]frontendProxyEndpoint{
+		{NodeID: "healthy-gateway", Address: "10.0.0.12:22769",
+			Capabilities: map[string]bool{frontendProxyCapabilityKill: true}},
+	})
+	restoreDiscovery := setFrontendProxyDiscoveryForTest(discovery)
+	defer restoreDiscovery()
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instanceID, Function: "tenant/function/$latest", NodeID: "InstanceManagerOwner",
+		StatusCode: 13,
+	})
+	defer execendpoint.Default().Delete(instanceID)
+	instancemanager.RecordRouteOnlyInstance("tenant/function/$latest", instanceID, "InstanceManagerOwner")
+	defer instancemanager.RemoveRouteOnlyInstance(instanceID)
+
+	startedPayload, err := proto.Marshal(&core.SnapStartedInfo{
+		InstanceID: instanceID, RouteAddress: "10.0.0.22:21006",
+		FunctionProxyID: "target-proxy", NodeID: "target-proxy",
+	})
+	require.NoError(t, err)
+	fakeService := &fakeFrontendProxyServiceClient{killResp: &frontend_proxy.KillInstanceResponse{
+		Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+		Kill:   &core.KillResponse{Code: common.ErrorCode_ERR_NONE, Payload: startedPayload},
+	}}
+	factory := &fakeFrontendProxyClientFactory{client: fakeService}
+	client := &routingFrontendProxyLifecycleClient{clientFactory: factory, frontendClientID: "frontend-test"}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err = client.KillInstanceWithResponse(simpleRuntimeKillRequest{
+		ctx: ctx, instanceID: instanceID, requestID: "resume-attempt", signal: frontendResumeSnapshotSignal,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.12:22769", factory.address)
+	require.Equal(t, int32(frontendResumeSnapshotSignal), fakeService.killReq.GetKill().GetSignal())
+}
+
+func TestRoutingFrontendProxyLifecyclePausedDeleteRetriesAnotherHealthyGatewayWhenAgentUnavailable(t *testing.T) {
+	const instanceID = "paused-delete-through-healthy-gateway"
+	discovery := newMemoryFrontendProxyDiscovery()
+	discovery.ReplaceSnapshot([]frontendProxyEndpoint{
+		{NodeID: "gateway-without-agent", Address: "10.0.0.31:22769",
+			Capabilities: map[string]bool{frontendProxyCapabilityKill: true}},
+		{NodeID: "gateway-with-agent", Address: "10.0.0.32:22769",
+			Capabilities: map[string]bool{frontendProxyCapabilityKill: true}},
+	})
+	restoreDiscovery := setFrontendProxyDiscoveryForTest(discovery)
+	defer restoreDiscovery()
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instanceID, Function: "tenant/function/$latest", NodeID: execendpoint.InstanceManagerOwner,
+		StatusCode: 13,
+	})
+	defer execendpoint.Default().Delete(instanceID)
+	instancemanager.RecordRouteOnlyInstance(
+		"tenant/function/$latest", instanceID, execendpoint.InstanceManagerOwner)
+	defer instancemanager.RemoveRouteOnlyInstance(instanceID)
+
+	withoutAgent := &fakeFrontendProxyServiceClient{killResp: &frontend_proxy.KillInstanceResponse{
+		Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+		Kill: &core.KillResponse{
+			Code:    common.ErrorCode_ERR_INNER_COMMUNICATION,
+			Message: "no function agent is available for snapshot cleanup",
+		},
+	}}
+	withAgent := &fakeFrontendProxyServiceClient{killResp: &frontend_proxy.KillInstanceResponse{
+		Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+		Kill:   &core.KillResponse{Code: common.ErrorCode_ERR_NONE},
+	}}
+	factory := &fakeFrontendProxyClientFactory{clientsByURL: map[string]frontend_proxy.FrontendProxyServiceClient{
+		"10.0.0.31:22769": withoutAgent,
+		"10.0.0.32:22769": withAgent,
+	}}
+	client := &routingFrontendProxyLifecycleClient{clientFactory: factory, frontendClientID: "frontend-test"}
+
+	err := client.KillInstance(simpleRuntimeKillRequest{
+		ctx: context.Background(), instanceID: instanceID, signal: 15,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, withoutAgent.calls)
+	require.Equal(t, 1, withAgent.calls)
+	require.Equal(t, []string{"10.0.0.31:22769", "10.0.0.32:22769"}, factory.addresses)
+	require.Empty(t, factory.evicted, "an agent-less stateless gateway is still a healthy proxy endpoint")
+}
+
+func TestDirectDataPlaneRejectsPausedBeforeOwnerResolution(t *testing.T) {
+	const instanceID = "paused-data-plane"
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instanceID, NodeID: "InstanceManagerOwner", StatusCode: execendpoint.StatusPaused,
+	})
+	defer execendpoint.Default().Delete(instanceID)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := resolveDirectProxyOwner(
+		ctx, instanceID, proxyrouting.CapabilityInvoke, proxyrouting.TransportGRPC)
+
+	require.EqualError(t, err, "instance paused-data-plane is paused")
 }
 
 func TestRoutingFrontendProxyLifecycleClientKillUsesOwningRoute(t *testing.T) {

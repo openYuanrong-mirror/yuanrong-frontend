@@ -76,6 +76,12 @@ message CreateRequest {
   // optional. if designated instanceID is not empty, the created instance id will be assigned designatedInstanceID
   string			 designatedInstanceID = 7;
   map<string, string> createOptions = 8;
+  string              snapshotID = 9;
+}
+
+message SnapshotInfo {
+  string          snapshotID = 1;
+  repeated string names      = 2;
 }
 
 message CreateResourceGroupRequest {
@@ -194,14 +200,44 @@ message StateLoadResponse {
   bytes            state   = 3;
 }
 
-message KillRequest {
+message SnapOptions {
+  common.SnapType type = 1;
+  int32           ttl  = 2;
+  bool            leaveRunning = 3;
+  string          functionType = 4;
+  string          name = 5;
+}
+
+message SnapStartOptions {
+  common.SnapType type = 1;
+  SchedulingOptions scheduleOpts = 2;
+}
+
+message SnapInfo {
+  string snapshotID = 1;
+  int64 size = 2;
+}
+
+message SnapStartedInfo {
   string instanceID = 1;
-  int32  signal     = 2;
-  bytes  payload    = 3;
-  string requestID  = 4;
+  string routeAddress = 2;
+  string portMappings = 3;
+  string functionProxyID = 4;
+  string nodeID = 5;
+  string namespace = 6;
+}
+
+message KillRequest {
+  string instanceID   = 1;
+  int32  signal       = 2;
+  bytes  payload      = 3;
+  string requestID    = 4;
+  string routeAddress = 5;
+  string proxyID      = 6;
 }
 
 message KillResponse {
   common.ErrorCode code    = 1;
   string           message = 2;
+  bytes            payload = 3;
 }

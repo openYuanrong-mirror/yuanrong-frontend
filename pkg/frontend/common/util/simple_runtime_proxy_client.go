@@ -52,9 +52,15 @@ import (
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/instancemanager"
 	"frontend/pkg/frontend/proxyrouting"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
 
 var frontendProxyRequestSeq atomic.Uint64
+
+const (
+	frontendPauseSnapshotSignal  = 18
+	frontendResumeSnapshotSignal = 19
+)
 
 var (
 	simpleRuntimeSmallValueBufferPool  sync.Pool
@@ -438,10 +444,18 @@ func decodeFrontendProxyRawCreateResponse(
 }
 
 func (c *grpcFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKillRequest) error {
+	_, err := c.KillInstanceWithResponse(req)
+	return err
+}
+
+func (c *grpcFrontendProxyLifecycleClient) KillInstanceWithResponse(
+	req simpleRuntimeKillRequest,
+) (*core.KillResponse, error) {
 	if c.client == nil {
-		return fmt.Errorf("frontend proxy grpc client is nil")
+		return nil, fmt.Errorf("frontend proxy grpc client is nil")
 	}
-	requestID := fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1))
+	requestID := firstNonEmpty(req.requestID,
+		fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1)))
 	ctx, cancel := simpleRuntimeInvokeContextWithParent(req.ctx, req.options, 0)
 	defer cancel()
 	resp, err := c.client.KillInstance(ctx, &frontend_proxy.KillInstanceRequest{
@@ -454,24 +468,47 @@ func (c *grpcFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKillReq
 		},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp == nil {
-		return fmt.Errorf("frontend proxy kill response is nil")
+		return nil, fmt.Errorf("frontend proxy kill response is nil")
 	}
 	if err := checkFrontendProxyStatus("kill", resp.GetStatus()); err != nil {
-		return err
+		return nil, err
 	}
 	killResp := resp.GetKill()
 	if killResp == nil {
-		return fmt.Errorf("frontend proxy kill missing kill response")
+		return nil, fmt.Errorf("frontend proxy kill missing kill response")
 	}
 	if killResp.GetCode() != common.ErrorCode_ERR_NONE {
-		return frontendProxyBusinessError("kill", killResp.GetCode(), killResp.GetMessage())
+		return nil, frontendProxyBusinessError("kill", killResp.GetCode(), killResp.GetMessage())
 	}
-	change := instancemanager.RemoveRouteOnlyInstanceWithSnapshot(req.instanceID)
+	before := instancemanager.SnapshotRouteOnlyInstance(req.instanceID)
+	change := instancemanager.RouteOnlyInstanceChange{Before: before, After: before}
+	switch req.signal {
+	case frontendPauseSnapshotSignal:
+		// PAUSED is owned by InstanceManager. The proxy handling this request is
+		// only a stateless gateway and must not remain the instance owner.
+		instancemanager.RecordRouteOnlyInstance(
+			before.Function, req.instanceID, execendpoint.InstanceManagerOwner)
+		change.After = instancemanager.SnapshotRouteOnlyInstance(req.instanceID)
+	case frontendResumeSnapshotSignal:
+		var started core.SnapStartedInfo
+		if err := proto.Unmarshal(killResp.GetPayload(), &started); err != nil {
+			return nil, fmt.Errorf("resume kill returned invalid route payload: %w", err)
+		}
+		if started.GetInstanceID() != req.instanceID || started.GetFunctionProxyID() == "" ||
+			started.GetRouteAddress() == "" {
+			return nil, fmt.Errorf("resume kill returned a mismatched or empty function proxy route")
+		}
+		instancemanager.RecordRouteOnlyInstance(
+			before.Function, req.instanceID, started.GetFunctionProxyID())
+		change.After = instancemanager.SnapshotRouteOnlyInstance(req.instanceID)
+	default:
+		change = instancemanager.RemoveRouteOnlyInstanceWithSnapshot(req.instanceID)
+	}
 	observeFrontendRouteLifecycle(req, requestID, "success", change, false)
-	return nil
+	return killResp, nil
 }
 
 func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRuntimeRawInvokeRequest) ([]byte, error) {
@@ -681,37 +718,63 @@ func (c *routingFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntim
 }
 
 func (c *routingFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKillRequest) error {
+	_, err := c.KillInstanceWithResponse(req)
+	return err
+}
+
+func (c *routingFrontendProxyLifecycleClient) KillInstanceWithResponse(
+	req simpleRuntimeKillRequest,
+) (*core.KillResponse, error) {
 	if c == nil || c.clientFactory == nil {
-		return fmt.Errorf("frontend proxy lifecycle routing client is not initialized")
+		return nil, fmt.Errorf("frontend proxy lifecycle routing client is not initialized")
 	}
+	if req.requestID == "" {
+		req.requestID = fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1))
+	}
+	tried := make(map[string]struct{})
 	for attempt := 0; attempt < frontendProxyKillMaxAttempts; attempt++ {
-		route, err := resolveDirectProxyOwner(
-			req.ctx, req.instanceID, proxyrouting.CapabilityKill, proxyrouting.TransportGRPC)
+		paused := execendpoint.Default().IsPaused(req.instanceID)
+		route, err := resolveLifecycleProxy(
+			req.ctx, req.instanceID, proxyrouting.CapabilityKill, proxyrouting.TransportGRPC, tried)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		address := route.Address
+		tried[address] = struct{}{}
 		serviceClient, err := c.clientFactory.ClientForAddress(address)
 		if err != nil {
 			evictFrontendProxyClientOnError(c.clientFactory, address, err)
-			return err
+			if paused && attempt+1 < frontendProxyKillMaxAttempts {
+				continue
+			}
+			return nil, err
 		}
-		err = newGRPCFrontendProxyLifecycleClient(serviceClient, c.frontendClientID).KillInstance(req)
+		response, err := newGRPCFrontendProxyLifecycleClient(serviceClient, c.frontendClientID).
+			KillInstanceWithResponse(req)
 		if err == nil {
-			return nil
+			return response, nil
+		}
+		if paused && isPausedLifecycleGatewayRetryable(err) && attempt+1 < frontendProxyKillMaxAttempts {
+			continue
 		}
 		if !isFrontendProxyRouteStaleStatus(err) {
 			evictFrontendProxyClientOnError(c.clientFactory, address, err)
-			return err
+			return nil, err
 		}
-		change := instancemanager.RemoveRouteOnlyInstanceWithSnapshot(req.instanceID)
-		willRetry := attempt == 0
+		change := instancemanager.RouteOnlyInstanceChange{
+			Before: instancemanager.SnapshotRouteOnlyInstance(req.instanceID),
+			After:  instancemanager.SnapshotRouteOnlyInstance(req.instanceID),
+		}
+		if !paused {
+			change = instancemanager.RemoveRouteOnlyInstanceWithSnapshot(req.instanceID)
+		}
+		willRetry := attempt+1 < frontendProxyKillMaxAttempts
 		observeFrontendRouteLifecycle(req, "", "route-stale", change, willRetry)
 		if !willRetry {
-			return err
+			return nil, err
 		}
 	}
-	return fmt.Errorf("frontend proxy kill retry exhausted")
+	return nil, fmt.Errorf("frontend proxy kill retry exhausted")
 }
 
 func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRuntimeRawInvokeRequest) ([]byte, error) {
@@ -756,7 +819,34 @@ func (defaultFrontendProxyRouteResolver) ResolveFrontendProxyAddress(req simpleR
 func resolveDirectProxyOwner(ctx context.Context, instanceID string, capability proxyrouting.Capability,
 	transport proxyrouting.Transport,
 ) (proxyrouting.OwnerRoute, error) {
+	if execendpoint.Default().IsPaused(instanceID) {
+		return proxyrouting.OwnerRoute{}, execendpoint.NewInstancePausedError(instanceID)
+	}
 	return proxyrouting.Wait(ctx, instanceID, capability, transport)
+}
+
+func resolveLifecycleProxy(ctx context.Context, instanceID string, capability proxyrouting.Capability,
+	transport proxyrouting.Transport, excluded map[string]struct{},
+) (proxyrouting.OwnerRoute, error) {
+	if !execendpoint.Default().IsPaused(instanceID) {
+		return resolveDirectProxyOwner(ctx, instanceID, capability, transport)
+	}
+	endpoint, err := proxyrouting.Select(ctx, capability, excluded)
+	if err != nil {
+		return proxyrouting.OwnerRoute{}, fmt.Errorf("select paused instance %s control gateway: %w", instanceID, err)
+	}
+	address := endpoint.GRPCAddress
+	if transport == proxyrouting.TransportTCPTunnel {
+		address = endpoint.TCPTunnelAddress
+	}
+	if !proxyrouting.IsRoutableAddress(address) {
+		return proxyrouting.OwnerRoute{}, fmt.Errorf("selected paused instance %s gateway has no routable address", instanceID)
+	}
+	return proxyrouting.OwnerRoute{
+		OwnerProxyID: endpoint.NodeID,
+		Endpoint:     endpoint,
+		Address:      address,
+	}, nil
 }
 
 type frontendProxyGRPCClientPool struct {
@@ -1000,6 +1090,11 @@ func isFrontendProxyCreatePreDispatchStatus(err error) bool {
 func isFrontendProxyRouteStaleStatus(err error) bool {
 	var statusErr *frontendProxyStatusErr
 	return errors.As(err, &statusErr) && statusErr.retryable && statusErr.retryReason == "route-stale"
+}
+
+func isPausedLifecycleGatewayRetryable(err error) bool {
+	var businessErr *frontendProxyBusinessErr
+	return errors.As(err, &businessErr) && businessErr.code == common.ErrorCode_ERR_INNER_COMMUNICATION
 }
 
 type frontendProxyStatusErr struct {

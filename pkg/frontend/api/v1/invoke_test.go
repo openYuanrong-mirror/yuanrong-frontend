@@ -35,6 +35,8 @@ import (
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/common"
+	"frontend/pkg/common/faas_common/grpc/pb/core"
 	"frontend/pkg/common/faas_common/grpc/pb/function"
 	"frontend/pkg/common/faas_common/localauth"
 	"frontend/pkg/common/faas_common/logger/log"
@@ -101,6 +103,11 @@ func (*directProxyInvokeStub) InvokeRaw(util.DirectRawRequest) ([]byte, error) {
 
 func (*directProxyInvokeStub) KillInstance(util.DirectKillRequest) error { return nil }
 
+func (*directProxyInvokeStub) KillInstanceWithResponse(
+	util.DirectKillRequest,
+) (*core.KillResponse, error) {
+	return &core.KillResponse{Code: common.ErrorCode_ERR_NONE}, nil
+}
 func (f *fakeClient) AcquireInstance(functionKey string, req commontype.AcquireOption) (*commontype.InstanceAllocationInfo, error) {
 	// TODO implement me
 	panic("implement me")

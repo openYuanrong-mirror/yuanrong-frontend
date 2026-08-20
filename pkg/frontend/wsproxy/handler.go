@@ -35,6 +35,7 @@ import (
 	"frontend/pkg/frontend/common/jwtauth"
 	"frontend/pkg/frontend/common/tenantauth"
 	"frontend/pkg/frontend/config"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
 
 // agentWSHeaderXAuth mirrors the JWT header posixws/webterm read.
@@ -118,6 +119,10 @@ func resolveAndAuthorize(w http.ResponseWriter, r *http.Request, tenantID, insta
 	instance, tunnelAddress, err := resolveInstance(r.Context(), instanceID)
 	if err != nil {
 		log.GetLogger().Infof("wsproxy resolve instance %s failed: %v", instanceID, err)
+		if errors.Is(err, execendpoint.ErrInstancePaused) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return "", false
+		}
 		http.Error(w, "failed to resolve instance", http.StatusBadGateway)
 		return "", false
 	}

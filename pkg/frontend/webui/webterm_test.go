@@ -153,6 +153,26 @@ func TestGetExecAddrLocalHitWithEmptyProxyFallsBack(t *testing.T) {
 	}
 }
 
+func TestGetExecAddrRejectsPausedWithoutMasterFallback(t *testing.T) {
+	const instanceID = "paused-exec"
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instanceID, NodeID: "InstanceManagerOwner", StatusCode: 13,
+	})
+	t.Cleanup(func() { execendpoint.Default().Delete(instanceID) })
+
+	oldQueryMaster := queryMasterFunc
+	t.Cleanup(func() { queryMasterFunc = oldQueryMaster })
+	queryMasterFunc = func(string, map[string]string, interface{}) error {
+		t.Fatal("paused exec must not query master for a runtime address")
+		return nil
+	}
+
+	_, err := getExecAddr(instanceID, "default")
+	if err == nil || err.Error() != "instance paused-exec is paused" {
+		t.Fatalf("getExecAddr paused error = %v", err)
+	}
+}
+
 func TestParseCommandSplitsArguments(t *testing.T) {
 	got := parseCommand("python3 -m yr.cli --version")
 	want := []string{"python3", "-m", "yr.cli", "--version"}
