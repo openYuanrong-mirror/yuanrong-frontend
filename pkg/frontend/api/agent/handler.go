@@ -1434,6 +1434,51 @@ func FileListHandler(ctx *gin.Context) {
 	}
 }
 
+// FileMkdirHandler handles POST /api/agent/:instanceId/files/mkdir.
+// It forwards a directory creation request through the existing TCP tunnel,
+// optionally setting the directory mode.
+func FileMkdirHandler(ctx *gin.Context) {
+	instanceID := ctx.Param("instanceId")
+	if instanceID == "" {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
+		return
+	}
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	targetPath := strings.TrimSpace(ctx.Query("path"))
+	if targetPath == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"message": "path query parameter is required",
+		})
+		return
+	}
+	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
+		log.GetLogger().Warnf("file mkdir instance not found %s: %v", instanceID, err)
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": fmt.Sprintf("instance %s not found", instanceID),
+		})
+		return
+	}
+	query := url.Values{"path": []string{targetPath}}
+	if mode := ctx.Query("mode"); mode != "" {
+		query.Set("mode", mode)
+	}
+	if recursive := ctx.Query("recursive"); recursive != "" {
+		query.Set("recursive", recursive)
+	}
+	request := agentExecutorHTTPRequest{
+		method: http.MethodPost, path: "/v1/files/mkdir", query: query,
+		headers: http.Header{"Accept": []string{"application/json"}},
+	}
+	if err := forwardAgentExecutorHTTP(ctx, instanceID, tenantID, request); err != nil {
+		writeFileTransferError(ctx, err)
+	}
+}
+
 // writeFileTransferError maps a file transfer error to the most appropriate
 // HTTP status. Executor HTTP statuses are forwarded directly; errors reaching
 // this helper are local streaming failures, where size overflow maps to 413
