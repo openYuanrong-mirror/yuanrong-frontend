@@ -226,6 +226,7 @@ func InitRoute(r *gin.Engine) {
 		agentGroup.POST("/:instanceId/files/upload", agent.FileUploadHandler)
 		agentGroup.GET("/:instanceId/files/download", agent.FileDownloadHandler)
 		agentGroup.GET("/:instanceId/files/list", agent.FileListHandler)
+		agentGroup.POST("/:instanceId/files/mkdir", agent.FileMkdirHandler)
 	}
 
 	// web terminal
