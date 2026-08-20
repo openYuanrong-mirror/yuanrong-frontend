@@ -69,6 +69,13 @@ var defaultAuthWhitelist = []AuthWhitelistRule{
 		SkipAuth:  true,
 	},
 	{
+		// Driver SDK capability discovery happens before authenticated initialization.
+		Path:      "/serverless/v1/capabilities",
+		Methods:   []string{"GET"},
+		MatchType: "exact",
+		SkipAuth:  true,
+	},
+	{
 		Path:      "/client/v1/lease",
 		Methods:   []string{"PUT", "DELETE"},
 		MatchType: "exact",
