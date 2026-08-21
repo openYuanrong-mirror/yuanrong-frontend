@@ -660,6 +660,8 @@ func TestCreateHandlerMountsWorkspaceAndCustomMounts(t *testing.T) {
 	// host_user is transparently passed by frontend from funcMeta.rootfs.user (proxy does not
 	// merge funcMeta). The stub funcSpec sets rootfs.user=agentos.
 	require.Equal(t, "agentos", capturedInvokeOpt.CreateOpt["host_user"])
+	// workspace source is mirrored into a sibling createOption for the Get handler.
+	require.Equal(t, "/home/snuser/workspaceA", capturedInvokeOpt.CreateOpt["workspace"])
 	// rootfs JSON carries workspace + custom mounts + the image (type/imageurl merged by
 	// applyAgentFuncMeta from funcMeta.rootfs.imageurl); the workspace target placeholder
 	// (__AGENT_USER__) is replaced by frontend with funcMeta.rootfs.user.
@@ -981,6 +983,7 @@ func TestCreateHandlerInlineBuildsFuncMeta(t *testing.T) {
 	// container config comes straight from the request.
 	require.Equal(t, "docker", capturedInvokeOpt.CreateOpt["sandbox_type"])
 	require.Equal(t, "agentos", capturedInvokeOpt.CreateOpt["host_user"])
+	require.Equal(t, "/home/snuser/workspaceA", capturedInvokeOpt.CreateOpt["workspace"])
 	require.JSONEq(t,
 		`{"mounts":[{"source":"/home/snuser/workspaceA","target":"/home/agentos","readonly":false}],
 		  "type":"image","imageurl":"yr-docker-runtime:v0"}`,
@@ -1228,6 +1231,7 @@ func sampleAgentSummaries() []execendpoint.Summary {
 			CreateOptions: map[string]string{
 				"sandbox_type":     "docker",
 				"host_user":        "agentos",
+				"workspace":        "/home/snuser/workspaceA",
 				"DELEGATE_ENV_VAR": `{"FOO":"bar"}`,
 				"rootfs": `{"type":"image","imageurl":"yr-docker-runtime:v0","mounts":[` +
 					`{"source":"/data","target":"/data","readonly":false}]}`,
@@ -1340,12 +1344,13 @@ func TestGetHandlerReturnsSingleInstance(t *testing.T) {
 	require.Equal(t, "4fb6aa1c", d.SandboxID)
 	require.Equal(t, float64(600), d.Resources["CPU"])
 	require.Equal(t, float64(200), d.Resources[agentStorageResourceName])
-	require.Equal(t, "agentos", d.HostUser)
 	require.Equal(t, "bar", d.EnvVars["FOO"])
 	require.Equal(t, []string{"tcp:22"}, d.Ports)
 	require.NotNil(t, d.Rootfs)
 	require.Equal(t, "image", d.Rootfs.Type)
 	require.Equal(t, "yr-docker-runtime:v0", d.Rootfs.ImageURL)
+	require.Equal(t, "agentos", d.Rootfs.User)
+	require.Equal(t, "/home/snuser/workspaceA", d.Rootfs.Workspace)
 	require.Len(t, d.Rootfs.Mounts, 1)
 	require.Equal(t, "/data", d.Rootfs.Mounts[0].Source)
 	require.False(t, d.Rootfs.Mounts[0].ReadOnly)

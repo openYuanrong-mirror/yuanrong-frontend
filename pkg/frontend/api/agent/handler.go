@@ -737,9 +737,10 @@ func mergeRootfsJSON(existing, imageJSON string) string {
 	return string(merged)
 }
 
-// applyAgentRootfsMounts builds rootfs.mounts from the workspace and custom mounts,
-// writes it into CreateOpt["rootfs"]. rootfs goes into CreateOpt (not CustomExtensions)
-// so docker executor's BuildBindMounts (which reads deployOptions["rootfs"]) can parse it.
+// applyAgentRootfsMounts builds rootfs.mounts from the workspace and custom mounts and writes
+// it into CreateOpt["rootfs"] (not CustomExtensions) so docker executor's BuildBindMounts can
+// parse it. The workspace source is also mirrored into CreateOpt["workspace"] so the Get handler
+// can surface it as rootfs.workspace without disambiguating it from a colliding user mount.
 func applyAgentRootfsMounts(invokeOpts *api.InvokeOptions, req CreateAgentRequest) error {
 	var rootfsMounts []map[string]interface{}
 	if req.Workspace != "" {
@@ -749,6 +750,7 @@ func applyAgentRootfsMounts(invokeOpts *api.InvokeOptions, req CreateAgentReques
 		rootfsMounts = append(rootfsMounts, map[string]interface{}{
 			"source": req.Workspace, "target": "/home/" + agentUserPlaceholder, "readonly": false,
 		})
+		invokeOpts.CreateOpt["workspace"] = req.Workspace
 	}
 	for _, m := range req.Mounts {
 		if err := validateBindSource(m.Source, "mount source"); err != nil {
@@ -1008,25 +1010,27 @@ type InstanceDetail struct {
 	SandboxType string             `json:"sandbox_type,omitempty"`
 	SandboxID   string             `json:"sandbox_id,omitempty"`
 	Rootfs      *RootfsInfo        `json:"rootfs,omitempty"`
-	HostUser    string             `json:"host_user,omitempty"`
 	Ports       []string           `json:"ports,omitempty"`
 	EnvVars     map[string]string  `json:"env_vars,omitempty"`
 	Resources   map[string]float64 `json:"resources,omitempty"`
 	StartTime   string             `json:"start_time,omitempty"`
 }
 
-// RootfsInfo mirrors createOptions["rootfs"] (image identity + nested bind mounts).
+// RootfsInfo mirrors createOptions["rootfs"]. User and workspace come from the sibling
+// host_user/workspace keys, not the rootfs JSON.
 type RootfsInfo struct {
-	Type     string      `json:"type,omitempty"`
-	ImageURL string      `json:"imageurl,omitempty"`
-	Mounts   []MountInfo `json:"mounts,omitempty"`
+	Type      string      `json:"type,omitempty"`
+	ImageURL  string      `json:"imageurl,omitempty"`
+	User      string      `json:"user,omitempty"`
+	Workspace string      `json:"workspace,omitempty"`
+	Mounts    []MountInfo `json:"mounts,omitempty"`
 }
 
-// MountInfo is one bind mount from rootfs.mounts.
+// MountInfo is one bind mount. ReadOnly has no omitempty so readonly:false is always printed.
 type MountInfo struct {
 	Source   string `json:"source,omitempty"`
 	Target   string `json:"target,omitempty"`
-	ReadOnly bool   `json:"readonly,omitempty"`
+	ReadOnly bool   `json:"readonly"`
 }
 
 // rootfsJSON mirrors the subset of createOptions["rootfs"] Get needs.
@@ -1108,41 +1112,49 @@ func flattenResources(in map[string]execendpoint.Resource) map[string]float64 {
 	return out
 }
 
-// applyDetailCreateOptions parses rootfs/host_user/network/env_vars from createOptions into the detail.
+// applyDetailCreateOptions parses rootfs/network/env_vars from createOptions into the detail.
 // Malformed JSON is logged and skipped so a bad value never blanks the whole response.
 func applyDetailCreateOptions(d *InstanceDetail, opts map[string]string) {
 	if len(opts) == 0 {
 		return
 	}
-	d.HostUser = opts["host_user"]
-	d.Rootfs = parseRootfs(opts["rootfs"], d.InstanceID)
+	d.Rootfs = parseRootfs(opts["rootfs"], opts["host_user"], opts["workspace"], d.InstanceID)
 	d.Ports = parsePorts(opts["network"])
 	d.EnvVars = parseEnvVars(opts["DELEGATE_ENV_VAR"])
 }
 
-// parseRootfs decodes createOptions["rootfs"] into RootfsInfo, tolerating per-mount
-// JSON errors by skipping the bad mount. Returns nil when the field is empty or invalid.
-func parseRootfs(rootfsStr, instanceID string) *RootfsInfo {
-	if rootfsStr == "" {
-		return nil
-	}
-	var rf rootfsJSON
-	if err := json.Unmarshal([]byte(rootfsStr), &rf); err != nil {
-		log.GetLogger().Warnf("agent get: failed to unmarshal rootfs for %s: %v", instanceID, err)
-		return nil
-	}
-	info := &RootfsInfo{Type: rf.Type, ImageURL: rf.ImageURL}
-	info.Mounts = make([]MountInfo, 0, len(rf.Mounts))
-	for _, raw := range rf.Mounts {
-		var m MountInfo
-		if err := json.Unmarshal(raw, &m); err == nil {
-			info.Mounts = append(info.Mounts, m)
+// parseRootfs decodes createOptions["rootfs"] into RootfsInfo. User and workspace come from
+// the sibling host_user/workspace keys, not the rootfs JSON. Returns nil when every field is
+// empty. Per-mount JSON errors are tolerated by skipping the bad mount (see parseRootfsMounts).
+func parseRootfs(rootfsStr, hostUser, workspace, instanceID string) *RootfsInfo {
+	info := &RootfsInfo{User: hostUser, Workspace: workspace}
+	if rootfsStr != "" {
+		var rf rootfsJSON
+		if err := json.Unmarshal([]byte(rootfsStr), &rf); err != nil {
+			log.GetLogger().Warnf("agent get: failed to unmarshal rootfs for %s: %v", instanceID, err)
+		} else {
+			info.Type = rf.Type
+			info.ImageURL = rf.ImageURL
+			info.Mounts = parseRootfsMounts(rf.Mounts)
 		}
 	}
-	if info.Type != "" || info.ImageURL != "" || len(info.Mounts) > 0 {
+	if info.Type != "" || info.ImageURL != "" || info.User != "" ||
+		info.Workspace != "" || len(info.Mounts) > 0 {
 		return info
 	}
 	return nil
+}
+
+// parseRootfsMounts decodes the raw mounts array, skipping entries that fail to unmarshal.
+func parseRootfsMounts(rawMounts []json.RawMessage) []MountInfo {
+	mounts := make([]MountInfo, 0, len(rawMounts))
+	for _, raw := range rawMounts {
+		var m MountInfo
+		if err := json.Unmarshal(raw, &m); err == nil {
+			mounts = append(mounts, m)
+		}
+	}
+	return mounts
 }
 
 // parsePorts decodes createOptions["network"] into the list of port labels (e.g. "tcp:22").
