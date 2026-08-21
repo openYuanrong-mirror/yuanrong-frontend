@@ -759,6 +759,86 @@ func TestGRPCFrontendProxyLifecycleClientBuildsCreateRequestAndReturnsInstanceID
 	require.Equal(t, []string{"nested-1"}, fakeService.createReq.Create.Args[1].NestedRefs)
 	require.Equal(t, "value-a", fakeService.createReq.Create.CreateOptions["custom-a"])
 	require.Equal(t, "value-b", fakeService.createReq.Create.CreateOptions["create-a"])
+	// No CPU/Memory set → SchedulingOps is nil so the executor applies its own default.
+	require.Nil(t, fakeService.createReq.Create.GetSchedulingOps())
+}
+
+func TestGRPCFrontendProxyLifecycleClientBuildsCreateRequestEmitsCpuMemory(t *testing.T) {
+	fakeService := &fakeFrontendProxyServiceClient{
+		createResp: &frontend_proxy.CreateInstanceResponse{
+			Status:       &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			Create:       &core.CreateResponse{Code: common.ErrorCode_ERR_NONE, InstanceID: "instance-created"},
+			RouteAddress: "proxy-node-a",
+		},
+	}
+	client := newGRPCFrontendProxyLifecycleClient(fakeService, "frontend-1")
+
+	_, err := client.CreateInstance(simpleRuntimeCreateRequest{
+		funcMeta: api.FunctionMeta{FuncID: "func-key", Api: api.FaaSApi},
+		options: api.InvokeOptions{
+			Cpu:             600,
+			Memory:          2048,
+			CustomResources: map[string]float64{"nvidia.com/gpu": 1},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, fakeService.createReq.Create.GetSchedulingOps())
+	resources := fakeService.createReq.Create.GetSchedulingOps().GetResources()
+	require.Equal(t, float64(600), resources[constant.ResourceCPUName])
+	require.Equal(t, float64(2048), resources[constant.ResourceMemoryName])
+	require.Equal(t, float64(1), resources["nvidia.com/gpu"])
+}
+
+func TestGRPCFrontendProxyLifecycleClientBuildsCreateRequestPassesThroughInvalidValues(t *testing.T) {
+	fakeService := &fakeFrontendProxyServiceClient{
+		createResp: &frontend_proxy.CreateInstanceResponse{
+			Status:       &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			Create:       &core.CreateResponse{Code: common.ErrorCode_ERR_NONE, InstanceID: "instance-created"},
+			RouteAddress: "proxy-node-a",
+		},
+	}
+	client := newGRPCFrontendProxyLifecycleClient(fakeService, "frontend-1")
+
+	// Invalid values are passed through unvalidated; the docker daemon rejects them.
+	_, err := client.CreateInstance(simpleRuntimeCreateRequest{
+		funcMeta: api.FunctionMeta{FuncID: "func-key", Api: api.FaaSApi},
+		options:  api.InvokeOptions{Cpu: -1, Memory: 0},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, fakeService.createReq.Create.GetSchedulingOps())
+	resources := fakeService.createReq.Create.GetSchedulingOps().GetResources()
+	require.Equal(t, float64(-1), resources[constant.ResourceCPUName])
+	_, hasMemory := resources[constant.ResourceMemoryName]
+	require.False(t, hasMemory, "zero memory must be omitted")
+}
+
+func TestGRPCFrontendProxyLifecycleClientBuildsCreateRequestOmitsMissingCpuMemory(t *testing.T) {
+	fakeService := &fakeFrontendProxyServiceClient{
+		createResp: &frontend_proxy.CreateInstanceResponse{
+			Status:       &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+			Create:       &core.CreateResponse{Code: common.ErrorCode_ERR_NONE, InstanceID: "instance-created"},
+			RouteAddress: "proxy-node-a",
+		},
+	}
+	client := newGRPCFrontendProxyLifecycleClient(fakeService, "frontend-1")
+
+	// Only a custom resource set, no CPU/Memory → resources has the custom key only,
+	// CPU/Memory fall through to the executor default.
+	_, err := client.CreateInstance(simpleRuntimeCreateRequest{
+		funcMeta: api.FunctionMeta{FuncID: "func-key", Api: api.FaaSApi},
+		options:  api.InvokeOptions{CustomResources: map[string]float64{"nvidia.com/gpu": 2}},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, fakeService.createReq.Create.GetSchedulingOps())
+	resources := fakeService.createReq.Create.GetSchedulingOps().GetResources()
+	require.Equal(t, float64(2), resources["nvidia.com/gpu"])
+	_, hasCPU := resources[constant.ResourceCPUName]
+	require.False(t, hasCPU, "zero CPU must be omitted")
+	_, hasMemory := resources[constant.ResourceMemoryName]
+	require.False(t, hasMemory, "zero memory must be omitted")
 }
 
 func TestGRPCFrontendProxyLifecycleClientMarksCreateSourceAsFrontend(t *testing.T) {

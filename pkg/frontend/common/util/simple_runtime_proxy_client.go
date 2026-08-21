@@ -329,6 +329,7 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreat
 			RequestID:     requestID,
 			TraceID:       req.options.TraceID,
 			CreateOptions: convertSimpleRuntimeCreateOptions(req.options),
+			SchedulingOps: convertSimpleRuntimeSchedulingOps(req.options),
 		},
 	})
 	if err != nil {
@@ -1457,6 +1458,31 @@ func convertSimpleRuntimeCreateOptions(options api.InvokeOptions) map[string]str
 		createOptions[frontendProxyCreateSourceKey] = frontendProxyCreateSource
 	}
 	return createOptions
+}
+
+// convertSimpleRuntimeSchedulingOps maps InvokeOptions into CreateRequest.SchedulingOps so
+// the proxy can read CPU/Memory from the structured scheduling field. CPU/Memory are emitted
+// only when non-zero (absent → executor default); values are passed through unvalidated.
+func convertSimpleRuntimeSchedulingOps(options api.InvokeOptions) *core.SchedulingOptions {
+	resources := make(map[string]float64, 2+len(options.CustomResources))
+	if options.Cpu != 0 {
+		resources[constant.ResourceCPUName] = float64(options.Cpu)
+	}
+	if options.Memory != 0 {
+		resources[constant.ResourceMemoryName] = float64(options.Memory)
+	}
+	for k, v := range options.CustomResources {
+		resources[k] = v
+	}
+
+	if len(resources) == 0 && options.Priority == 0 && options.ScheduleTimeoutMs == 0 {
+		return nil
+	}
+	return &core.SchedulingOptions{
+		Priority:          int32(options.Priority),
+		Resources:         resources,
+		ScheduleTimeoutMs: options.ScheduleTimeoutMs,
+	}
 }
 
 func firstArgTenantID(args []api.Arg) string {
