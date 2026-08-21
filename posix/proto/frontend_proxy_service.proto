@@ -67,6 +67,9 @@ message FrontendProxyStatus {
 message InvokeInstanceRequest {
   FrontendRequestContext context = 1;
   core_service.InvokeRequest invoke = 2;
+  // Function execution timeout supplied by frontend. The proxy adds its own
+  // result-forwarding buffer before timing out the synchronous wait.
+  int64 invokeTimeoutMs = 3;
 }
 
 message InvokeInstanceResponse {
