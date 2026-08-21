@@ -495,6 +495,7 @@ func TestGRPCFrontendProxyInvokeClientBuildsRequestAndReturnsMessagePayload(t *t
 		}},
 		options: api.InvokeOptions{
 			TraceID:          "trace-1",
+			Timeout:          60,
 			CustomExtensions: map[string]string{"tag-a": "value-a"},
 			CreateOpt:        map[string]string{"YR_ROUTE": "proxy-a"},
 		},
@@ -502,6 +503,19 @@ func TestGRPCFrontendProxyInvokeClientBuildsRequestAndReturnsMessagePayload(t *t
 
 	require.NoError(t, err)
 	requireFaaSInvokeRequest(t, fakeService, payload, got)
+	require.Equal(t, int64(60_000), fakeService.req.InvokeTimeoutMs)
+}
+
+func TestFrontendProxyInvokeContextAddsResultBuffer(t *testing.T) {
+	started := time.Now()
+	ctx, cancel := simpleRuntimeInvokeContextWithParent(
+		context.Background(), api.InvokeOptions{Timeout: 60}, frontendProxyInvokeResultBuffer,
+	)
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok)
+	require.WithinDuration(t, started.Add(70*time.Second), deadline, time.Second)
 }
 
 func TestConvertSimpleRuntimeInvokeOptionsUsesExistingRuntimeProtocol(t *testing.T) {
