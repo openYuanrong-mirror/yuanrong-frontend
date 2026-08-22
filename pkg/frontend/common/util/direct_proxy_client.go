@@ -233,7 +233,9 @@ func (c *directProxyClient) Invoke(req DirectInvokeRequest) ([]byte, error) {
 	invokeOpts.RetryTimes = req.RetryTimes
 	invokeOpts.ForceInvoke = req.ForceInvoke
 	invokeOpts.BypassDataSystem = req.BypassDataSystem
-	routeCtx, cancelRoute := simpleRuntimeInvokeContext(invokeOpts)
+	routeCtx, cancelRoute := simpleRuntimeInvokeContextWithParent(
+		context.Background(), invokeOpts, frontendProxyInvokeResultBuffer,
+	)
 	defer cancelRoute()
 	proxyReq := simpleRuntimeInvokeRequest{
 		ctx:        routeCtx,
