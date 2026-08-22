@@ -73,6 +73,7 @@ const (
 	frontendProxyControlNotWired                      = "control-path-not-wired"
 	simpleRuntimeFaaSMetaPrefix                       = "0000000000000000"
 	defaultFrontendProxyTimeout                       = 60 * time.Second
+	frontendProxyInvokeResultBuffer                   = 10 * time.Second
 	frontendProxyKeepaliveTimeout                     = 10 * time.Second
 	frontendProxyKillMaxAttempts                      = 2
 	runtimeRequestIDLength                            = 18
@@ -172,7 +173,7 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceID(req simpleRuntimeInvo
 		return nil, fmt.Errorf("frontend proxy grpc client is nil")
 	}
 	requestID := newFrontendProxyRuntimeRequestID()
-	ctx, cancel := simpleRuntimeInvokeContext(req.options)
+	ctx, cancel := simpleRuntimeInvokeContextWithParent(req.ctx, req.options, frontendProxyInvokeResultBuffer)
 	defer cancel()
 	invokeArgs, releaseInvokeArgs := convertSimpleRuntimeInvokeArgsForRPC(req.funcMeta, req.args)
 	defer releaseInvokeArgs()
@@ -191,6 +192,7 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceID(req simpleRuntimeInvo
 			TraceID:       req.options.TraceID,
 			InvokeOptions: convertSimpleRuntimeInvokeOptions(req.options),
 		},
+		InvokeTimeoutMs: functionInvokeTimeoutMs(req.options),
 	})
 	if err != nil {
 		return nil, newDirectProxyPostDispatchError("invoke transport", err)
@@ -209,7 +211,7 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceIDStream(
 		return nil, fmt.Errorf("frontend proxy streaming invoke response writer is nil")
 	}
 	requestID := newFrontendProxyRuntimeRequestID()
-	baseCtx, cancel := simpleRuntimeInvokeContext(req.options)
+	baseCtx, cancel := simpleRuntimeInvokeContextWithParent(req.ctx, req.options, frontendProxyInvokeResultBuffer)
 	defer cancel()
 	ctx, cancelStream := context.WithCancel(baseCtx)
 	defer cancelStream()
@@ -237,6 +239,7 @@ func (c *grpcFrontendProxyInvokeClient) InvokeByInstanceIDStream(
 			TraceID:       req.options.TraceID,
 			InvokeOptions: convertSimpleRuntimeInvokeOptions(req.options),
 		},
+		InvokeTimeoutMs: functionInvokeTimeoutMs(req.options),
 	})
 	if err != nil {
 		return nil, newDirectProxyPostDispatchError("invoke stream transport", err)
@@ -439,7 +442,7 @@ func (c *grpcFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKillReq
 		return fmt.Errorf("frontend proxy grpc client is nil")
 	}
 	requestID := fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1))
-	ctx, cancel := simpleRuntimeInvokeContextWithParent(req.ctx, req.options)
+	ctx, cancel := simpleRuntimeInvokeContextWithParent(req.ctx, req.options, 0)
 	defer cancel()
 	resp, err := c.client.KillInstance(ctx, &frontend_proxy.KillInstanceRequest{
 		Context: frontendRequestContextFromInvokeOptions(c.frontendClientID, req.tenantID, requestID, req.options),
@@ -856,12 +859,13 @@ func (p *frontendProxyGRPCClientPool) EvictAddress(address string) {
 }
 
 func simpleRuntimeInvokeContext(options api.InvokeOptions) (context.Context, context.CancelFunc) {
-	return simpleRuntimeInvokeContextWithParent(context.Background(), options)
+	return simpleRuntimeInvokeContextWithParent(context.Background(), options, 0)
 }
 
 func simpleRuntimeInvokeContextWithParent(
 	parent context.Context,
 	options api.InvokeOptions,
+	timeoutBuffer time.Duration,
 ) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
@@ -870,7 +874,14 @@ func simpleRuntimeInvokeContextWithParent(
 	if options.Timeout > 0 {
 		timeout = time.Duration(options.Timeout) * time.Second
 	}
-	return context.WithTimeout(parent, timeout)
+	return context.WithTimeout(parent, timeout+timeoutBuffer)
+}
+
+func functionInvokeTimeoutMs(options api.InvokeOptions) int64 {
+	if options.Timeout <= 0 {
+		return 0
+	}
+	return int64(options.Timeout) * int64(time.Second/time.Millisecond)
 }
 
 func rawSimpleRuntimeContext(parent context.Context, _ api.RawRequestOption) (context.Context, context.CancelFunc) {
