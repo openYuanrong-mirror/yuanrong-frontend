@@ -27,10 +27,41 @@
 package execendpoint
 
 import (
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
 )
+
+const (
+	// StatusRunning mirrors FunctionSystem's RUNNING InstanceState.
+	StatusRunning int32 = 3
+	// StatusPaused mirrors FunctionSystem's PAUSED InstanceState.
+	StatusPaused int32 = 13
+
+	// InstanceManagerOwner is the control-plane owner persisted for PAUSED
+	// instances. It is not a routable FunctionProxy node ID.
+	InstanceManagerOwner = "InstanceManagerOwner"
+)
+
+// ErrInstancePaused identifies requests rejected because the logical instance
+// has no live runtime while it is owned by InstanceManager.
+var ErrInstancePaused = errors.New("instance paused")
+
+type instancePausedError struct{ instanceID string }
+
+func (e instancePausedError) Error() string {
+	return fmt.Sprintf("instance %s is paused", e.instanceID)
+}
+
+func (e instancePausedError) Is(target error) bool { return target == ErrInstancePaused }
+
+// NewInstancePausedError returns an instance-specific error that still works
+// with errors.Is(err, ErrInstancePaused).
+func NewInstancePausedError(instanceID string) error {
+	return instancePausedError{instanceID: instanceID}
+}
 
 // Endpoint is the minimal backend coordinate the exec path needs for one
 // instance: where to dial (ProxyGrpcAddress) and which container to exec into
@@ -136,6 +167,14 @@ func (s *Store) GetSummary(instanceID string) (Summary, bool) {
 	defer s.mu.RUnlock()
 	summary, ok := s.summaries[instanceID]
 	return summary, ok
+}
+
+// IsPaused reports whether the authoritative watcher summary has PAUSED state.
+// Status is decisive here: even malformed PAUSED metadata must never fall
+// through into stale runtime routing.
+func (s *Store) IsPaused(instanceID string) bool {
+	summary, ok := s.GetSummary(instanceID)
+	return ok && summary.StatusCode == StatusPaused
 }
 
 // Delete removes the endpoint for instanceID (no-op if absent).

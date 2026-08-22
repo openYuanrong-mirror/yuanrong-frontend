@@ -81,7 +81,8 @@ func New(cfg *config.SandboxRouterConfig) (*Router, error) {
 	}
 	cfg.ApplyDefaults()
 
-	res := resolver.NewInstanceInfoWatchResolver()
+	res := resolver.NewInstanceInfoWatchResolverWithTimeout(
+		time.Duration(cfg.ResolveTimeoutMs) * time.Millisecond)
 	server := proxy.New(res)
 	server.SetAuth(cfg.EnableJWTAuth, cfg.ValidateIAM, uint16(cfg.RRTPort), uint16(cfg.TunnelPort))
 

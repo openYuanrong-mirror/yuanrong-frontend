@@ -170,6 +170,29 @@ func TestApplyEventNonRunningRemoved(t *testing.T) {
 	}
 }
 
+func TestApplyEventPausedKeepsSummaryWithoutExecEndpoint(t *testing.T) {
+	s := NewStore()
+	const pausedJSON = `{"instanceID":"inst-abc","tenantID":"default",` +
+		`"proxyGrpcAddress":"","functionProxyID":"InstanceManagerOwner",` +
+		`"instanceStatus":{"code":13,"msg":"paused"}}`
+
+	ApplyInstanceEvent(s, EventPut, instanceKey, []byte(pausedJSON))
+
+	if _, ok := s.Get("inst-abc"); ok {
+		t.Fatal("PAUSED instance must not retain a stale exec endpoint")
+	}
+	summary, ok := s.GetSummary("inst-abc")
+	if !ok {
+		t.Fatal("PAUSED instance should remain visible for lifecycle authorization and status")
+	}
+	if summary.TenantID != "default" || summary.StatusCode != StatusPaused || summary.StatusMsg != "paused" {
+		t.Fatalf("unexpected paused summary: %+v", summary)
+	}
+	if summary.NodeID != "InstanceManagerOwner" || summary.ContainerID != "" || summary.ContainerIP != "" {
+		t.Fatalf("paused summary retained source physical identity: %+v", summary)
+	}
+}
+
 func TestApplyEventEmptyProxyStillCachedForList(t *testing.T) {
 	s := NewStore()
 	const noProxyJSON = `{"instanceID":"inst-abc","tenantID":"default","proxyGrpcAddress":"","instanceStatus":{"code":3}}`

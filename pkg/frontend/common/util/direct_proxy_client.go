@@ -23,6 +23,7 @@ import (
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
+	"frontend/pkg/common/faas_common/grpc/pb/core"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/proxyrouting"
 )
@@ -39,6 +40,7 @@ type DirectProxyClient interface {
 	CreateRaw(req DirectRawRequest) ([]byte, error)
 	InvokeRaw(req DirectRawRequest) ([]byte, error)
 	KillInstance(req DirectKillRequest) error
+	KillInstanceWithResponse(req DirectKillRequest) (*core.KillResponse, error)
 }
 
 // DirectInvokeRequest is the inline-data DTO exposed by DirectProxyClient. It
@@ -77,6 +79,7 @@ type DirectKillRequest struct {
 	Payload              []byte
 	TraceID, TraceParent string
 	TimeoutSeconds       int
+	RequestID            string
 }
 
 // NewDirectInvokeRequest validates and converts an inline invocation request.
@@ -304,12 +307,20 @@ func (c *directProxyClient) InvokeRaw(req DirectRawRequest) ([]byte, error) {
 }
 
 func (c *directProxyClient) KillInstance(req DirectKillRequest) error {
+	_, err := c.KillInstanceWithResponse(req)
+	return err
+}
+
+// KillInstanceWithResponse dispatches a lifecycle signal and returns its
+// authoritative payload. Pause and Resume use this to synchronously return the
+// committed snapshot or route while ordinary callers may ignore the response.
+func (c *directProxyClient) KillInstanceWithResponse(req DirectKillRequest) (*core.KillResponse, error) {
 	if c == nil || c.lifecycleClient == nil {
-		return fmt.Errorf("direct proxy lifecycle client is not initialized")
+		return nil, fmt.Errorf("direct proxy lifecycle client is not initialized")
 	}
 	options := req.AdaptedInvokeOptions()
-	return c.lifecycleClient.KillInstance(simpleRuntimeKillRequest{
+	return c.lifecycleClient.KillInstanceWithResponse(simpleRuntimeKillRequest{
 		ctx: req.Context, instanceID: req.InstanceID, tenantID: req.TenantID,
-		signal: req.Signal, payload: req.Payload, options: options,
+		signal: req.Signal, payload: req.Payload, requestID: req.RequestID, options: options,
 	})
 }

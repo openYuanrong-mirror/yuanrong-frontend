@@ -56,6 +56,7 @@ import (
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/instancemanager"
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"
+	"frontend/pkg/frontend/sandboxrouter/resolver"
 	"frontend/pkg/frontend/sandboxrouter/route"
 	"frontend/pkg/frontend/schedulerproxy"
 
@@ -65,48 +66,52 @@ import (
 const (
 	// Sandbox v1 always executes through the dedicated Rust slot (rrt).
 	// The public runtime field selects only the sandbox isolation runtime.
-	defaultSandboxRuntime          = "rrt"
-	defaultSandboxFunctionID       = "default/0-defaultservice-rrt/$latest"
-	sandboxCreateTimeoutSeconds    = 60
-	sandboxScheduleBufferSeconds   = 30
-	sandboxDefaultCPU              = 1000
-	sandboxDefaultMemory           = 2048
-	sandboxInitTimeoutSeconds      = 305
-	sandboxGracefulShutdownSeconds = 5
-	sandboxDirectoryQuotaMB        = 512
-	sandboxInstanceType            = "reserved"
-	sandboxDelegateDirectory       = "/tmp"
-	sandboxConcurrency             = "1"
-	sandboxModuleName              = "yr.sandbox.sandbox"
-	sandboxClassName               = "SandboxInstance"
-	sandboxTemporarySchedulerNote  = "-temporary"
-	sandboxKillInstanceSignal      = constant.KillSignalVal
-	sandboxRunningPollTimeout      = 5 * time.Second
-	sandboxRunningPollInterval     = 200 * time.Millisecond
-	sandboxDefaultRRTHTTPPort      = 50090
-	sandboxDefaultTunnelWSPort     = 8765
-	sandboxDefaultTunnelHTTPPort   = 8766
-	inlineValueLengthOffset        = 8
-	maxSandboxPort                 = 65535
-	portForwardingFormatParts      = 2
-	createTimeoutSuccessCode       = 3002
-	sandboxInstanceDuplicatedCode  = 1004
-	millisecondsPerSecond          = 1000
-	sandboxCreateHeartbeatInterval = 2 * time.Second
-	sandboxCreateStatusCreating    = "creating"
-	sandboxCreateStatusRunning     = "running"
-	sandboxCreateStatusTimeout     = "timeout"
-	sandboxCreateStatusFailed      = "failed"
-	sandboxCreateReplayTTL         = 10 * time.Minute
-	sandboxCreateReplayMaxEntries  = 10000
-	sandboxCreateRequestBodyLimit  = 1 << 20
-	sandboxRawRequestIDLength      = 18
-	sandboxRawRequestSequence      = "00"
-	sandboxXPUFieldCount           = 3
-	sandboxStorageResourceName     = "storage"
-	sandboxStorageLimitExtension   = "STORAGE_LIMIT"
-	bytesPerMiB                    = 1024 * 1024
-	decimalRadix                   = 10
+	defaultSandboxRuntime           = "rrt"
+	defaultSandboxFunctionID        = "default/0-defaultservice-rrt/$latest"
+	sandboxCreateTimeoutSeconds     = 60
+	sandboxScheduleBufferSeconds    = 30
+	sandboxDefaultCPU               = 1000
+	sandboxDefaultMemory            = 2048
+	sandboxInitTimeoutSeconds       = 305
+	sandboxGracefulShutdownSeconds  = 5
+	sandboxDirectoryQuotaMB         = 512
+	sandboxInstanceType             = "reserved"
+	sandboxDelegateDirectory        = "/tmp"
+	sandboxConcurrency              = "1"
+	sandboxModuleName               = "yr.sandbox.sandbox"
+	sandboxClassName                = "SandboxInstance"
+	sandboxTemporarySchedulerNote   = "-temporary"
+	sandboxKillInstanceSignal       = constant.KillSignalVal
+	sandboxPauseInstanceSignal      = 18
+	sandboxResumeInstanceSignal     = 19
+	sandboxPauseDefaultTTLSeconds   = 90_000
+	sandboxLifecycleRequestIDHeader = "X-YR-Request-ID"
+	sandboxRunningPollTimeout       = 5 * time.Second
+	sandboxRunningPollInterval      = 200 * time.Millisecond
+	sandboxDefaultRRTHTTPPort       = 50090
+	sandboxDefaultTunnelWSPort      = 8765
+	sandboxDefaultTunnelHTTPPort    = 8766
+	inlineValueLengthOffset         = 8
+	maxSandboxPort                  = 65535
+	portForwardingFormatParts       = 2
+	createTimeoutSuccessCode        = 3002
+	sandboxInstanceDuplicatedCode   = 1004
+	millisecondsPerSecond           = 1000
+	sandboxCreateHeartbeatInterval  = 2 * time.Second
+	sandboxCreateStatusCreating     = "creating"
+	sandboxCreateStatusRunning      = "running"
+	sandboxCreateStatusTimeout      = "timeout"
+	sandboxCreateStatusFailed       = "failed"
+	sandboxCreateReplayTTL          = 10 * time.Minute
+	sandboxCreateReplayMaxEntries   = 10000
+	sandboxCreateRequestBodyLimit   = 1 << 20
+	sandboxRawRequestIDLength       = 18
+	sandboxRawRequestSequence       = "00"
+	sandboxXPUFieldCount            = 3
+	sandboxStorageResourceName      = "storage"
+	sandboxStorageLimitExtension    = "STORAGE_LIMIT"
+	bytesPerMiB                     = 1024 * 1024
+	decimalRadix                    = 10
 )
 
 var selectSandboxSchedulerID = func(funcKey string) (string, error) {
@@ -131,11 +136,67 @@ var waitForSandboxInstanceRunning = func(instanceID, functionID, resourceSpecNot
 	return isSandboxInstanceRunning(instanceID, functionID, resourceSpecNote)
 }
 
+var readAuthoritativeSandboxInstance = resolver.ReadAuthoritativeInstance
+
 var (
-	sandboxXPUTypePattern  = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
-	sandboxXPUCountPattern = regexp.MustCompile(`^[0-9]+$`)
-	sandboxDNSLabelPattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
+	sandboxXPUTypePattern           = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+	sandboxXPUCountPattern          = regexp.MustCompile(`^[0-9]+$`)
+	sandboxPauseRequestIDPattern    = regexp.MustCompile(`^pause-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxResumeRequestIDPattern   = regexp.MustCompile(`^resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxSnapshotRequestIDPattern = regexp.MustCompile(`^snapshot-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxDNSLabelPattern          = regexp.MustCompile(`^[a-z0-9_-]+$`)
 )
+
+type pauseV1Request struct {
+	TTLSeconds int32 `json:"ttlSeconds"`
+}
+
+type pauseV1Response struct {
+	SandboxID  string `json:"sandboxId"`
+	SnapshotID string `json:"snapshotId"`
+	Size       int64  `json:"size"`
+	State      string `json:"state"`
+	ExpiresAt  int64  `json:"expiresAt"`
+}
+
+type resumeV1Response struct {
+	SandboxID       string         `json:"sandboxId"`
+	State           string         `json:"state"`
+	RouteAddress    string         `json:"routeAddress"`
+	FunctionProxyID string         `json:"functionProxyId"`
+	NodeID          string         `json:"nodeId"`
+	PortMappings    map[string]int `json:"portMappings"`
+}
+
+type sandboxLifecycleTransportError struct {
+	cause error
+}
+
+func (e *sandboxLifecycleTransportError) Error() string { return e.cause.Error() }
+func (e *sandboxLifecycleTransportError) Unwrap() error { return e.cause }
+
+type sandboxLifecycleHTTPError struct {
+	status int
+	cause  error
+}
+
+func (e *sandboxLifecycleHTTPError) Error() string { return e.cause.Error() }
+func (e *sandboxLifecycleHTTPError) Unwrap() error { return e.cause }
+
+type sandboxLifecycleBusinessError struct {
+	operation string
+	code      common.ErrorCode
+	message   string
+}
+
+func (e *sandboxLifecycleBusinessError) Error() string {
+	return fmt.Sprintf("%s failed: code=%d message=%s", e.operation, e.code, e.message)
+}
+
+type reusableSnapshotInfo struct {
+	SnapshotID string   `json:"snapshotId"`
+	Names      []string `json:"names"`
+}
 
 // CreateRequest holds the parameters for sandbox creation.
 type CreateRequest struct {
@@ -161,6 +222,7 @@ type CreateRequest struct {
 	StorageMb      *int64                   `json:"storageMb,omitempty"`
 	StorageLimitMb int64                    `json:"storage_limit_mb"`
 	Network        *SandboxNetworkPolicy    `json:"network,omitempty"`
+	SnapshotID     string                   `json:"snapshotId,omitempty"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -226,6 +288,7 @@ type CreateV1Request struct {
 	ScheduleAffinities     []api.Affinity           `json:"scheduleAffinities,omitempty"`
 	Tunnel                 TunnelSpec               `json:"tunnel,omitempty"`
 	Network                *SandboxNetworkPolicy    `json:"network,omitempty"`
+	SnapshotID             string                   `json:"snapshotId,omitempty"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
 	portRouteKinds         map[int]string
@@ -764,6 +827,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		StorageLimitMb:         req.StorageLimitMb,
 		Network:                req.Network,
 		ScheduleAffinities:     req.ScheduleAffinities,
+		SnapshotID:             strings.TrimSpace(req.SnapshotID),
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
 		nameGenerated:          req.nameGenerated,
@@ -1068,6 +1132,7 @@ func isSandboxInstanceDuplicated(err error) bool {
 type sandboxInvocation struct {
 	funcID     string
 	invokeOpts api.InvokeOptions
+	snapshotID string
 }
 
 func prepareSandboxInvocation(
@@ -1101,7 +1166,7 @@ func prepareSandboxInvocation(
 	if err != nil {
 		return sandboxInvocation{}, err
 	}
-	return sandboxInvocation{funcID: funcID, invokeOpts: invokeOpts}, nil
+	return sandboxInvocation{funcID: funcID, invokeOpts: invokeOpts, snapshotID: req.SnapshotID}, nil
 }
 
 func createSandboxInstanceRaw(
@@ -1191,6 +1256,7 @@ func buildSandboxRawCreateRequest(
 		Labels:               append([]string(nil), invokeOpts.Labels...),
 		DesignatedInstanceID: namespace + "-" + name,
 		CreateOptions:        createOptions,
+		SnapshotID:           strings.TrimSpace(invocation.snapshotID),
 	}, nil
 }
 
@@ -2251,6 +2317,230 @@ func DeleteHandler(ctx *gin.Context) {
 	app.SetCtxResponse(ctx, map[string]string{"status": "deleted"}, http.StatusOK, nil)
 }
 
+// PauseV1Handler synchronously pauses one sandbox through signal 18.
+func PauseV1Handler(ctx *gin.Context) {
+	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
+	runningSummary, hadRunningSummary := execendpoint.Default().GetSummary(instanceID)
+	var req pauseV1Request
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err))
+		return
+	}
+	if req.TTLSeconds == 0 {
+		req.TTLSeconds = sandboxPauseDefaultTTLSeconds
+	}
+	if req.TTLSeconds < 0 {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, errors.New("ttlSeconds must be positive"))
+		return
+	}
+	payload, err := proto.Marshal(&core.SnapOptions{
+		Type: common.SnapType_PAUSE_RESUME,
+		Ttl:  req.TTLSeconds,
+	})
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
+		return
+	}
+	killResponse, err := executeSandboxLifecycleKill(
+		ctx,
+		sandboxPauseInstanceSignal,
+		payload,
+		sandboxPauseRequestIDPattern,
+		"pause",
+	)
+	if err != nil {
+		setSandboxLifecycleError(ctx, err)
+		return
+	}
+	var snapInfo core.SnapInfo
+	if err := proto.Unmarshal(killResponse.GetPayload(), &snapInfo); err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("invalid pause response: %v", err))
+		return
+	}
+	requestID := strings.TrimSpace(ctx.GetHeader(sandboxLifecycleRequestIDHeader))
+	if snapInfo.GetSnapshotID() != requestID || snapInfo.GetSize() <= 0 {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError,
+			fmt.Errorf("invalid pause response identity or size"))
+		return
+	}
+	if hadRunningSummary {
+		runningSummary.StatusCode = execendpoint.StatusPaused
+		runningSummary.StatusMsg = "paused"
+		runningSummary.NodeID = execendpoint.InstanceManagerOwner
+		runningSummary.ContainerID = ""
+		runningSummary.ContainerIP = ""
+		execendpoint.Default().PutSummary(runningSummary)
+		execendpoint.Default().DeleteEndpoint(instanceID)
+		instancemanager.RecordRouteOnlyInstance(
+			runningSummary.Function, instanceID, execendpoint.InstanceManagerOwner)
+	}
+	app.SetCtxResponse(ctx, pauseV1Response{
+		SandboxID:  instanceID,
+		SnapshotID: snapInfo.GetSnapshotID(),
+		Size:       snapInfo.GetSize(),
+		State:      "paused",
+		ExpiresAt:  time.Now().Unix() + int64(req.TTLSeconds),
+	}, http.StatusOK, nil)
+}
+
+// ResumeV1Handler synchronously resumes one sandbox through signal 19.
+func ResumeV1Handler(ctx *gin.Context) {
+	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
+	payload, err := proto.Marshal(&core.SnapStartOptions{Type: common.SnapType_PAUSE_RESUME})
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
+		return
+	}
+	killResponse, err := executeSandboxLifecycleKill(
+		ctx,
+		sandboxResumeInstanceSignal,
+		payload,
+		sandboxResumeRequestIDPattern,
+		"resume",
+	)
+	if err != nil {
+		setSandboxLifecycleError(ctx, err)
+		return
+	}
+	var started core.SnapStartedInfo
+	if err := proto.Unmarshal(killResponse.GetPayload(), &started); err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("invalid resume response: %v", err))
+		return
+	}
+	if started.GetInstanceID() != instanceID || started.GetRouteAddress() == "" ||
+		started.GetFunctionProxyID() == "" {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError,
+			fmt.Errorf("invalid resume response identity or route"))
+		return
+	}
+	portMappings, err := parseResumePortMappings(started.GetPortMappings())
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("invalid resume port mappings: %v", err))
+		return
+	}
+	// SandboxRouter caches converge independently through ETCD watch/read-through;
+	// local route publication is not part of the lifecycle success boundary.
+	app.SetCtxResponse(ctx, resumeV1Response{
+		SandboxID:       started.GetInstanceID(),
+		State:           "running",
+		RouteAddress:    started.GetRouteAddress(),
+		FunctionProxyID: started.GetFunctionProxyID(),
+		NodeID:          started.GetNodeID(),
+		PortMappings:    portMappings,
+	}, http.StatusOK, nil)
+}
+
+func parseResumePortMappings(encoded string) (map[string]int, error) {
+	const physicalMappingFieldCount = 3
+
+	result := map[string]int{}
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
+		return result, nil
+	}
+	if strings.HasPrefix(encoded, "{") {
+		if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+	var physical []string
+	if err := json.Unmarshal([]byte(encoded), &physical); err != nil {
+		return nil, err
+	}
+	for _, mapping := range physical {
+		parts := strings.Split(mapping, ":")
+		if len(parts) != physicalMappingFieldCount {
+			return nil, fmt.Errorf("malformed physical mapping %q", mapping)
+		}
+		hostPort, err := strconv.Atoi(parts[1])
+		if err != nil || hostPort <= 0 || hostPort > maxSandboxPort {
+			return nil, fmt.Errorf("invalid host port in mapping %q", mapping)
+		}
+		containerPort, err := strconv.Atoi(parts[2])
+		if err != nil || containerPort <= 0 || containerPort > maxSandboxPort {
+			return nil, fmt.Errorf("invalid container port in mapping %q", mapping)
+		}
+		key := strconv.Itoa(containerPort)
+		if previous, exists := result[key]; exists && previous != hostPort {
+			return nil, fmt.Errorf("conflicting host ports for container port %d", containerPort)
+		}
+		result[key] = hostPort
+	}
+	return result, nil
+}
+
+func executeSandboxLifecycleKill(
+	ctx *gin.Context,
+	signal int,
+	payload []byte,
+	requestIDPattern *regexp.Regexp,
+	operation string,
+) (*core.KillResponse, error) {
+	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
+	if instanceID == "" {
+		return nil, errors.New("sandboxID is required")
+	}
+	requestID := strings.TrimSpace(ctx.GetHeader(sandboxLifecycleRequestIDHeader))
+	if !requestIDPattern.MatchString(requestID) {
+		return nil, fmt.Errorf("%s must contain a valid SDK %s request ID", sandboxLifecycleRequestIDHeader, operation)
+	}
+	needsAuth, statusCode, err := ensureDeleteJWTContext(ctx, ctx.GetHeader(constant.HeaderTraceID))
+	if err != nil {
+		return nil, &sandboxLifecycleHTTPError{status: statusCode, cause: err}
+	}
+	if needsAuth {
+		if statusCode, err := authorizeSandboxDelete(ctx, instanceID); err != nil {
+			return nil, &sandboxLifecycleHTTPError{status: statusCode, cause: err}
+		}
+	}
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	invokeOptions := api.InvokeOptions{
+		TraceID: ctx.GetHeader(constant.HeaderTraceID),
+		CustomExtensions: map[string]string{
+			"traceparent": ctx.GetHeader(constant.HeaderTraceParent),
+		},
+	}
+	killRequest := util.NewDirectKillRequest(
+		ctx.Request.Context(), instanceID, signal, payload, tenantID, invokeOptions)
+	killRequest.RequestID = requestID
+	response, err := util.GetDirectProxyClient().KillInstanceWithResponse(killRequest)
+	if err != nil {
+		return nil, &sandboxLifecycleTransportError{cause: err}
+	}
+	if response.GetCode() != common.ErrorCode_ERR_NONE {
+		return nil, &sandboxLifecycleBusinessError{
+			operation: operation,
+			code:      response.GetCode(),
+			message:   response.GetMessage(),
+		}
+	}
+	return response, nil
+}
+
+func setSandboxLifecycleError(ctx *gin.Context, err error) {
+	statusCode := http.StatusInternalServerError
+	var transportError *sandboxLifecycleTransportError
+	var businessError *sandboxLifecycleBusinessError
+	var httpError *sandboxLifecycleHTTPError
+	if errors.As(err, &httpError) {
+		statusCode = httpError.status
+	} else if errors.As(err, &transportError) {
+		statusCode = http.StatusServiceUnavailable
+	} else if errors.As(err, &businessError) {
+		statusCode = http.StatusConflict
+	} else if strings.Contains(err.Error(), sandboxLifecycleRequestIDHeader) ||
+		strings.Contains(err.Error(), "required") ||
+		strings.Contains(err.Error(), "authorized") ||
+		strings.Contains(err.Error(), "tenant") {
+		statusCode = http.StatusBadRequest
+	}
+	app.SetCtxResponse(ctx, nil, statusCode, err)
+}
+
 func needsDeleteAuthorization(ctx *gin.Context) bool {
 	if !config.GetConfig().IamConfig.EnableFuncTokenAuth {
 		return false
@@ -2293,14 +2583,24 @@ func authorizeSandboxDelete(ctx *gin.Context, instanceID string) (int, error) {
 	if callerRoleName != jwtauth.RoleDeveloper {
 		return http.StatusForbidden, errors.New("caller role is not authorized to delete instances")
 	}
-	summary, ok := execendpoint.Default().GetSummary(instanceID)
-	if !ok {
-		return http.StatusNotFound, errors.New("instance not found in frontend cache")
-	}
 	if callerTenantID == tenantauth.SystemTenantID {
 		return http.StatusOK, nil
 	}
-	if callerTenantID == summary.TenantID {
+	targetTenantID := ""
+	if summary, ok := execendpoint.Default().GetSummary(instanceID); ok {
+		targetTenantID = summary.TenantID
+	} else {
+		instance, err := readAuthoritativeSandboxInstance(ctx.Request.Context(), instanceID)
+		if err != nil {
+			if errors.Is(err, resolver.ErrAuthoritativeInstanceNotFound) {
+				return http.StatusNotFound, errors.New("authoritative instance not found")
+			}
+			return http.StatusServiceUnavailable,
+				fmt.Errorf("failed to read authoritative instance ownership: %w", err)
+		}
+		targetTenantID = instance.TenantID
+	}
+	if callerTenantID == targetTenantID {
 		return http.StatusOK, nil
 	}
 	return http.StatusForbidden, errors.New("caller tenant is not authorized to delete target instance")

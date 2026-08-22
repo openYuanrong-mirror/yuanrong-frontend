@@ -48,6 +48,7 @@ import (
 	"frontend/pkg/frontend/common/jwtauth"
 	"frontend/pkg/frontend/common/util"
 	"frontend/pkg/frontend/config"
+	"frontend/pkg/frontend/instancemanager"
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
 
@@ -121,6 +122,7 @@ type runtimeStub struct {
 	) (string, error)
 	getAsync func(objectID string, cb api.GetAsyncCallback)
 	kill     func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error
+	killRaw  func(killReq *core.KillRequest, option api.RawRequestOption) ([]byte, error)
 }
 
 func setAPIClientsForTest(t *testing.T, runtime *runtimeStub) {
@@ -151,6 +153,26 @@ func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
 	return r.runtime.Kill(req.InstanceID, req.Signal, req.Payload, req.AdaptedInvokeOptions())
 }
 
+func (r *directRuntimeStub) KillInstanceWithResponse(req util.DirectKillRequest) (*core.KillResponse, error) {
+	if r.runtime.killRaw != nil {
+		return unmarshalDirectKillResponse(r.runtime.killRaw(&core.KillRequest{
+			InstanceID: req.InstanceID, Signal: int32(req.Signal), Payload: req.Payload, RequestID: req.RequestID,
+		}, api.RawRequestOption{TraceParent: req.TraceParent}))
+	}
+	err := r.KillInstance(req)
+	return &core.KillResponse{Code: common.ErrorCode_ERR_NONE}, err
+}
+
+func unmarshalDirectKillResponse(raw []byte, err error) (*core.KillResponse, error) {
+	if err != nil {
+		return nil, err
+	}
+	response := &core.KillResponse{}
+	if err := proto.Unmarshal(raw, response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
 func (r *runtimeStub) Invoke(util.InvokeRequest) ([]byte, error) {
 	return nil, nil
 }
@@ -456,6 +478,13 @@ func (r *runtimeStub) InvokeByInstanceIdRaw(invokeReqRaw []byte, option api.RawR
 }
 
 func (r *runtimeStub) KillRaw(killReqRaw []byte, option api.RawRequestOption) ([]byte, error) {
+	var killReq core.KillRequest
+	if err := proto.Unmarshal(killReqRaw, &killReq); err != nil {
+		return nil, err
+	}
+	if r.killRaw != nil {
+		return r.killRaw(&killReq, option)
+	}
 	return nil, nil
 }
 
@@ -2569,6 +2598,316 @@ func TestInvokeV1HandlerRejectsMissingAction(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "action is required")
 }
+
+func TestPauseV1HandlerUsesSDKRequestIDForSignal18AndReturnsSnapshot(t *testing.T) {
+	const requestID = "pause-123e4567-e89b-12d3-a456-426614174000"
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: "default-sandbox-1", TenantID: "default", Function: "default/sandbox/$latest",
+		NodeID: "proxy-before-pause", StatusCode: 3, StatusMsg: "running",
+	})
+	t.Cleanup(func() {
+		execendpoint.Default().Delete("default-sandbox-1")
+		instancemanager.RemoveRouteOnlyInstance("default-sandbox-1")
+	})
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		var ok bool
+		captured, ok = proto.Clone(killReq).(*core.KillRequest)
+		require.True(t, ok)
+		var options core.SnapOptions
+		require.NoError(t, proto.Unmarshal(killReq.GetPayload(), &options))
+		require.Equal(t, common.SnapType_PAUSE_RESUME, options.GetType())
+		require.Equal(t, int32(90_000), options.GetTtl())
+		payload, err := proto.Marshal(&core.SnapInfo{SnapshotID: requestID, Size: 8192})
+		require.NoError(t, err)
+		return proto.Marshal(&core.KillResponse{
+			Code:    common.ErrorCode_ERR_NONE,
+			Payload: payload,
+		})
+	}})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/pause",
+		bytes.NewBufferString(`{"ttlSeconds":90000}`),
+	)
+	ctx.Request.Header.Set("X-YR-Request-ID", requestID)
+	startedAt := time.Now().Unix()
+
+	PauseV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.Equal(t, "default-sandbox-1", captured.GetInstanceID())
+	require.Equal(t, int32(18), captured.GetSignal())
+	require.Equal(t, requestID, captured.GetRequestID())
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result struct {
+		SandboxID  string  `json:"sandboxId"`
+		SnapshotID string  `json:"snapshotId"`
+		Size       float64 `json:"size"`
+		State      string  `json:"state"`
+		ExpiresAt  float64 `json:"expiresAt"`
+	}
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.Equal(t, "default-sandbox-1", result.SandboxID)
+	require.Equal(t, requestID, result.SnapshotID)
+	require.Equal(t, float64(8192), result.Size)
+	require.Equal(t, "paused", result.State)
+	require.GreaterOrEqual(t, int64(result.ExpiresAt), startedAt+90_000)
+	summary, ok := execendpoint.Default().GetSummary("default-sandbox-1")
+	require.True(t, ok)
+	require.Equal(t, int32(13), summary.StatusCode)
+	require.Equal(t, "paused", summary.StatusMsg)
+	require.Equal(t, "InstanceManagerOwner",
+		instancemanager.SnapshotRouteOnlyInstance("default-sandbox-1").FunctionProxyID)
+}
+
+func TestResumeV1HandlerUsesSDKRequestIDForSignal19AndReturnsRoute(t *testing.T) {
+	const requestID = "resume-123e4567-e89b-12d3-a456-426614174000"
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: "default-sandbox-1", TenantID: "default", Function: "default/sandbox/$latest",
+		NodeID: "InstanceManagerOwner", StatusCode: execendpoint.StatusPaused, StatusMsg: "paused",
+	})
+	t.Cleanup(func() { execendpoint.Default().Delete("default-sandbox-1") })
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		var ok bool
+		captured, ok = proto.Clone(killReq).(*core.KillRequest)
+		require.True(t, ok)
+		var options core.SnapStartOptions
+		require.NoError(t, proto.Unmarshal(killReq.GetPayload(), &options))
+		require.Equal(t, common.SnapType_PAUSE_RESUME, options.GetType())
+		payload, err := proto.Marshal(&core.SnapStartedInfo{
+			InstanceID:      "default-sandbox-1",
+			RouteAddress:    "10.0.0.8:9000",
+			PortMappings:    `{"8080":41080}`,
+			FunctionProxyID: "proxy-a",
+			NodeID:          "node-a",
+		})
+		require.NoError(t, err)
+		return proto.Marshal(&core.KillResponse{
+			Code:    common.ErrorCode_ERR_NONE,
+			Payload: payload,
+		})
+	}})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/resume",
+		nil,
+	)
+	ctx.Request.Header.Set("X-YR-Request-ID", requestID)
+
+	ResumeV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.Equal(t, "default-sandbox-1", captured.GetInstanceID())
+	require.Equal(t, int32(19), captured.GetSignal())
+	require.Equal(t, requestID, captured.GetRequestID())
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result struct {
+		State           string         `json:"state"`
+		RouteAddress    string         `json:"routeAddress"`
+		FunctionProxyID string         `json:"functionProxyId"`
+		NodeID          string         `json:"nodeId"`
+		PortMappings    map[string]int `json:"portMappings"`
+	}
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.Equal(t, "running", result.State)
+	require.Equal(t, "10.0.0.8:9000", result.RouteAddress)
+	require.Equal(t, "proxy-a", result.FunctionProxyID)
+	require.Equal(t, "node-a", result.NodeID)
+	require.Equal(t, map[string]int{"8080": 41080}, result.PortMappings)
+	summary, ok := execendpoint.Default().GetSummary("default-sandbox-1")
+	require.True(t, ok)
+	require.Equal(t, int32(execendpoint.StatusPaused), summary.StatusCode)
+	require.Equal(t, "paused", summary.StatusMsg)
+	require.Equal(t, "InstanceManagerOwner", summary.NodeID)
+}
+
+func TestResumeV1HandlerDoesNotRequireLocalSandboxRouter(t *testing.T) {
+	const instanceID = "default-sandbox-resume-without-local-router"
+	const requestID = "resume-123e4567-e89b-12d3-a456-426614174002"
+	execendpoint.Default().PutSummary(execendpoint.Summary{
+		InstanceID: instanceID, TenantID: "default", Function: "default/sandbox/$latest",
+		NodeID: "InstanceManagerOwner", StatusCode: execendpoint.StatusPaused, StatusMsg: "paused",
+	})
+	t.Cleanup(func() { execendpoint.Default().Delete(instanceID) })
+
+	runtimeClient := &runtimeStub{killRaw: func(
+		_ *core.KillRequest, _ api.RawRequestOption,
+	) ([]byte, error) {
+		payload, err := proto.Marshal(&core.SnapStartedInfo{
+			InstanceID: instanceID, RouteAddress: "10.0.0.10:22772",
+			PortMappings:    `["public+http:43080:8080"]`,
+			FunctionProxyID: "target-proxy", NodeID: "target-node",
+		})
+		require.NoError(t, err)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE, Payload: payload})
+	}}
+	util.SetAPIClientLibruntime(runtimeClient)
+	restoreDirectClient := util.SetDirectProxyClientForTest(&directRuntimeStub{runtime: runtimeClient})
+	t.Cleanup(restoreDirectClient)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: instanceID}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/sandboxes/"+instanceID+"/resume", nil)
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader, requestID)
+
+	ResumeV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result struct {
+		State           string         `json:"state"`
+		FunctionProxyID string         `json:"functionProxyId"`
+		PortMappings    map[string]int `json:"portMappings"`
+	}
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.Equal(t, "running", result.State)
+	require.Equal(t, "target-proxy", result.FunctionProxyID)
+	require.Equal(t, map[string]int{"8080": 43080}, result.PortMappings)
+}
+
+func TestPauseV1HandlerRejectsSnapshotFromDifferentSDKRequest(t *testing.T) {
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		payload, err := proto.Marshal(&core.SnapInfo{
+			SnapshotID: "pause-different-request",
+			Size:       8192,
+		})
+		require.NoError(t, err)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE, Payload: payload})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "sandbox-1"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/sandboxes/sandbox-1/pause",
+		bytes.NewBufferString(`{"ttlSeconds":90000}`))
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader,
+		"pause-123e4567-e89b-12d3-a456-426614174000")
+
+	PauseV1Handler(ctx)
+
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "invalid pause response identity")
+}
+
+func TestResumeV1HandlerRejectsDifferentWinnerInstance(t *testing.T) {
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		payload, err := proto.Marshal(&core.SnapStartedInfo{
+			InstanceID:      "different-sandbox",
+			RouteAddress:    "10.0.0.8:9000",
+			FunctionProxyID: "proxy-a",
+		})
+		require.NoError(t, err)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE, Payload: payload})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "sandbox-1"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/sandboxes/sandbox-1/resume", nil)
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader,
+		"resume-123e4567-e89b-12d3-a456-426614174000")
+
+	ResumeV1Handler(ctx)
+
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "invalid resume response identity")
+}
+
+func TestPauseResumeV1HandlersRejectMissingSDKRequestID(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		path    string
+		handler gin.HandlerFunc
+	}{
+		{name: "pause", path: "/api/sandbox/v1/sandboxes/sandbox-1/pause", handler: PauseV1Handler},
+		{name: "resume", path: "/api/sandbox/v1/sandboxes/sandbox-1/resume", handler: ResumeV1Handler},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Params = gin.Params{{Key: "sandboxID", Value: "sandbox-1"}}
+			body := bytes.NewBuffer(nil)
+			if testCase.name == "pause" {
+				body = bytes.NewBufferString(`{}`)
+			}
+			ctx.Request = httptest.NewRequest(http.MethodPost, testCase.path, body)
+
+			testCase.handler(ctx)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
+			require.Contains(t, recorder.Body.String(), "X-YR-Request-ID")
+		})
+	}
+}
+
+func TestPauseV1HandlerMapsUnknownDispatchToRetryableServiceUnavailable(t *testing.T) {
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		return nil, errors.New("frontend proxy response lost")
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "sandbox-1"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/sandboxes/sandbox-1/pause",
+		bytes.NewBufferString(`{"ttlSeconds":90000}`))
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader,
+		"pause-123e4567-e89b-12d3-a456-426614174000")
+
+	PauseV1Handler(ctx)
+
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+}
+
+func TestResumeV1HandlerDoesNotMakeBusinessFailureTransportRetryable(t *testing.T) {
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		return proto.Marshal(&core.KillResponse{
+			Code:    common.ErrorCode_ERR_STATE_MACHINE_ERROR,
+			Message: "instance is not paused",
+		})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "sandbox-1"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/sandboxes/sandbox-1/resume", nil)
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader,
+		"resume-123e4567-e89b-12d3-a456-426614174000")
+
+	ResumeV1Handler(ctx)
+
+	require.Equal(t, http.StatusConflict, recorder.Code)
+}
+
 func TestDeleteHandlerDeletesSandboxInstance(t *testing.T) {
 	var (
 		capturedInstanceID string
@@ -2738,6 +3077,16 @@ func TestDeleteHandlerAllowsSystemTenantDeveloper(t *testing.T) {
 	DeleteHandler(ctx)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.True(t, killCalled)
+}
+
+func TestAuthorizeSandboxLifecycleAllowsSystemTenantWithoutRunningSummary(t *testing.T) {
+	targetInstance := "sandbox-paused-not-in-exec-cache"
+	ctx, _ := deleteTestContext(t, targetInstance, "0", jwtauth.RoleDeveloper)
+
+	status, err := authorizeSandboxDelete(ctx, targetInstance)
+
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status)
 }
 
 func testJWT(sub, role string) string {

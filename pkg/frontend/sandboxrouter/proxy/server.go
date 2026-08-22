@@ -270,6 +270,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, targetForLog 
 	}
 
 	target, err := s.resolver.Resolve(r.Context(), parsed.Key)
+	if errors.Is(err, route.ErrInstancePaused) {
+		http.Error(w, "instance paused", http.StatusConflict)
+		return
+	}
 	if errors.Is(err, route.ErrRouteNotFound) {
 		http.NotFound(w, r) // 404
 		return

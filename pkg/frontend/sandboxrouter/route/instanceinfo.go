@@ -24,7 +24,14 @@ package route
 type InstanceInfo struct {
 	InstanceID       string            `json:"instanceID"`
 	TenantID         string            `json:"tenantID"`
+	Function         string            `json:"function"`
+	FunctionProxyID  string            `json:"functionProxyID"`
 	ProxyGrpcAddress string            `json:"proxyGrpcAddress"`
+	RuntimeAddress   string            `json:"runtimeAddress"`
+	ContainerID      string            `json:"containerID"`
+	ContainerIP      string            `json:"containerIP"`
+	RequestID        string            `json:"requestID"`
+	Version          JSONInt64         `json:"version"`
 	InstanceStatus   InstanceStatus    `json:"instanceStatus"`
 	Extensions       map[string]string `json:"extensions"`
 }

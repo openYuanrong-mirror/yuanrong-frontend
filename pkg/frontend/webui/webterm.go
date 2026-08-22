@@ -590,6 +590,9 @@ func getExecAddr(instance, tenantID string) (InstanceInfo, error) {
 	if tenantID == "" {
 		tenantID = "default"
 	}
+	if execendpoint.Default().IsPaused(instance) {
+		return InstanceInfo{}, execendpoint.NewInstancePausedError(instance)
+	}
 
 	// Fast path: resolve from the sandbox router's local instance-info cache,
 	// fed by the same /sn/instance etcd watch the frontend already runs. This
@@ -713,6 +716,10 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	info, err := getExecAddr(instance, tenantID)
 	if err != nil {
 		log.GetLogger().Infof("Failed to get executor address: %v", err)
+		if errors.Is(err, execendpoint.ErrInstancePaused) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, fmt.Sprintf("failed to resolve executor address: %v", err), http.StatusBadGateway)
 		return
 	}

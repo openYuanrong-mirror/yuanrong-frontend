@@ -120,6 +120,7 @@ func TestProxyErrorCodes(t *testing.T) {
 		{"unparseable path", fakeResolver{target: targetTo(t, upstream.URL)}, "/", http.StatusNotFound},
 		{"port not numeric", fakeResolver{target: targetTo(t, upstream.URL)}, "/inst/nope", http.StatusNotFound},
 		{"route not found", fakeResolver{err: route.ErrRouteNotFound}, "/inst/8080/x", http.StatusNotFound},
+		{"instance paused", fakeResolver{err: route.ErrInstancePaused}, "/inst/8080/x", http.StatusConflict},
 		{"resolver unavailable", fakeResolver{err: errors.New("boom")}, "/inst/8080/x", http.StatusServiceUnavailable},
 		{"upstream refused", fakeResolver{target: targetTo(t, "http://127.0.0.1:1")}, "/inst/8080/x",
 			http.StatusBadGateway},

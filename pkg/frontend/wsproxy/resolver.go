@@ -28,6 +28,7 @@ import (
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/frontend/proxyrouting"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
 
 // routeWaitTimeout bounds how long resolveInstance waits for the instance
@@ -39,6 +40,9 @@ const routeWaitTimeout = 10 * time.Second
 // resolveInstance applies WebSocket-specific lifecycle validation after the
 // shared owner resolver has selected the owning proxy's TCP tunnel.
 func resolveInstance(ctx context.Context, instanceID string) (*types.InstanceSpecification, string, error) {
+	if execendpoint.Default().IsPaused(instanceID) {
+		return nil, "", execendpoint.NewInstancePausedError(instanceID)
+	}
 	routeCtx, cancel := context.WithTimeout(ctx, routeWaitTimeout)
 	defer cancel()
 	ownerRoute, err := proxyrouting.Wait(

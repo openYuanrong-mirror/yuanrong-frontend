@@ -23,12 +23,6 @@ import (
 	"frontend/pkg/frontend/sandboxrouter/rootfs"
 )
 
-// kernelStatusRunning is constant.KernelInstanceStatusRunning (3). Only RUNNING
-// instances are cached; any other state removes them. Kept as a local const so
-// this package stays dependency-free (stdlib only) and unit-testable, mirroring
-// route/apply.go.
-const kernelStatusRunning int32 = 3
-
 // EventKind is the kind of instance-info change, mirroring the etcd watch event
 // types while keeping this package free of the etcd client dependency.
 type EventKind int
@@ -74,6 +68,7 @@ type instanceExecInfo struct {
 //   - DELETE removes the instance's endpoint and summary (instanceID recovered from the key).
 //   - PUT of a RUNNING instance adds/replaces its summary. If it also has a
 //     non-empty proxyGrpcAddress, it adds/replaces its exec endpoint.
+//   - PUT of a PAUSED instance retains its summary but removes its exec endpoint.
 //   - PUT of any other state or unparseable value removes cached data.
 //
 // It never panics on bad input; malformed data results in the instance having
@@ -95,7 +90,7 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 		id = instanceIDFromKey(key)
 	}
 
-	if info.InstanceStatus.Code != kernelStatusRunning {
+	if info.InstanceStatus.Code != StatusRunning && info.InstanceStatus.Code != StatusPaused {
 		s.Delete(id)
 		return
 	}
@@ -125,7 +120,7 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 		CreateOptions:  copyStringMap(info.CreateOptions),
 	})
 
-	if info.ProxyGrpcAddress == "" {
+	if info.InstanceStatus.Code != StatusRunning || info.ProxyGrpcAddress == "" {
 		s.DeleteEndpoint(id)
 		return
 	}

@@ -212,7 +212,17 @@ func InitRoute(r *gin.Engine) {
 	{
 		sandboxV1Group.POST("", sandboxTraceHandler(sandbox.CreateV1Handler))
 		sandboxV1Group.DELETE("/:sandboxID", sandboxTraceHandler(sandbox.DeleteHandler))
+		sandboxV1Group.POST("/:sandboxID/pause", sandboxTraceHandler(sandbox.PauseV1Handler))
+		sandboxV1Group.POST("/:sandboxID/resume", sandboxTraceHandler(sandbox.ResumeV1Handler))
+		sandboxV1Group.POST("/:sandboxID/snapshots", sandboxTraceHandler(sandbox.CreateReusableSnapshotV1Handler))
 		sandboxV1Group.POST("/:sandboxID/invoke", sandboxTraceHandler(sandbox.InvokeV1Handler))
+	}
+
+	snapshotV1Group := r.Group("/api/sandbox/v1/snapshots")
+	{
+		snapshotV1Group.GET("", sandboxTraceHandler(sandbox.ListReusableSnapshotsV1Handler))
+		snapshotV1Group.GET("/:snapshotID", sandboxTraceHandler(sandbox.GetReusableSnapshotV1Handler))
+		snapshotV1Group.DELETE("/:snapshotID", sandboxTraceHandler(sandbox.DeleteReusableSnapshotV1Handler))
 	}
 
 	// agent management (create/kill/get/list by user function URN, with workspace/user/userid)
