@@ -3306,6 +3306,102 @@ func TestCreateV1HandlerNormalizesDNSBlacklist(t *testing.T) {
 	)
 }
 
+func TestCreateV1HandlerNormalizesACLVersion2(t *testing.T) {
+	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
+		t,
+		`{
+            "network": {
+                "schemaVersion": 2,
+                "traffic": {
+                    "ingressDefaultAction": "ALLOW",
+                    "egressDefaultAction": "deny",
+                    "mode": "stateful",
+                    "rules": [
+                        {
+                            "action": "allow",
+                            "direction": "egress",
+                            "protocol": "tcp",
+                            "peer": {
+                                "cidr": "192.0.2.129/24",
+                                "portRange": {"first": 80, "last": 443}
+                            },
+                            "priority": 110
+                        },
+                        {
+                            "action": "deny",
+                            "direction": "egress",
+                            "protocol": "udp",
+                            "peer": {"domain": "BÜCHER.example."},
+                            "sandboxPortRange": {"first": 5000, "last": 5010}
+                        }
+                    ]
+                },
+                "dns": {
+                    "defaultAction": "allow",
+                    "rules": [
+                        {"action": "deny", "pattern": "*.Example.COM."}
+                    ]
+                }
+            }
+        }`,
+	)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, called)
+	require.NotNil(t, captured)
+	require.JSONEq(
+		t,
+		`{
+            "schemaVersion": 2,
+            "traffic": {
+                "ingressDefaultAction": "allow",
+                "egressDefaultAction": "deny",
+                "mode": "stateful",
+                "rules": [
+                    {
+                        "action": "allow",
+                        "direction": "egress",
+                        "protocol": "tcp",
+                        "peer": {
+                            "cidr": "192.0.2.0/24",
+                            "portRange": {"first": 80, "last": 443}
+                        },
+                        "priority": 110
+                    },
+                    {
+                        "action": "deny",
+                        "direction": "egress",
+                        "protocol": "udp",
+                        "peer": {"domain": "xn--bcher-kva.example"},
+                        "sandboxPortRange": {"first": 5000, "last": 5010},
+                        "priority": 100
+                    }
+                ]
+            },
+            "dns": {
+                "defaultAction": "allow",
+                "rules": [
+                    {"action": "deny", "pattern": "*.example.com"}
+                ]
+            }
+        }`,
+		captured.GetCreateOptions()["network_policy"],
+	)
+}
+
+func TestCreateV1HandlerOmitsEmptyACLVersion2(t *testing.T) {
+	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
+		t,
+		`{"network":{"schemaVersion":2}}`,
+	)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, called)
+	require.NotNil(t, captured)
+	_, exists := captured.GetCreateOptions()["network_policy"]
+	require.False(t, exists)
+}
+
 func TestCreateV1HandlerOmitsEmptyNetworkPolicy(t *testing.T) {
 	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
 		t,
@@ -3324,6 +3420,20 @@ func TestCreateV1HandlerRejectsInvalidNetworkPolicy(t *testing.T) {
 		`{"network":{"blockNetwork":true,"dnsBlacklist":["github.com"]}}`,
 		`{"network":{"dnsBlacklist":["github.*"]}}`,
 		`{"network":{"dnsBlacklist":["github..com"]}}`,
+		`{"network":{"dnsBlacklist":["github.com.."]}}`,
+		`{"network":{"traffic":{"ingressDefaultAction":"allow"}}}`,
+		`{"network":{"schemaVersion":2,"blockNetwork":true}}`,
+		`{"network":{"schemaVersion":3}}`,
+		`{"network":{"schemaVersion":2,"unknown":true}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","unknown":true}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","rules":[{"action":"allow","direction":"egress","protocol":"tcp","unknown":true}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","rules":[{"action":"allow","direction":"egress","protocol":"tcp","peer":{"unknown":true}}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","rules":[{"action":"allow","direction":"egress","protocol":"tcp","peer":{"portRange":{"first":80,"last":443,"unknown":true}}}]}}}`,
+		`{"network":{"schemaVersion":2,"dns":{"defaultAction":"deny","rules":[{"action":"allow","pattern":"example.com","unknown":true}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"ingress","protocol":"tcp","peer":{"domain":"example.com"},"priority":100}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"egress","protocol":"tcp","peer":{"cidr":"2001:db8::/32"},"priority":100}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"egress","protocol":"any","peer":{"portRange":{"first":443,"last":443}},"priority":100}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"egress","protocol":"tcp","priority":4294967295}]}}}`,
 	}
 	for _, body := range invalidBodies {
 		t.Run(body, func(t *testing.T) {
