@@ -1345,7 +1345,41 @@ func convertSimpleRuntimeCreateArgs(funcMeta api.FunctionMeta, args []api.Arg, c
 		Type:  common.Arg_VALUE,
 		Value: metaValue,
 	})
-	withMetadata = append(withMetadata, converted...)
+	// The FaaS executor's parse_faas_param (faas_executor.py:339) strips a 16-byte
+	// METALEN header from each user arg before json.loads. function_agent's
+	// BuildCreateArgs (static_function_util.cpp:BuildCreateArgs) prepends 16 null
+	// bytes to every user create arg; the direct-proxy invoke path does the same
+	// via prefixSimpleRuntimeFaaSInvokeArgsForRPC. The create path here used to
+	// omit it, so parse_faas_param got bare JSON (e.g. "{}" → empty context_meta),
+	// leaving _ENV_STORAGE fields unset and invoke failing on
+	// update_user_agency. Prepend the same 16-byte prefix to non-MetaData user
+	// args so the wire contract matches. MetaData (args[0]) is untouched: the C++
+	// side parses it as protobuf, not via parse_faas_param.
+	for _, arg := range converted {
+		next := arg
+		if next != nil && next.GetType() == common.Arg_VALUE &&
+			!bytes.HasPrefix(next.GetValue(), []byte(simpleRuntimeFaaSMetaPrefix)) {
+			value := make([]byte, 0, len(simpleRuntimeFaaSMetaPrefix)+len(next.GetValue()))
+			value = append(value, simpleRuntimeFaaSMetaPrefix...)
+			value = append(value, next.GetValue()...)
+			next = &common.Arg{Type: next.GetType(), Value: value, NestedRefs: next.GetNestedRefs()}
+		}
+		withMetadata = append(withMetadata, next)
+	}
+	// [YRPROBE4201] log the create args this direct-proxy path actually hands off to
+	// function_proxy. faas non-Posix init needs args_size>=2: args[0]=MetaData,
+	// args[1+]=user context_meta args. If this logs size==1 the user args never left
+	// the frontend (the prefix loop above is currently commented out).
+	log.GetLogger().Infof("[YRPROBE4201][go] convertSimpleRuntimeCreateArgs funcMeta.Api=%v in=%d out=%d codePaths=%v",
+		funcMeta.Api, len(args), len(withMetadata), codePaths)
+	for i, a := range withMetadata {
+		hl := 16
+		if len(a.GetValue()) < hl {
+			hl = len(a.GetValue())
+		}
+		log.GetLogger().Infof("[YRPROBE4201][go]   out[%d] type=%v valueLen=%d head=%x",
+			i, a.GetType(), len(a.GetValue()), a.GetValue()[:hl])
+	}
 	return withMetadata
 }
 
@@ -1480,6 +1514,16 @@ func buildSimpleRuntimeCreateMetadata(funcMeta api.FunctionMeta, codePaths []str
 	// represented by the field's default value. FunctionMeta remains required
 	// by the runtime initializer.
 	metadata = appendProtoBytes(metadata, functionMetaModuleNameField, buildSimpleRuntimeFunctionMeta(funcMeta))
+	// MetaConfig.codePaths (repeated string, MetaData field 3.config, field 2) is what
+	// the runtime's InitCall reads to drive loadFunctionCallback -> CodeManager.load_functions.
+	// Without it faas_init_handler reports "failed to find init handler: None" (4201)
+	// because entry_map never gets the userInitEntry/userCallEntry keys. Must be emitted
+	// ONCE: protobuf merges repeated-field occurrences, so emitting config twice doubled
+	// codePaths (3 -> 6) and load_functions' _are_faas_entries rejected len>3 (else branch,
+	// no entry_map) -> 4201. buildSimpleRuntimeMetaConfig uses appendProtoBytes (not
+	// appendProtoString) so an empty init entry ("") is still emitted as a zero-length
+	// string; CodeManager.load_functions requires len(codePaths) in [2,3] to treat them
+	// as FaaS entries, skipping empty strings would drop the count below 2.
 	if config := buildSimpleRuntimeMetaConfig(codePaths); len(config) != 0 {
 		metadata = appendProtoBytes(metadata, metaDataConfigField, config)
 	}
@@ -1608,4 +1652,53 @@ func firstArgTenantID(args []api.Arg) string {
 		}
 	}
 	return ""
+}
+
+// InvokeAgentInstanceRaw sends an invoke request to an agent (FaaS executor) instance
+// through the raw invoke channel while satisfying the executor's non-Posix arg contract.
+//
+// The raw path (InvokeInstanceRawWithContext -> InvokeByInstanceIdRaw) transparently
+// forwards the InvokeRequest bytes, so callers that target a FaaS apiType executor
+// (e.g. 0-system-faasExecutorPython3.11) must themselves prepend the serialized MetaData
+// protobuf as args[0] and 16-byte META_PREFIX on each VALUE arg -- exactly what
+// convertSimpleRuntimeInvokeArgsForRPC does on the InvokeByInstanceID (simple-runtime
+// proxy) path. This helper centralizes that encoding so HTTP entrypoints (agent
+// /api/agent/:id/invoke) reuse the same layout as the working kernel FaaS invoke path
+// and the C++ executor's ParseMetaData (invoke_adaptor.cpp) no longer fails on a
+// bare traceID at args[0].
+//
+// payloads are the user-visible arg bytes in order (e.g. [traceID, callReqJSON]); they
+// are prefixed with META_PREFIX internally. The returned bytes are a marshaled
+// runtime.NotifyRequest, mirroring InvokeInstanceRawWithContext.
+func InvokeAgentInstanceRaw(ctx context.Context, client Client, funcKey, instanceID,
+	traceID string, payloads [][]byte, option api.RawRequestOption) ([]byte, error) {
+	args := make([]api.Arg, 0, len(payloads))
+	for _, p := range payloads {
+		args = append(args, api.Arg{Type: api.Value, Data: p})
+	}
+	funcMeta := api.FunctionMeta{FuncID: funcKey, Api: api.FaaSApi}
+	encodedArgs, releaseEncodedArgs := convertSimpleRuntimeInvokeArgsForRPC(funcMeta, args)
+	defer releaseEncodedArgs()
+	invokeReq := &core.InvokeRequest{
+		Function:   funcKey,
+		Args:       encodedArgs,
+		InstanceID: instanceID,
+		RequestID:  uuid.New().String(),
+		TraceID:    traceID,
+	}
+	invokeReqRaw, err := proto.Marshal(invokeReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal agent invoke request: %w", err)
+	}
+	// Delegate to the libruntime raw-invoke seam. The legacy
+	// InvokeInstanceRawWithContext package-level helper was removed when the
+	// Client contract was narrowed (see commit 9c23b6f); InvokeAgentInstanceRaw
+	// now reaches clientLibruntime.InvokeByInstanceIdRaw directly. The returned
+	// bytes are a marshaled runtime.NotifyRequest, matching what
+	// parseAgentInvokeResponse expects to proto.Unmarshal.
+	dc, ok := client.(*defaultClient)
+	if !ok {
+		return nil, fmt.Errorf("agent raw invoke requires *defaultClient, got %T", client)
+	}
+	return dc.clientLibruntime.InvokeByInstanceIdRaw(invokeReqRaw, option)
 }

@@ -34,11 +34,13 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/protobuf/proto"
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/runtime"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/types"
@@ -92,12 +94,19 @@ type eventCreateParams struct {
 	UserCallEntry string `json:"userCallEntry,omitempty"`
 }
 
+// agentCreateConfig is the shared carrier for the agent create call's resolved inputs. It is
+// built once in CreateHandler and consumed by both buildAgentInvokeOptions (rootfs/code/opts
+// sinking) and buildAgentCreateArgs (libruntime CreateInstance args). runtimeSpec carries the
+// inline req.RuntimeSpec pointer (nil in registered mode); resKey is filled in after
+// buildAgentInvokeOptions since it derives from the resolved invokeOpts.Cpu/Memory.
 type agentCreateConfig struct {
 	funcKey          string
 	inline           bool
 	spec             *types.FuncSpec
 	platformExecutor bool
 	preStopTimeout   int
+	runtime          string
+	runtimeSpec      *RuntimeSpec
 }
 
 type agentExecutorHTTPRequest struct {
@@ -206,13 +215,26 @@ type CreateAgentRequest struct {
 }
 
 // RuntimeSpec carries inline container config (inline mode).
+// CodePath/Handler/ExtendedHandler supply the user code entry for inline+supervisor
+// (where there is no funcSpec): CodePath→DELEGATE_DOWNLOAD (storage_type=local), the
+// handler symbols→CodePaths. See design §4.5.1, §6 C4/C8.
 type RuntimeSpec struct {
-	Runtime     string      `json:"runtime,omitempty"`
-	SandboxType string      `json:"sandbox_type,omitempty"`
-	Rootfs      *RootfsSpec `json:"rootfs,omitempty"`
-	Cmds        [][]string  `json:"cmds,omitempty"`
-	CPU         int         `json:"cpu,omitempty"`
-	Memory      int         `json:"memory,omitempty"`
+	Runtime         string          `json:"runtime,omitempty"`
+	SandboxType     string          `json:"sandbox_type,omitempty"`
+	CodePath        string          `json:"codePath,omitempty"`
+	Handler         string          `json:"handler,omitempty"`
+	ExtendedHandler *ExtendedHandler `json:"extendedHandler,omitempty"`
+	Rootfs          *RootfsSpec     `json:"rootfs,omitempty"`
+	Cmds            [][]string      `json:"cmds,omitempty"`
+	CPU             int             `json:"cpu,omitempty"`
+	Memory          int             `json:"memory,omitempty"`
+}
+
+// ExtendedHandler carries the optional init/preStop entry symbols for inline mode,
+// mirroring meta_service's extendedHandler (registered: ExtendedMetaData.Initializer/PreStop).
+type ExtendedHandler struct {
+	Initializer string `json:"initializer,omitempty"`
+	PreStop     string `json:"pre_stop,omitempty"`
 }
 
 // RootfsSpec carries the inline container rootfs config. ImageURL is optional here: it is
@@ -258,7 +280,18 @@ func CreateHandler(ctx *gin.Context) {
 			spec = loaded
 		}
 	}
-	platformExecutor := inline || spec == nil || strings.TrimSpace(spec.FuncMetaData.Handler) == ""
+	// platformExecutor decides whether the instance runs the platform Executor's lifecycle
+	// entries (yr.agentexecutor.handler.*) instead of a user-supplied handler. The two modes
+	// are evaluated separately so that inline's spec==nil does not leak into the registered
+	// branch and vice versa:
+	//   - inline: fall back to the platform Executor ONLY when no user handler was supplied
+	//     in runtime_spec (the bootstrap-cmds use case). A non-empty runtime_spec.handler
+	//     means the caller wants its own code entry run (design §4.5.1 UC2).
+	//   - registered: fall back to the platform Executor when the watched funcSpec is missing
+	//     or its handler is empty.
+	inlineUserHandler := inline && req.RuntimeSpec != nil && strings.TrimSpace(req.RuntimeSpec.Handler) != ""
+	platformExecutor := (inline && !inlineUserHandler) ||
+		(!inline && (spec == nil || strings.TrimSpace(spec.FuncMetaData.Handler) == ""))
 	preStopTimeout := resolveAgentPreStopTimeout(spec, platformExecutor)
 	if platformExecutor && !isSupportedAgentPythonRuntime(runtime) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest,
@@ -278,6 +311,8 @@ func CreateHandler(ctx *gin.Context) {
 		spec:             spec,
 		platformExecutor: platformExecutor,
 		preStopTimeout:   preStopTimeout,
+		runtime:          runtime,
+		runtimeSpec:      req.RuntimeSpec,
 	}
 	invokeOpts, err := buildAgentInvokeOptions(ctx, req, createConfig)
 	if err != nil {
@@ -289,7 +324,7 @@ func CreateHandler(ctx *gin.Context) {
 		Memory:      int64(invokeOpts.Memory),
 		InvokeLabel: "",
 	}
-	args := buildAgentCreateArgs(runtime, spec, resKey, platformExecutor, preStopTimeout)
+	args := buildAgentCreateArgs(createConfig, resKey)
 	createAgentInstance(ctx, req, funcMeta, invokeOpts, args)
 }
 
@@ -502,11 +537,23 @@ func applyAgentCodePaths(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
 // object because agent instances are not scheduler-managed; createEvent is an empty JSON object
 // because agent has no event payload.
 //
+// Three mutually exclusive branches, selected by config.platformExecutor + spec + runtimeSpec:
+//   - platformExecutor=true: platform Executor entries (inline without a user handler, or a
+//     registered funcSpec whose handler is empty).
+//   - spec != nil: registered mode, user entries from the watched funcSpec.
+//   - runtimeSpec != nil with a non-empty handler: inline+supervisor user-code mode (design
+//     §4.5.1 UC2). A user funcSpec is synthesized from runtime_spec so the runtime's faas
+//     init/call path registers the user's handler/preStop the same way a registered funcSpec
+//     would.
+//
 // resKey mirrors the ResourceSpecification built by buildAgentResourceSpecJSON (same CPU/Memory
 // source, InvokeLabel empty since agent create does not set one).
-func buildAgentCreateArgs(runtime string, spec *types.FuncSpec, resKey resspeckey.ResourceSpecification,
-	platformExecutor bool, preStopTimeout int,
-) []api.Arg {
+func buildAgentCreateArgs(config agentCreateConfig, resKey resspeckey.ResourceSpecification) []api.Arg {
+	runtime := config.runtime
+	spec := config.spec
+	rs := config.runtimeSpec
+	preStopTimeout := config.preStopTimeout
+	platformExecutor := config.platformExecutor
 	funcSpecData := []byte("{}")
 	userInitEntry, userCallEntry := "", ""
 	if platformExecutor {
@@ -544,6 +591,37 @@ func buildAgentCreateArgs(runtime string, spec *types.FuncSpec, resKey resspecke
 		}
 		userInitEntry = spec.ExtendedMetaData.Initializer.Handler
 		userCallEntry = spec.FuncMetaData.Handler
+	} else if rs != nil {
+		// inline+supervisor user-code mode: synthesize the user funcSpec the runtime faas
+		// init/call path expects (load_context_meta reads funcMetaData.handler,
+		// extendedMetaData.initializer/pre_stop with the same snake_case tags as a registered
+		// funcSpec). Entry symbols come from resolveInlineHandlerEntries, the single source of
+		// truth for the [init?, handler, preStop?] layout shared with applyAgentInlineCode.
+		var preStopEntry string
+		userInitEntry, userCallEntry, preStopEntry = resolveInlineHandlerEntries(rs)
+		if userCallEntry != "" {
+			inlineSpec := types.FuncSpec{
+				FuncMetaData: types.FuncMetaData{
+					Handler: userCallEntry,
+					Runtime: runtime,
+					Timeout: agentCreateBusinessTimeoutSeconds,
+				},
+				ResourceMetaData: types.ResourceMetaData{CPU: resKey.CPU, Memory: resKey.Memory},
+				ExtendedMetaData: types.ExtendedMetaData{
+					Initializer: types.Initializer{Handler: userInitEntry, Timeout: agentInitTimeoutSeconds},
+					PreStop: types.PreStop{
+						Handler: preStopEntry,
+						Timeout: preStopTimeout,
+					},
+				},
+			}
+			var err error
+			funcSpecData, err = json.Marshal(inlineSpec)
+			if err != nil {
+				log.GetLogger().Warnf("failed to marshal inline agent user func spec: %v", err)
+				funcSpecData = []byte("{}")
+			}
+		}
 	}
 	params := createParams{
 		InstanceLabel: resKey.InvokeLabel,
@@ -565,7 +643,28 @@ func buildAgentCreateArgs(runtime string, spec *types.FuncSpec, resKey resspecke
 	}
 }
 
+// resolveInlineHandlerEntries extracts the (init, call, preStop) user entry symbols from an
+// inline runtime_spec, mirroring applyAgentInlineCode's CodePaths layout [init?, handler, preStop?]:
+// init from extendedHandler.initializer, call from handler, preStop from extendedHandler.pre_stop
+// (each "" when unset/absent). Shared by buildAgentCreateArgs (synthesized funcSpec + createParams)
+// and applyAgentInlineCode (wire CodePaths) so the two never diverge on entry layout.
+func resolveInlineHandlerEntries(rs *RuntimeSpec) (initEntry, callEntry, preStopEntry string) {
+	if rs == nil {
+		return "", "", ""
+	}
+	callEntry = strings.TrimSpace(rs.Handler)
+	if rs.ExtendedHandler != nil {
+		initEntry = strings.TrimSpace(rs.ExtendedHandler.Initializer)
+		preStopEntry = strings.TrimSpace(rs.ExtendedHandler.PreStop)
+	}
+	return initEntry, callEntry, preStopEntry
+}
+
 // applyAgentInlineMeta passes container config from req.RuntimeSpec into createOptions (inline mode).
+// It also sinks CodePath→DELEGATE_DOWNLOAD (storage_type=local) and Handler/ExtendedHandler
+// →CodePaths, mirroring registered's applyAgentCodePath/applyAgentCodePaths so inline+supervisor
+// instances reach the same runtime code-loading path. CodePath presence is not validated here;
+// missing codePath/handler is surfaced at invoke time (design §6 C7/C8).
 func applyAgentInlineMeta(invokeOpts *api.InvokeOptions, req CreateAgentRequest) {
 	c := req.RuntimeSpec
 	if c == nil {
@@ -577,6 +676,7 @@ func applyAgentInlineMeta(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 	if len(c.Cmds) > 0 {
 		mergeAgentBootstrapCmds(invokeOpts, c.Cmds)
 	}
+	applyAgentInlineCode(invokeOpts, c)
 	if c.Rootfs == nil {
 		return
 	}
@@ -598,6 +698,38 @@ func applyAgentInlineMeta(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 	}
 	if len(c.Rootfs.Ports) > 0 {
 		applyAgentPorts(invokeOpts, c.Rootfs.Ports)
+	}
+}
+
+// applyAgentInlineCode sinks the inline user-code config from runtime_spec into
+// createOptions: codePath→DELEGATE_DOWNLOAD (storage_type=local, per design §6 C4) so the
+// function_agent's LocalDeployer resolves the code dir; handler/extendedHandler→CodePaths
+// via resolveInlineHandlerEntries so CodeManager.load_functions registers the
+// [init, handler, preStop?] entry layout (init empty when unset, keeping length>=2 so
+// _are_faas_entries treats it as FaaS entries, design §6 C5). The same resolver feeds the
+// synthesized funcSpec in buildAgentCreateArgs, so wire CodePaths and create args never diverge.
+// codePath/handler presence is not validated here (§6 C7/C8: surfaced at invoke).
+func applyAgentInlineCode(invokeOpts *api.InvokeOptions, c *RuntimeSpec) {
+	if c.CodePath != "" {
+		delegateDownloadValue := types.LocalMetaData{
+			StorageType: constants.LocalStorageType,
+			CodePath:    c.CodePath,
+		}
+		data, err := json.Marshal(delegateDownloadValue)
+		if err != nil {
+			log.GetLogger().Warnf("failed to marshal inline agent delegate download: %v", err)
+		} else {
+			log.GetLogger().Infof("[AgentInlineCode] set DELEGATE_DOWNLOAD=%s", string(data))
+			invokeOpts.CreateOpt[constant.DelegateDownloadKey] = string(data)
+		}
+	}
+	if c.Handler != "" {
+		initEntry, _, preStopEntry := resolveInlineHandlerEntries(c)
+		codeEntrys := []string{initEntry, c.Handler}
+		if preStopEntry != "" {
+			codeEntrys = append(codeEntrys, preStopEntry)
+		}
+		invokeOpts.CodePaths = codeEntrys
 	}
 }
 
@@ -1651,3 +1783,155 @@ func copyResponseHeaders(destination, source http.Header) {
 		}
 	}
 }
+
+// --- agent instance invocation (POST /api/agent/:instanceId/invoke) ---
+
+// InvokeHandler drives one synchronous execution of an already-created agent instance.
+// It looks up the instance + executor funcKey from the execendpoint cache, builds the
+// faasCallHandler args contract ([traceID, CallReqJSON]), calls the raw gRPC invoke
+// channel (util.InvokeInstanceRawWithContext), and decodes the returned NotifyRequest
+// into the user handler's return value. Mirrors sandbox.InvokeV1Handler's raw path but
+// uses the FaaS args contract instead of the sandbox single-Arg envelope.
+func InvokeHandler(ctx *gin.Context) {
+	instanceID := ctx.Param("instanceId")
+	if instanceID == "" {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
+		return
+	}
+	summaries := lookupAgentInstanceSummaries("", instanceID)
+	if len(summaries) == 0 {
+		ctx.JSON(http.StatusNotFound,
+			gin.H{"code": http.StatusNotFound, "message": fmt.Sprintf("instance not found: %s", instanceID)})
+		return
+	}
+	funcKey := summaries[0].Function
+	traceID := httputil.InitTraceID(ctx)
+
+	callReqJSON, err := buildAgentCallReqJSON(ctx, traceID)
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("failed to build invoke request: %v", err))
+		return
+	}
+	parent := ctx.Request.Context()
+	if agentInvokeTimeout > 0 {
+		var cancel context.CancelFunc
+		parent, cancel = context.WithTimeout(parent, agentInvokeTimeout)
+		defer cancel()
+	}
+	// Payloads are [traceID, callReqJSON]; InvokeAgentInstanceRaw prepends the MetaData
+	// protobuf (args[0]) and 16-byte META_PREFIX on each VALUE arg so the FaaS executor
+	// (non-Posix) ParseMetaData succeeds -- mirroring the kernel FaaS invoke arg layout
+	// produced by convertSimpleRuntimeInvokeArgsForRPC. See faas_executor.py faasCallHandler
+	// (_INDEX_META_DATA=0, _INDEX_CALL_USER_EVENT=1).
+	respRaw, err := util.InvokeAgentInstanceRaw(parent, util.NewClient(), funcKey, instanceID, traceID,
+		[][]byte{[]byte(traceID), callReqJSON}, api.RawRequestOption{TraceParent: ctx.GetHeader(constant.HeaderTraceParent)})
+	if err != nil {
+		if errInfo, ok := err.(api.ErrorInfo); ok {
+			app.SetCtxResponse(ctx, nil, http.StatusInternalServerError,
+				fmt.Errorf("invoke failed: code=%d err=%s", errInfo.Code, errInfo.Err))
+			return
+		}
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("invoke failed: %v", err))
+		return
+	}
+	result, err := parseAgentInvokeResponse(respRaw)
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "data": result})
+}
+
+// buildAgentCallReqJSON mirrors httputil.TranslateInvokeMsgToCallReq's CallReq shape
+// (body + header + path + method + query) but reads directly from gin.Context instead of
+// InvokeProcessContext. faas_call_handler (faas_executor.py:123) parses args[1] as a
+// CallReq and takes event from its "body" field; header feeds trace/context into the
+// user handler. Minimal header set (X-Trace-Id); callers needing more can extend.
+func buildAgentCallReqJSON(ctx *gin.Context, traceID string) ([]byte, error) {
+	body, err := io.ReadAll(ctx.Request.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+	if len(body) == 0 {
+		body = []byte("{}")
+	}
+	header := map[string]string{"X-Trace-Id": traceID}
+	for _, h := range []string{"X-Request-Id", "X-Invoke-Alias"} {
+		if v := ctx.GetHeader(h); v != "" {
+			header[h] = v
+		}
+	}
+	req := map[string]interface{}{
+		"body":   json.RawMessage(body),
+		"header": header,
+		"path":   ctx.Request.URL.Path,
+		"method": ctx.Request.Method,
+		"query":  ctx.Request.URL.RawQuery,
+	}
+	return json.Marshal(req)
+}
+
+// parseAgentInvokeResponse decodes the []byte returned by InvokeInstanceRawWithContext
+// into the user handler's return value. The bytes are a runtime.NotifyRequest protobuf
+// (the client bridges the gRPC InvokeInstanceResponse.callResult into NotifyRequest via
+// marshalRuntimeNotifyFromCallResultWithRequestID). code!=0 means the runtime reported
+// an execution error; smallObjects[0].value holds the FaaS call result.
+//
+// The FaaS executor encodes its return as META_PREFIX(16 bytes of '0') +
+// transform_call_response_to_str JSON (faas_executor.py:289-322): {"body":<user return>,
+// "innerCode":"0", "traceId":..., "billingDuration":..., "logResult":..., "invokerSummary":...}.
+// The user handler's return value is the "body" field. This is NOT the libruntime inline-value
+// (msgpack+length-header) format that sandbox/posix returns, so decodeAgentYRValue (which
+// assumes that format and decodes the '0' prefix bytes as msgpack fixint 48) must not be used
+// here. Strip the 16-byte META_PREFIX, JSON-unmarshal, and return the "body" field.
+func parseAgentInvokeResponse(raw []byte) (interface{}, error) {
+	var notify runtime.NotifyRequest
+	if err := proto.Unmarshal(raw, &notify); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal agent invoke response: %w", err)
+	}
+	code := int(notify.GetCode())
+	if code != 0 {
+		message := notify.GetMessage()
+		if message == "" {
+			message = fmt.Sprintf("agent invoke failed with code %d", code)
+		}
+		return nil, api.ErrorInfo{Code: code, Err: errors.New(message)}
+	}
+	if len(notify.GetSmallObjects()) == 0 {
+		return nil, fmt.Errorf("agent invoke response contains no result")
+	}
+	smallVal := notify.GetSmallObjects()[0].GetValue()
+	// Strip the 16-byte FaaS META_PREFIX (ASCII '0' x16) that wraps the JSON result.
+	payload := smallVal
+	if len(payload) >= constant.LibruntimeHeaderSize {
+		payload = payload[constant.LibruntimeHeaderSize:]
+	}
+	var resp struct {
+		Body        interface{} `json:"body"`
+		InnerCode   string      `json:"innerCode,omitempty"`
+		TraceID     string      `json:"traceId,omitempty"`
+		BillingDur  string      `json:"billingDuration,omitempty"`
+		LogResult   string      `json:"logResult,omitempty"`
+		InvokerSum  string      `json:"invokerSummary,omitempty"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal faas call result JSON: %w (payload head=%x)", err,
+		    smallVal[:min(constant.LibruntimeHeaderSize, len(smallVal))])
+	}
+	if resp.InnerCode != "" && resp.InnerCode != "0" {
+		return nil, api.ErrorInfo{Code: atoiSafe(resp.InnerCode), Err: fmt.Errorf("faas inner error code %s", resp.InnerCode)}
+	}
+	return resp.Body, nil
+}
+
+func atoiSafe(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// agentInvokeTimeout caps a single invoke call. Agent handlers are user code so the
+// default mirrors agent create timeout; can be tuned via flag if needed.
+const agentInvokeTimeout = 0 // 0 = no client-side deadline; runtime/proxy enforce theirs
