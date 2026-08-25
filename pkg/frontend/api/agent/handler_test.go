@@ -475,7 +475,7 @@ func TestCreateHandlerSetsDetachedAndReservedCreateOptions(t *testing.T) {
 	require.Equal(t, validAgentURN, capturedInvokeOpt.CreateOpt[constant.FunctionKeyNote])
 	require.Equal(t, "header-tenant", capturedInvokeOpt.CreateOpt["tenantId"])
 	createOpts := capturedInvokeOpt.CreateOpt
-	require.Equal(t, fmt.Sprintf("%d", agentCreateTimeoutSeconds), createOpts["call_timeout"])
+	require.Equal(t, fmt.Sprintf("%d", agentCreateBusinessTimeoutSeconds), createOpts["call_timeout"])
 	require.Equal(t, fmt.Sprintf("%d", agentInitTimeoutSeconds), createOpts["init_call_timeout"])
 	require.Equal(t, fmt.Sprintf("%d", agentGracefulShutdownSeconds),
 		createOpts["GRACEFUL_SHUTDOWN_TIME"])

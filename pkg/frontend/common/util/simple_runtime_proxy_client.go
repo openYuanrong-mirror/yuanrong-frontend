@@ -1245,12 +1245,23 @@ func convertSimpleRuntimeCreateArgs(funcMeta api.FunctionMeta, args []api.Arg, c
 	// Libruntime used to prepend MetaData before sending a non-POSIX create.
 	// The direct Proxy path must preserve that runtime wire contract itself.
 	withMetadata := make([]*common.Arg, 0, len(converted)+1)
+	metaValue := buildSimpleRuntimeCreateMetadata(funcMeta, codePaths)
 	withMetadata = append(withMetadata, &common.Arg{
 		Type:  common.Arg_VALUE,
-		Value: buildSimpleRuntimeCreateMetadata(funcMeta, codePaths),
+		Value: metaValue,
 	})
 	withMetadata = append(withMetadata, converted...)
 	return withMetadata
+}
+
+// funcSpecDataArgValue extracts the funcSpecData (args[0]) as a string for diagnostics.
+func funcSpecDataArgValue(args []api.Arg) string {
+	for _, a := range args {
+		if a.Type == api.Value && len(a.Data) > 0 {
+			return string(a.Data)
+		}
+	}
+	return "<empty>"
 }
 
 func convertSimpleRuntimeInvokeArgsForRPC(funcMeta api.FunctionMeta, args []api.Arg) ([]*common.Arg, func()) {
@@ -1384,8 +1395,7 @@ func buildSimpleRuntimeCreateMetadata(funcMeta api.FunctionMeta, codePaths []str
 func buildSimpleRuntimeMetaConfig(codePaths []string) []byte {
 	var config []byte
 	for _, codePath := range codePaths {
-		config = appendProtoString(config, metaConfigCodePathsField, codePath)
-	}
+        config = appendProtoBytes(config, metaConfigCodePathsField, []byte(codePath))	}
 	return config
 }
 
