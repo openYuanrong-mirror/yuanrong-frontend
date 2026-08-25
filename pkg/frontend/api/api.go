@@ -219,6 +219,7 @@ func InitRoute(r *gin.Engine) {
 	agentGroup := r.Group("/api/agent")
 	{
 		agentGroup.POST("", agent.CreateHandler)
+		agentGroup.POST("/:instanceId/invoke", agent.InvokeHandler)
 		agentGroup.DELETE("/:instanceId", agent.DeleteHandler)
 		agentGroup.GET("", agent.ListHandler)
 		agentGroup.GET("/:instanceId", agent.GetHandler)
