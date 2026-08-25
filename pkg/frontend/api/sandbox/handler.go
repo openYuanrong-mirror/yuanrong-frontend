@@ -84,6 +84,7 @@ const (
 	sandboxKillInstanceSignal       = constant.KillSignalVal
 	sandboxPauseInstanceSignal      = 18
 	sandboxResumeInstanceSignal     = 19
+	sandboxReloadInstanceSignal     = 25
 	sandboxPauseDefaultTTLSeconds   = 90_000
 	sandboxLifecycleRequestIDHeader = "X-YR-Request-ID"
 	sandboxRunningPollTimeout       = 5 * time.Second
@@ -143,6 +144,7 @@ var (
 	sandboxXPUCountPattern          = regexp.MustCompile(`^[0-9]+$`)
 	sandboxPauseRequestIDPattern    = regexp.MustCompile(`^pause-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxResumeRequestIDPattern   = regexp.MustCompile(`^resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxReloadRequestIDPattern   = regexp.MustCompile(`^reload-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxSnapshotRequestIDPattern = regexp.MustCompile(`^snapshot-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxDNSLabelPattern          = regexp.MustCompile(`^[a-z0-9_-]+$`)
 )
@@ -166,6 +168,10 @@ type resumeV1Response struct {
 	FunctionProxyID string         `json:"functionProxyId"`
 	NodeID          string         `json:"nodeId"`
 	PortMappings    map[string]int `json:"portMappings"`
+}
+
+type reloadV1Response struct {
+	Success bool `json:"success"`
 }
 
 type sandboxLifecycleTransportError struct {
@@ -2440,6 +2446,22 @@ func ResumeV1Handler(ctx *gin.Context) {
 	}, http.StatusOK, nil)
 }
 
+// ReloadV1Handler restores one running sandbox from its latest local anonymous snapshot.
+func ReloadV1Handler(ctx *gin.Context) {
+	_, err := executeSandboxLifecycleKill(
+		ctx,
+		sandboxReloadInstanceSignal,
+		nil,
+		sandboxReloadRequestIDPattern,
+		"reload",
+	)
+	if err != nil {
+		app.SetCtxResponse(ctx, reloadV1Response{Success: false}, sandboxLifecycleHTTPStatus(err), err)
+		return
+	}
+	app.SetCtxResponse(ctx, reloadV1Response{Success: true}, http.StatusOK, nil)
+}
+
 func parseResumePortMappings(encoded string) (map[string]int, error) {
 	const physicalMappingFieldCount = 3
 
@@ -2532,6 +2554,10 @@ func executeSandboxLifecycleKill(
 }
 
 func setSandboxLifecycleError(ctx *gin.Context, err error) {
+	app.SetCtxResponse(ctx, nil, sandboxLifecycleHTTPStatus(err), err)
+}
+
+func sandboxLifecycleHTTPStatus(err error) int {
 	statusCode := http.StatusInternalServerError
 	var transportError *sandboxLifecycleTransportError
 	var businessError *sandboxLifecycleBusinessError
@@ -2548,7 +2574,7 @@ func setSandboxLifecycleError(ctx *gin.Context, err error) {
 		strings.Contains(err.Error(), "tenant") {
 		statusCode = http.StatusBadRequest
 	}
-	app.SetCtxResponse(ctx, nil, statusCode, err)
+	return statusCode
 }
 
 func needsDeleteAuthorization(ctx *gin.Context) bool {

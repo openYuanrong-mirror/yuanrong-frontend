@@ -2761,6 +2761,72 @@ func TestResumeV1HandlerUsesSDKRequestIDForSignal19AndReturnsRoute(t *testing.T)
 	require.Equal(t, "InstanceManagerOwner", summary.NodeID)
 }
 
+func TestReloadV1HandlerUsesSignal25AndReturnsBoolean(t *testing.T) {
+	const requestID = "reload-123e4567-e89b-12d3-a456-426614174000"
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		captured = proto.Clone(killReq).(*core.KillRequest)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/reload",
+		nil,
+	)
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader, requestID)
+
+	ReloadV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.Equal(t, int32(25), captured.GetSignal())
+	require.Equal(t, requestID, captured.GetRequestID())
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result reloadV1Response
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.True(t, result.Success)
+}
+
+func TestReloadV1HandlerReturnsFalseOnBusinessFailure(t *testing.T) {
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		return proto.Marshal(&core.KillResponse{
+			Code:    common.ErrorCode_ERR_INNER_SYSTEM_ERROR,
+			Message: "local snapshot is unavailable",
+		})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/reload",
+		nil,
+	)
+	ctx.Request.Header.Set(
+		sandboxLifecycleRequestIDHeader,
+		"reload-123e4567-e89b-12d3-a456-426614174001",
+	)
+
+	ReloadV1Handler(ctx)
+
+	require.Equal(t, http.StatusConflict, recorder.Code)
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result reloadV1Response
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.False(t, result.Success)
+}
+
 func TestResumeV1HandlerDoesNotRequireLocalSandboxRouter(t *testing.T) {
 	const instanceID = "default-sandbox-resume-without-local-router"
 	const requestID = "resume-123e4567-e89b-12d3-a456-426614174002"
