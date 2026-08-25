@@ -223,6 +223,7 @@ type CreateRequest struct {
 	StorageLimitMb int64                    `json:"storage_limit_mb"`
 	Network        *SandboxNetworkPolicy    `json:"network,omitempty"`
 	SnapshotID     string                   `json:"snapshotId,omitempty"`
+	Failover       bool                     `json:"failover"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -289,6 +290,7 @@ type CreateV1Request struct {
 	Tunnel                 TunnelSpec               `json:"tunnel,omitempty"`
 	Network                *SandboxNetworkPolicy    `json:"network,omitempty"`
 	SnapshotID             string                   `json:"snapshotId,omitempty"`
+	Failover               bool                     `json:"failover"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
 	portRouteKinds         map[int]string
@@ -828,6 +830,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		Network:                req.Network,
 		ScheduleAffinities:     req.ScheduleAffinities,
 		SnapshotID:             strings.TrimSpace(req.SnapshotID),
+		Failover:               req.Failover,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
 		nameGenerated:          req.nameGenerated,
@@ -1133,6 +1136,7 @@ type sandboxInvocation struct {
 	funcID     string
 	invokeOpts api.InvokeOptions
 	snapshotID string
+	failover   bool
 }
 
 func prepareSandboxInvocation(
@@ -1166,7 +1170,12 @@ func prepareSandboxInvocation(
 	if err != nil {
 		return sandboxInvocation{}, err
 	}
-	return sandboxInvocation{funcID: funcID, invokeOpts: invokeOpts, snapshotID: req.SnapshotID}, nil
+	return sandboxInvocation{
+		funcID:     funcID,
+		invokeOpts: invokeOpts,
+		snapshotID: req.SnapshotID,
+		failover:   req.Failover,
+	}, nil
 }
 
 func createSandboxInstanceRaw(
@@ -1257,6 +1266,7 @@ func buildSandboxRawCreateRequest(
 		DesignatedInstanceID: namespace + "-" + name,
 		CreateOptions:        createOptions,
 		SnapshotID:           strings.TrimSpace(invocation.snapshotID),
+		Failover:             invocation.failover,
 	}, nil
 }
 

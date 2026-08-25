@@ -466,6 +466,26 @@ func TestCreateSandboxInstanceRawUsesIndependentTimeoutContext(t *testing.T) {
 	require.Equal(t, "default-sandbox-context", instanceID)
 }
 
+func TestCreateV1HandlerForwardsFailover(t *testing.T) {
+	request := CreateV1Request{Name: "sandbox-a", Namespace: "default", Failover: true}
+	create := createRequestFromV1(request, "python:3.12-slim")
+	raw, err := buildSandboxRawCreateRequest(
+		sandboxInvocation{
+			invokeOpts: api.InvokeOptions{
+				CreateOpt:        map[string]string{},
+				CustomExtensions: map[string]string{},
+			},
+			snapshotID: create.SnapshotID,
+			failover:   create.Failover,
+		},
+		create.Name,
+		create.Namespace,
+	)
+
+	require.NoError(t, err)
+	require.True(t, raw.GetFailover())
+}
+
 func (r *runtimeStub) InvokeByInstanceIdRaw(invokeReqRaw []byte, option api.RawRequestOption) ([]byte, error) {
 	var invokeReq core.InvokeRequest
 	if err := proto.Unmarshal(invokeReqRaw, &invokeReq); err != nil {
