@@ -21,6 +21,7 @@ import (
 
 	"yuanrong.org/kernel/runtime/libruntime/api"
 
+	"frontend/pkg/common/faas_common/grpc/pb/core"
 	"frontend/pkg/common/faas_common/types"
 )
 
@@ -70,4 +71,5 @@ type frontendProxyLifecycleClient interface {
 	CreateInstance(simpleRuntimeCreateRequest) (string, error)
 	CreateInstanceRaw(simpleRuntimeRawCreateRequest) ([]byte, error)
 	KillInstance(simpleRuntimeKillRequest) error
+	KillInstanceWithResponse(simpleRuntimeKillRequest) (*core.KillResponse, error)
 }

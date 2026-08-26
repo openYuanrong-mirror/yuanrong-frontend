@@ -25,9 +25,9 @@ import (
 
 // cacheableInstanceStates are the yr InstanceState codes (instance_state.h) this
 // package caches. "Instance gone" states (NEW/EXITING/EXITED/EVICTING/EVICTED/
-// SUSPEND) are not cached: they remove the summary so GET returns 404. Kept local
-// so this package stays dependency-free (stdlib only) and unit-testable, mirroring
-// route/apply.go.
+// SUSPEND) are not cached: they remove the summary so GET returns 404. Kept
+// local so this package stays dependency-free (stdlib only) and unit-testable,
+// mirroring route/apply.go.
 var cacheableInstanceStates = map[int32]struct{}{
 	1:  {}, // SCHEDULING
 	2:  {}, // CREATING
@@ -89,7 +89,16 @@ type instanceExecInfo struct {
 // no cached data.
 func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 	if kind == EventDelete {
-		s.Delete(instanceIDFromKey(key))
+		id := instanceIDFromKey(key)
+		// FATAL/FAILED: keep the summary so GET returns the failure state,
+		// only drop the exec endpoint to avoid routing to a dead instance.
+		if summary, ok := s.GetSummary(id); ok {
+			if summary.StatusCode == StatusFatal || summary.StatusCode == StatusFailed {
+				s.DeleteEndpoint(id)
+				return
+			}
+		}
+		s.Delete(id)
 		return
 	}
 
