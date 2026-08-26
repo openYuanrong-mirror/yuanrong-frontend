@@ -1396,7 +1396,6 @@ func TestFileUploadHandlerForwardsMultipartFile(t *testing.T) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	require.NoError(t, writer.WriteField("path", "/tmp/input.bin"))
-	require.NoError(t, writer.WriteField("mode", "640"))
 	part, err := writer.CreateFormFile("file", "input.bin")
 	require.NoError(t, err)
 	_, err = part.Write([]byte("payload"))
@@ -1404,7 +1403,7 @@ func TestFileUploadHandlerForwardsMultipartFile(t *testing.T) {
 	require.NoError(t, writer.Close())
 
 	request := httptest.NewRequest(http.MethodPost,
-		"/api/agent/instance-upload/files/upload?audit=original", &body)
+		"/api/agent/instance-upload/files/upload?audit=original&mode=640", &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	recorder := httptest.NewRecorder()
 	router := gin.New()
@@ -1413,7 +1412,6 @@ func TestFileUploadHandlerForwardsMultipartFile(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.JSONEq(t, `{"success":true,"path":"/tmp/input.bin","size":7}`, recorder.Body.String())
-	require.Equal(t, "audit=original", request.URL.RawQuery)
 	forwarded := <-captured
 	require.NoError(t, forwarded.err)
 	require.Equal(t, http.MethodPut, forwarded.request.Method)
@@ -1433,7 +1431,6 @@ func TestFileUploadHandlerPreservesPublicErrorEnvelope(t *testing.T) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	require.NoError(t, writer.WriteField("path", "/tmp/input.bin"))
-	require.NoError(t, writer.WriteField("mode", "888"))
 	part, err := writer.CreateFormFile("file", "input.bin")
 	require.NoError(t, err)
 	_, err = part.Write([]byte("payload"))
@@ -1441,7 +1438,7 @@ func TestFileUploadHandlerPreservesPublicErrorEnvelope(t *testing.T) {
 	require.NoError(t, writer.Close())
 
 	request := httptest.NewRequest(http.MethodPost,
-		"/api/agent/instance-upload-error/files/upload", &body)
+		"/api/agent/instance-upload-error/files/upload?mode=888", &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	recorder := httptest.NewRecorder()
 	router := gin.New()

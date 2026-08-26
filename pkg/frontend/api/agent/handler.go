@@ -1351,9 +1351,9 @@ func waitForAgentInstanceExist(instanceID string) (*types.InstanceSpecification,
 // existing HTTP-over-TCP tunnel to the Agent Executor HTTP server.
 //
 // The multipart form must include a "path" text field and a "file" file field.
-// The "path" field should precede "file" so the target is known before the
-// stream is opened; if "file" arrives before "path", the request is rejected
-// with 400 to keep streaming single-pass.
+// The optional "mode" (octal permission, e.g. "644") is a URL query parameter,
+// not a multipart field, to avoid ordering constraints with the sequential
+// multipart stream.
 func FileUploadHandler(ctx *gin.Context) {
 	instanceID := ctx.Param("instanceId")
 	if instanceID == "" {
@@ -1386,6 +1386,11 @@ func FileUploadHandler(ctx *gin.Context) {
 		return
 	}
 
+	// "mode" is a URL query parameter (e.g. ?mode=644), not a multipart field.
+	// This decouples it from multipart field ordering: the sequential multipart
+	// stream cannot rewind to read a "mode" field placed after "file".
+	fileMode := ctx.Query("mode")
+
 	// Limit the multipart reader memory to the cap so a malicious payload is
 	// rejected at the parse boundary instead of exhausting memory.
 	ctx.Request.Body = http.MaxBytesReader(ctx.Writer, ctx.Request.Body, maxRequestSize)
@@ -1400,7 +1405,6 @@ func FileUploadHandler(ctx *gin.Context) {
 	}
 
 	var targetPath string
-	var fileMode string
 	pathSeen := false
 	for {
 		part, err := reader.NextPart()
@@ -1424,20 +1428,6 @@ func FileUploadHandler(ctx *gin.Context) {
 				return
 			}
 			targetPath = strings.TrimSpace(string(buf))
-		case "mode":
-			// Optional octal permission string (e.g. "600", "755"). When
-			// present, the runtime applies os.chmod after the upload
-			// completes.
-			buf, err := io.ReadAll(part)
-			if err != nil {
-				log.GetLogger().Warnf("file upload mode read failed instance %s: %v", instanceID, err)
-				ctx.JSON(http.StatusBadRequest, gin.H{
-					"code":    http.StatusBadRequest,
-					"message": fmt.Sprintf("read mode failed: %v", err),
-				})
-				return
-			}
-			fileMode = strings.TrimSpace(string(buf))
 		case "file":
 			// The "path" field must precede the "file" field so the upload
 			// target is known before streaming begins.
