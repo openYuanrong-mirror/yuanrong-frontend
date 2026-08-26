@@ -23,6 +23,24 @@ import (
 	"frontend/pkg/frontend/sandboxrouter/rootfs"
 )
 
+// cacheableInstanceStates are the yr InstanceState codes (instance_state.h) this
+// package caches. "Instance gone" states (NEW/EXITING/EXITED/EVICTING/EVICTED/
+// SUSPEND) are not cached: they remove the summary so GET returns 404. PAUSED is
+// cacheable too, but it never carries a routable exec endpoint (it has no live
+// runtime), so it retains its summary yet drops the exec endpoint below. Kept
+// local so this package stays dependency-free (stdlib only) and unit-testable,
+// mirroring route/apply.go.
+var cacheableInstanceStates = map[int32]struct{}{
+	1:  {}, // SCHEDULING
+	2:  {}, // CREATING
+	3:  {}, // RUNNING
+	4:  {}, // FAILED
+	6:  {}, // FATAL
+	7:  {}, // SCHEDULE_FAILED
+	11: {}, // SUB_HEALTH
+	13: {}, // PAUSED
+}
+
 // EventKind is the kind of instance-info change, mirroring the etcd watch event
 // types while keeping this package free of the etcd client dependency.
 type EventKind int
@@ -66,16 +84,26 @@ type instanceExecInfo struct {
 
 // ApplyInstanceEvent updates the cache for one /sn/instance watch event:
 //   - DELETE removes the instance's endpoint and summary (instanceID recovered from the key).
-//   - PUT of a RUNNING instance adds/replaces its summary. If it also has a
-//     non-empty proxyGrpcAddress, it adds/replaces its exec endpoint.
-//   - PUT of a PAUSED instance retains its summary but removes its exec endpoint.
-//   - PUT of any other state or unparseable value removes cached data.
+//   - PUT of a cacheable state adds/replaces its summary. If it also has a
+//     non-empty proxyGrpcAddress, it adds/replaces its exec endpoint. PAUSED is
+//     cacheable but never carries a routable endpoint, so it keeps its summary
+//     while its exec endpoint is dropped.
+//   - PUT of a non-cacheable state or unparseable value removes cached data.
 //
 // It never panics on bad input; malformed data results in the instance having
 // no cached data.
 func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 	if kind == EventDelete {
-		s.Delete(instanceIDFromKey(key))
+		id := instanceIDFromKey(key)
+		// FATAL/FAILED: keep the summary so GET returns the failure state,
+		// only drop the exec endpoint to avoid routing to a dead instance.
+		if summary, ok := s.GetSummary(id); ok {
+			if summary.StatusCode == StatusFatal || summary.StatusCode == StatusFailed {
+				s.DeleteEndpoint(id)
+				return
+			}
+		}
+		s.Delete(id)
 		return
 	}
 
@@ -90,7 +118,7 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 		id = instanceIDFromKey(key)
 	}
 
-	if info.InstanceStatus.Code != StatusRunning && info.InstanceStatus.Code != StatusPaused {
+	if _, ok := cacheableInstanceStates[info.InstanceStatus.Code]; !ok {
 		s.Delete(id)
 		return
 	}
@@ -120,7 +148,7 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 		CreateOptions:  copyStringMap(info.CreateOptions),
 	})
 
-	if info.InstanceStatus.Code != StatusRunning || info.ProxyGrpcAddress == "" {
+	if info.ProxyGrpcAddress == "" {
 		s.DeleteEndpoint(id)
 		return
 	}

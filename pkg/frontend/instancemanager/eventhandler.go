@@ -63,7 +63,6 @@ func ProcessInstanceUpdate(event *etcd3.Event) {
 		zap.Any("revisionId", event.Rev))
 	instanceId := instance.GetInstanceIDFromEtcdKey(event.Key)
 	insSpec := instance.GetInsSpecFromEtcdValue(event.Key, event.Value)
-	RemoveRouteOnlyInstance(instanceId)
 	removeEvictingInstance(instanceId)
 	if len(instanceId) == 0 || insSpec == nil {
 		logger.Warnf("ignoring invalid etcd key, key: %s", event.Key)
@@ -104,6 +103,9 @@ func ProcessInstanceUpdate(event *etcd3.Event) {
 		}
 	} else {
 		GetGlobalInstanceScheduler().addInstance(functionKey, insSpec, logger)
+		// Now that the full instance is reachable in instancesMap, the
+		// create-path routeOnlyInstance shim is no longer needed.
+		RemoveRouteOnlyInstance(instanceId)
 	}
 }
 
