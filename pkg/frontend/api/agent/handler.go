@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -215,13 +216,17 @@ type CreateAgentRequest struct {
 }
 
 // RuntimeSpec carries inline container config (inline mode).
-// CodePath/Handler/ExtendedHandler supply the user code entry for inline+supervisor
-// (where there is no funcSpec): CodePath→DELEGATE_DOWNLOAD (storage_type=local), the
-// handler symbols→CodePaths. See design §4.5.1, §6 C4/C8.
+// CodePath/StorageType/Handler/ExtendedHandler supply the user code entry for inline+supervisor
+// (where there is no funcSpec): CodePath+StorageType→DELEGATE_DOWNLOAD, the handler
+// symbols→CodePaths. StorageType defaults to "local" when unset and is passed through as
+// DELEGATE_DOWNLOAD.storage_type so the function_agent picks the matching deployer (local is
+// no-op and relies on caller mounts; working_dir/s3 pull the resource from the codePath URI).
+// See design §4.5.1, §6 C4/C8.
 type RuntimeSpec struct {
 	Runtime         string          `json:"runtime,omitempty"`
 	SandboxType     string          `json:"sandbox_type,omitempty"`
 	CodePath        string          `json:"codePath,omitempty"`
+	StorageType     string          `json:"storageType,omitempty"`
 	Handler         string          `json:"handler,omitempty"`
 	ExtendedHandler *ExtendedHandler `json:"extendedHandler,omitempty"`
 	Rootfs          *RootfsSpec     `json:"rootfs,omitempty"`
@@ -299,6 +304,10 @@ func CreateHandler(ctx *gin.Context) {
 				"(python3.9, python3.10, or python3.11), got %q", runtime))
 		return
 	}
+	if err := validateAgentCodeDescriptor(inline, req.RuntimeSpec, spec); err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
 	funcMeta := api.FunctionMeta{
 		FuncID:    getAgentExecutorFuncKey(runtime),
 		Language:  api.Python,
@@ -342,6 +351,41 @@ func resolveAgentPreStopTimeout(spec *types.FuncSpec, platformExecutor bool) int
 		return agentPreStopTimeoutSeconds
 	}
 	return 0
+}
+
+// validateAgentCodeDescriptor enforces that storageType and codePath are both set or both
+// unset — a partial pair (one filled, the other empty) means an incomplete code descriptor
+// and is rejected with 400 rather than producing a confusing deployer failure downstream.
+// The same rule applies symmetrically to both modes: inline checks runtime_spec (the
+// caller-supplied code descriptor); registered checks the watched funcSpec (code descriptor
+// from registration, defensive — registration should already validate, but create guards it
+// too). A nil descriptor (inline runtime_spec nil, or registered funcSpec not loaded → falls
+// back to platformExecutor) is skipped. Both-empty is allowed: it means no user code package,
+// and handler-empty → platformExecutor adx fallback.
+func validateAgentCodeDescriptor(inline bool, rs *RuntimeSpec, spec *types.FuncSpec) error {
+	var storageType, codePath string
+	if inline {
+		if rs == nil {
+			return nil
+		}
+		storageType = strings.TrimSpace(rs.StorageType)
+		codePath = strings.TrimSpace(rs.CodePath)
+	} else {
+		if spec == nil {
+			return nil
+		}
+		storageType = strings.TrimSpace(spec.CodeMetaData.StorageType)
+		codePath = strings.TrimSpace(spec.CodeMetaData.CodePath)
+	}
+	if (storageType == "") != (codePath == "") {
+		mode := "inline"
+		if !inline {
+			mode = "registered"
+		}
+		return fmt.Errorf("agent %s: storageType and codePath must be both set or both empty "+
+			"(got storageType=%q, codePath=%q)", mode, storageType, codePath)
+	}
+	return nil
 }
 
 // resolveAgentFuncKeyAndRuntime resolves the user function key and runtime for the agent.
@@ -497,25 +541,82 @@ func applyAgentExecutorCode(invokeOpts *api.InvokeOptions) {
 	invokeOpts.CodePaths = []string{agentExecutorInitEntry, agentExecutorCallEntry, agentExecutorPreStopEntry}
 }
 
-// applyAgentCodePath passes an optional local user code package to the runtime. The package may
-// contain a traditional AgentHandler, or it may only contain files and executables started by
-// the platform Executor through YR_RUNTIME_BOOTSTRAP_CMD.
+// applyAgentCodePath passes the user code package to the runtime via DELEGATE_DOWNLOAD. It
+// mirrors the faas path (functionscaler/instancepool/instance_operation_kernel.go:
+// setCreateOptionForDownloadData) and does NOT constrain storage_type: whatever the funcSpec
+// carries (local/working_dir/s3/copy/...) is forwarded. When S3MetaData is non-empty it is
+// folded into a compact CodeMetaData tagged storage_type=s3 (carrying only the non-empty s3
+// fields the S3Deployer needs) so the S3Deployer can pull the code; otherwise only the
+// LocalMetaData (storage_type+code_path) is serialized so local/working_dir payloads stay
+// compact (no empty s3 fields). An entirely empty code descriptor (no storage_type and no
+// code_path, and no S3MetaData) is skipped.
+//
+// The s3 branch serializes a compact map rather than the full types.CodeMetaData struct:
+// S3MetaData's fields lack omitempty tags, so marshalling the whole struct would emit every s3
+// field (appId/code_type/code_url/code_filename/func_code/sha512) as empty. The C++ consumer
+// ParseDelegateDownloadInfo (metadata.cpp:732-785) reads each field by key-presence, so
+// omitting empty keys is wire-compatible and keeps DELEGATE_DOWNLOAD compact. code_path is
+// always emitted (empty for the s3 path) so the JSON shape matches the local path.
 func applyAgentCodePath(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
-	if spec == nil || spec.CodeMetaData.StorageType != constants.LocalStorageType ||
-		spec.CodeMetaData.CodePath == "" {
+	if spec == nil {
 		return
 	}
-	delegateDownloadValue := types.LocalMetaData{
-		StorageType: constants.LocalStorageType,
-		CodePath:    spec.CodeMetaData.CodePath,
+	var data []byte
+	var err error
+	if !reflect.DeepEqual(spec.S3MetaData, types.S3MetaData{}) {
+		// s3 path: fold S3MetaData into a compact map, tagged storage_type=s3.
+		data, err = json.Marshal(s3MetaDataToCompactMap(spec.S3MetaData))
+	} else if spec.CodeMetaData.StorageType != "" || spec.CodeMetaData.CodePath != "" {
+		// local/working_dir/copy path: forward the LocalMetaData as-is.
+		data, err = json.Marshal(spec.CodeMetaData.LocalMetaData)
+	} else {
+		return
 	}
-	data, err := json.Marshal(delegateDownloadValue)
 	if err != nil {
 		log.GetLogger().Warnf("failed to marshal agent user code delegate download: %v", err)
 		return
 	}
 	log.GetLogger().Infof("[AgentCodePath] set user code DELEGATE_DOWNLOAD=%s", string(data))
 	invokeOpts.CreateOpt[constant.DelegateDownloadKey] = string(data)
+}
+
+// s3MetaDataToCompactMap mirrors functionscaler's s3MetaDataConvert2CodeMetaData (folds an
+// S3MetaData into a CodeMetaData tagged storage_type=s3) but emits a compact map carrying only
+// storage_type=s3, code_path (always present, empty for the s3 path), and the non-empty s3
+// fields (bucketId/objectId/bucketUrl/appId/code_type/code_url/code_filename/func_code) the
+// S3Deployer needs. Empty s3 fields are omitted so DELEGATE_DOWNLOAD stays compact; the C++
+// ParseDelegateDownloadInfo reads fields by key-presence and treats absent keys the same as
+// empty ones, so this is wire-compatible with the full-struct form the faas path emits.
+func s3MetaDataToCompactMap(s3 types.S3MetaData) map[string]interface{} {
+	m := map[string]interface{}{
+		"storage_type": constants.S3StorageType,
+		"code_path":    "",
+	}
+	if s3.AppID != "" {
+		m["appId"] = s3.AppID
+	}
+	if s3.BucketID != "" {
+		m["bucketId"] = s3.BucketID
+	}
+	if s3.ObjectID != "" {
+		m["objectId"] = s3.ObjectID
+	}
+	if s3.BucketURL != "" {
+		m["bucketUrl"] = s3.BucketURL
+	}
+	if s3.CodeType != "" {
+		m["code_type"] = s3.CodeType
+	}
+	if s3.CodeURL != "" {
+		m["code_url"] = s3.CodeURL
+	}
+	if s3.CodeFileName != "" {
+		m["code_filename"] = s3.CodeFileName
+	}
+	if s3.FuncCode.File != "" || s3.FuncCode.Link != "" {
+		m["func_code"] = map[string]interface{}{"file": s3.FuncCode.File, "link": s3.FuncCode.Link}
+	}
+	return m
 }
 
 func applyAgentCodePaths(invokeOpts *api.InvokeOptions, spec *types.FuncSpec) {
@@ -702,17 +803,23 @@ func applyAgentInlineMeta(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 }
 
 // applyAgentInlineCode sinks the inline user-code config from runtime_spec into
-// createOptions: codePath→DELEGATE_DOWNLOAD (storage_type=local, per design §6 C4) so the
-// function_agent's LocalDeployer resolves the code dir; handler/extendedHandler→CodePaths
+// createOptions: codePath+storageType→DELEGATE_DOWNLOAD so the function_agent picks the
+// matching deployer to resolve the code dir (storage_type=local → LocalDeployer no-op,
+// working_dir/s3 → the codePath is pulled as a resource URI); handler/extendedHandler→CodePaths
 // via resolveInlineHandlerEntries so CodeManager.load_functions registers the
 // [init, handler, preStop?] entry layout (init empty when unset, keeping length>=2 so
 // _are_faas_entries treats it as FaaS entries, design §6 C5). The same resolver feeds the
 // synthesized funcSpec in buildAgentCreateArgs, so wire CodePaths and create args never diverge.
-// codePath/handler presence is not validated here (§6 C7/C8: surfaced at invoke).
+// storageType is passed through verbatim (no value constraint, mirroring the faas path).
+// validateAgentCodeDescriptor (C10) enforces upstream that storageType and codePath are both
+// set or both empty, so the C++ ParseDelegateDownloadInfo default-to-s3 path (which fires when
+// storage_type is an empty/absent key) is not reachable via this API when codePath is set;
+// callers wanting s3 must set storage_type explicitly (design §6 C4 risk note). codePath/
+// handler presence is not validated here (§6 C7/C8: surfaced at invoke).
 func applyAgentInlineCode(invokeOpts *api.InvokeOptions, c *RuntimeSpec) {
 	if c.CodePath != "" {
 		delegateDownloadValue := types.LocalMetaData{
-			StorageType: constants.LocalStorageType,
+			StorageType: c.StorageType,
 			CodePath:    c.CodePath,
 		}
 		data, err := json.Marshal(delegateDownloadValue)
