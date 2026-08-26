@@ -893,7 +893,6 @@ func TestIsSafeBindSource(t *testing.T) {
 
 func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
 	const instanceID = "0b6c6322-6533-4901-8000-00000000bb0b"
-	defer stubInstanceFound(t, instanceID).Reset()
 
 	var (
 		capturedInstanceID string
@@ -901,12 +900,27 @@ func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
 		capturedPayload    []byte
 		capturedInvokeOpt  api.InvokeOptions
 	)
+	// The instance is present until the kill RPC fires; the kill callback flips
+	// the cache to absent, mirroring the async etcd-delete the exit handler runs
+	// so waitForAgentInstanceDeleted observes the clear and the handler returns 200.
+	cleared := false
+	patches := gomonkey.ApplyMethod(
+		reflect.TypeOf(instancemanager.GetGlobalInstanceScheduler()),
+		"GetInstanceByIDAcrossFunctions",
+		func(_ *instancemanager.FunctionInstancesMap, id string) *types.InstanceSpecification {
+			if id == instanceID && !cleared {
+				return &types.InstanceSpecification{}
+			}
+			return nil
+		})
+	defer patches.Reset()
 	setAPIClientsForTest(t, &runtimeStub{
 		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
 			capturedInstanceID = instanceID
 			capturedSignal = signal
 			capturedPayload = append([]byte(nil), payload...)
 			capturedInvokeOpt = invokeOpt
+			cleared = true
 			return nil
 		},
 	})
@@ -953,13 +967,12 @@ func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
 }
 
 func TestDeleteHandlerReturns404ForNonExistentInstance(t *testing.T) {
-	// No stubInstanceFound patch: instance cache reports nil for unknown IDs,
-	// so a non-existent or already-deleted instanceID returns 404, not 200.
-	killCalled := false
+	// No stubInstanceFound patch: the instance is absent from both the routable
+	// table and the execendpoint summary cache, so resolveKillAddress returns a
+	// "not present in frontend route cache" error and the handler maps it to 404.
 	setAPIClientsForTest(t, &runtimeStub{
 		kill: func(string, int, []byte, api.InvokeOptions) error {
-			killCalled = true
-			return nil
+			return fmt.Errorf("instance not present in frontend route cache")
 		},
 	})
 
@@ -976,7 +989,6 @@ func TestDeleteHandlerReturns404ForNonExistentInstance(t *testing.T) {
 		require.Equal(t, http.StatusNotFound, recorder.Code, instanceID)
 		require.Contains(t, recorder.Body.String(), "instance not found", instanceID)
 	}
-	require.False(t, killCalled, "kill must not be called for non-existent instance")
 }
 
 // inlineRootfsReq is an inline-mode CreateAgentRequest (RuntimeSpec set, no Urn) used by the

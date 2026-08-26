@@ -52,6 +52,7 @@ import (
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/instancemanager"
 	"frontend/pkg/frontend/proxyrouting"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
 
 var frontendProxyRequestSeq atomic.Uint64
@@ -356,13 +357,12 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreat
 		return "", fmt.Errorf("frontend proxy create response missing instance id")
 	}
 	ownerProxyID := strings.TrimSpace(resp.GetRouteAddress())
-	if ownerProxyID == "" {
-		return "", fmt.Errorf("frontend proxy create response missing final owner proxy node id")
+	if ownerProxyID != "" {
+		if proxyrouting.IsHostPort(ownerProxyID) {
+			return "", fmt.Errorf("frontend proxy create owner must be a proxy node id, got address %q", ownerProxyID)
+		}
+		instancemanager.RecordRouteOnlyInstance(req.funcMeta.FuncID, instanceID, ownerProxyID)
 	}
-	if proxyrouting.IsHostPort(ownerProxyID) {
-		return "", fmt.Errorf("frontend proxy create owner must be a proxy node id, got address %q", ownerProxyID)
-	}
-	instancemanager.RecordRouteOnlyInstance(req.funcMeta.FuncID, instanceID, ownerProxyID)
 	return instanceID, nil
 }
 
@@ -685,12 +685,16 @@ func (c *routingFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKill
 		return fmt.Errorf("frontend proxy lifecycle routing client is not initialized")
 	}
 	for attempt := 0; attempt < frontendProxyKillMaxAttempts; attempt++ {
-		route, err := resolveDirectProxyOwner(
-			req.ctx, req.instanceID, proxyrouting.CapabilityKill, proxyrouting.TransportGRPC)
+		// Resolve the owning proxy address. The routable instance table (InstanceScheduler)
+		// only holds RUNNING instances; FATAL/EXITED/FAILED instances self-clear from it. For
+		// those unreachable states, fall back to the execendpoint summary (populated from etcd
+		// PUT for cacheable states incl. FATAL) to recover the owning node ID and route the
+		// kill directly. invoke paths keep using the blocking Wait (see resolveDirectProxyOwner)
+		// and are untouched here, so dead instances remain unroutable for invocation.
+		address, err := c.resolveKillAddress(req)
 		if err != nil {
 			return err
 		}
-		address := route.Address
 		serviceClient, err := c.clientFactory.ClientForAddress(address)
 		if err != nil {
 			evictFrontendProxyClientOnError(c.clientFactory, address, err)
@@ -712,6 +716,37 @@ func (c *routingFrontendProxyLifecycleClient) KillInstance(req simpleRuntimeKill
 		}
 	}
 	return fmt.Errorf("frontend proxy kill retry exhausted")
+}
+
+// resolveKillAddress resolves the owning frontend proxy gRPC address for a kill.
+// It prefers the non-blocking Resolve; when the instance is absent from the
+// routable table (FATAL/EXITED/FAILED after self-clear), it falls back to the
+// execendpoint summary's NodeID so the kill can still reach the backend. The
+// fallback is kill-only: invocation does not call this path.
+func (c *routingFrontendProxyLifecycleClient) resolveKillAddress(
+	req simpleRuntimeKillRequest,
+) (string, error) {
+	if route, err := proxyrouting.Resolve(
+		req.instanceID, proxyrouting.CapabilityKill, proxyrouting.TransportGRPC); err == nil {
+		return route.Address, nil
+	}
+	// Instance not in the routable table; fall back to the cached summary to
+	// recover the owning proxy node ID. The summary stays until the etcd key is
+	// deleted by the watcher, so it remains available while a kill is in flight.
+	summary, ok := execendpoint.Default().GetSummary(req.instanceID)
+	if !ok || summary.NodeID == "" {
+		return "", fmt.Errorf("instance %s is not present in frontend route cache", req.instanceID)
+	}
+	endpoint, ok := proxyrouting.Lookup(summary.NodeID, proxyrouting.CapabilityKill)
+	if !ok {
+		return "", fmt.Errorf("owner proxy %s for instance %s does not publish healthy capability %s",
+			summary.NodeID, req.instanceID, proxyrouting.CapabilityKill)
+	}
+	if !proxyrouting.IsRoutableAddress(endpoint.GRPCAddress) {
+		return "", fmt.Errorf("owner proxy %s has no routable address for capability %s",
+			summary.NodeID, proxyrouting.CapabilityKill)
+	}
+	return endpoint.GRPCAddress, nil
 }
 
 func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDRaw(req simpleRuntimeRawInvokeRequest) ([]byte, error) {

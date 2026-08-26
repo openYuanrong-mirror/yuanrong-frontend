@@ -16,7 +16,10 @@
 
 package execendpoint
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 const instanceKey = "/sn/instance/business/yrk/tenant/default/function/0-svc/version/$latest/" +
 	"defaultaz/req0/inst-abc"
@@ -158,15 +161,42 @@ func TestApplyEventPutThenDelete(t *testing.T) {
 
 func TestApplyEventNonRunningRemoved(t *testing.T) {
 	s := NewStore()
-	// Pre-populate, then a non-RUNNING update (code 5) must evict it.
+	// Pre-populate, then a non-cacheable update (code 5 = EXITING) must evict it.
 	ApplyInstanceEvent(s, EventPut, instanceKey, []byte(runningJSON))
 	const exitedJSON = `{"instanceID":"inst-abc","proxyGrpcAddress":"10.0.0.1:22774","instanceStatus":{"code":5}}`
 	ApplyInstanceEvent(s, EventPut, instanceKey, []byte(exitedJSON))
 	if _, ok := s.Get("inst-abc"); ok {
-		t.Error("non-RUNNING instance must not stay cached")
+		t.Error("non-cacheable instance must not stay cached")
 	}
 	if summaries := s.ListSummaries("default", ""); len(summaries) != 0 {
-		t.Errorf("non-RUNNING summary must not stay cached, got %+v", summaries)
+		t.Errorf("non-cacheable summary must not stay cached, got %+v", summaries)
+	}
+}
+
+// TestApplyEventCacheableStates asserts the non-RUNNING cacheable states are
+// cached, not just RUNNING.
+func TestApplyEventCacheableStates(t *testing.T) {
+	cacheable := map[int32]string{
+		2: "CREATING", 11: "SUB_HEALTH", 4: "FAILED", 6: "FATAL", 7: "SCHEDULE_FAILED", 1: "SCHEDULING",
+	}
+	for code, name := range cacheable {
+		s := NewStore()
+		json := `{"instanceID":"inst-abc","proxyGrpcAddress":"10.0.0.1:22774",` +
+			`"instanceStatus":{"code":` + strconv.Itoa(int(code)) + `,"msg":"` + name + `"}}`
+		ApplyInstanceEvent(s, EventPut, instanceKey, []byte(json))
+		if _, ok := s.Get("inst-abc"); !ok {
+			t.Errorf("code %d (%s) should be cached as exec endpoint", code, name)
+		}
+		summaries := s.ListSummaries("default", "")
+		if len(summaries) != 1 {
+			t.Fatalf("code %d (%s): expected one summary, got %+v", code, name, summaries)
+		}
+		if summaries[0].StatusCode != code {
+			t.Errorf("code %d (%s): StatusCode = %d", code, name, summaries[0].StatusCode)
+		}
+		if summaries[0].StatusMsg != name {
+			t.Errorf("code %d (%s): StatusMsg = %q", code, name, summaries[0].StatusMsg)
+		}
 	}
 }
 
