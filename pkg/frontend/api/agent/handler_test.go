@@ -601,6 +601,47 @@ func TestCreateHandlerWithUserHandlerUsesFaaSPath(t *testing.T) {
 	require.Equal(t, "user_agent.handle", params.EventCreateParams.UserCallEntry)
 }
 
+// TestCreateHandlerRegisteredS3ForwardsAllS3Fields covers applyAgentCodePath's s3 branch: a
+// registered funcSpec whose S3MetaData is non-empty must forward storage_type=s3 plus the
+// s3 fields (bucketId/objectId/hostName/...) the S3Deployer needs — no local-only constraint.
+func TestCreateHandlerRegisteredS3ForwardsAllS3Fields(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "instance-s3", nil
+		},
+	})
+	defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(string) (*types.FuncSpec, bool) {
+		return &types.FuncSpec{
+			FuncMetaData: types.FuncMetaData{Runtime: "python3.11", Handler: "user_agent.handle"},
+			S3MetaData: types.S3MetaData{
+				BucketID:  "my-bucket",
+				ObjectID:  "my-object.zip",
+				BucketURL: "http://obs.example.com",
+			},
+			ExtendedMetaData: types.ExtendedMetaData{
+				Initializer: types.Initializer{Handler: "user_agent.initialize"},
+			},
+			RootfsSpecMeta: types.RootfsSpecMeta{ImageURL: "yr-docker-runtime:v0"},
+			SandboxType:    "docker",
+		}, true
+	}).Reset()
+
+	recorder, ctx := newAgentCreateRecorder(t, CreateAgentRequest{
+		Namespace: "agent-ns",
+		Name:      "agent-s3",
+		Urn:       validAgentURN,
+	})
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	// storage_type tagged s3, s3 fields carried through (no local-only constraint).
+	require.JSONEq(t, `{"storage_type":"s3","code_path":"","bucketId":"my-bucket",
+		"objectId":"my-object.zip","bucketUrl":"http://obs.example.com"}`,
+		capturedInvokeOpt.CreateOpt[constant.DelegateDownloadKey])
+}
+
 func TestCreateHandlerRegisteredSinksFuncMetaResources(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
 	setAPIClientsForTest(t, &runtimeStub{
@@ -1033,6 +1074,162 @@ func TestCreateHandlerInlineSupervisorToleratesEmptyImageURL(t *testing.T) {
 	// sandbox_type is sunk as-is; rootfs carries mounts only (no image url).
 	require.Equal(t, agentSandboxTypeSupervisor, capturedInvokeOpt.CreateOpt["sandbox_type"])
 	require.NotContains(t, capturedInvokeOpt.CreateOpt["rootfs"], "imageurl")
+}
+
+// TestCreateHandlerInlineUserCodeSinksStorageType covers applyAgentInlineCode: codePath+
+// storageType are sunk into DELEGATE_DOWNLOAD, handler/extendedHandler into CodePaths.
+// storageType is passed through verbatim (mirroring the faas path). validateAgentCodeDescriptor
+// (C10) rejects the storageType-unset + codePath-set pair with 400 (covered by
+// TestCreateHandlerInlineCodeDescriptorCompleteness), so only the both-set cases here.
+func TestCreateHandlerInlineUserCodeSinksStorageType(t *testing.T) {
+	cases := []struct {
+		name        string
+		codePath    string
+		storageType string
+		handler     string
+		wantJSON    string
+	}{
+		// Note: a "storageType unset + codePath set" case is intentionally omitted here. It is
+		// rejected with 400 by validateAgentCodeDescriptor (C10: storageType and codePath must be
+		// both set or both empty) — see TestCreateHandlerInlineCodeDescriptorCompleteness. The C++
+		// ParseDelegateDownloadInfo default-to-s3 path is therefore not reachable via the agent
+		// create API; callers wanting s3 must set storage_type explicitly (design C4 risk note).
+		{
+			name:        "explicit local",
+			codePath:    "/opt/mycode/service",
+			storageType: constants.LocalStorageType,
+			handler:     "demo.handler",
+			wantJSON:    `{"storage_type":"local","code_path":"/opt/mycode/service"}`,
+		},
+		{
+			name:        "working_dir passed through (codePath is a resource URI)",
+			codePath:    "file:///home/hhc/mycode.zip",
+			storageType: "working_dir",
+			handler:     "demo.handler",
+			wantJSON:    `{"storage_type":"working_dir","code_path":"file:///home/hhc/mycode.zip"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var capturedInvokeOpt api.InvokeOptions
+			setAPIClientsForTest(t, &runtimeStub{
+				createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+					capturedInvokeOpt = invokeOpt
+					return "instance-inline-usercode", nil
+				},
+			})
+
+			req := inlineRootfsReq()
+			req.RuntimeSpec.SandboxType = agentSandboxTypeSupervisor
+			req.RuntimeSpec.Rootfs.ImageURL = ""
+			req.RuntimeSpec.CodePath = tc.codePath
+			req.RuntimeSpec.StorageType = tc.storageType
+			req.RuntimeSpec.Handler = tc.handler
+			req.RuntimeSpec.ExtendedHandler = &ExtendedHandler{
+				Initializer: "demo.init", PreStop: "demo.pre_stop",
+			}
+			recorder, ctx := newAgentCreateRecorder(t, req)
+			CreateHandler(ctx)
+
+			require.Equal(t, http.StatusOK, recorder.Code)
+			require.JSONEq(t, tc.wantJSON, capturedInvokeOpt.CreateOpt[constant.DelegateDownloadKey])
+			// CodePaths layout is [init, handler, preStop?] (design §6 C5).
+			require.Equal(t, []string{"demo.init", "demo.handler", "demo.pre_stop"},
+				capturedInvokeOpt.CodePaths)
+		})
+	}
+}
+
+// TestCreateHandlerInlineCodeDescriptorCompleteness covers validateAgentCodeDescriptor:
+// storageType and codePath must be both set or both empty; a partial pair is rejected with
+// 400 "incomplete" before any gRPC call.
+func TestCreateHandlerInlineCodeDescriptorCompleteness(t *testing.T) {
+	cases := []struct {
+		name        string
+		codePath    string
+		storageType string
+		wantStatus  int
+	}{
+		{"both set", "/opt/mycode/service", constants.LocalStorageType, http.StatusOK},
+		{"both empty", "", "", http.StatusOK},
+		{"only storageType set", "", constants.LocalStorageType, http.StatusBadRequest},
+		{"only codePath set", "/opt/mycode/service", "", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var called bool
+			setAPIClientsForTest(t, &runtimeStub{
+				createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+					called = true
+					return "instance-inline", nil
+				},
+			})
+
+			req := inlineRootfsReq()
+			req.RuntimeSpec.SandboxType = agentSandboxTypeSupervisor
+			req.RuntimeSpec.Rootfs.ImageURL = ""
+			req.RuntimeSpec.CodePath = tc.codePath
+			req.RuntimeSpec.StorageType = tc.storageType
+			recorder, ctx := newAgentCreateRecorder(t, req)
+			CreateHandler(ctx)
+
+			require.Equal(t, tc.wantStatus, recorder.Code)
+			require.Equal(t, tc.wantStatus == http.StatusOK, called)
+		})
+	}
+}
+
+// TestCreateHandlerRegisteredCodeDescriptorCompleteness mirrors the inline completeness check
+// for registered mode: a watched funcSpec whose storageType/codePath is a partial pair is
+// rejected with 400 (defensive — registration should already validate, but create guards too).
+func TestCreateHandlerRegisteredCodeDescriptorCompleteness(t *testing.T) {
+	cases := []struct {
+		name       string
+		storageType string
+		codePath   string
+		wantStatus int
+	}{
+		{"both set", constants.LocalStorageType, "/opt/user/agent-code", http.StatusOK},
+		{"both empty", "", "", http.StatusOK},
+		{"only storageType set", constants.LocalStorageType, "", http.StatusBadRequest},
+		{"only codePath set", "", "/opt/user/agent-code", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var called bool
+			setAPIClientsForTest(t, &runtimeStub{
+				createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+					called = true
+					return "instance-registered", nil
+				},
+			})
+			defer gomonkey.ApplyFunc(functionmeta.LoadFuncSpec, func(string) (*types.FuncSpec, bool) {
+				return &types.FuncSpec{
+					FuncMetaData: types.FuncMetaData{Runtime: "python3.11", Handler: "user_agent.handle"},
+					CodeMetaData: types.CodeMetaData{
+						LocalMetaData: types.LocalMetaData{
+							StorageType: tc.storageType, CodePath: tc.codePath,
+						},
+					},
+					ExtendedMetaData: types.ExtendedMetaData{
+						Initializer: types.Initializer{Handler: "user_agent.initialize"},
+					},
+					RootfsSpecMeta: types.RootfsSpecMeta{ImageURL: "yr-docker-runtime:v0"},
+					SandboxType:    "docker",
+				}, true
+			}).Reset()
+
+			recorder, ctx := newAgentCreateRecorder(t, CreateAgentRequest{
+				Namespace: "agent-ns",
+				Name:      "agent-registered",
+				Urn:       validAgentURN,
+			})
+			CreateHandler(ctx)
+
+			require.Equal(t, tc.wantStatus, recorder.Code)
+			require.Equal(t, tc.wantStatus == http.StatusOK, called)
+		})
+	}
 }
 
 func TestCreateHandlerInlineRejectsEmptyImageURLForDocker(t *testing.T) {
