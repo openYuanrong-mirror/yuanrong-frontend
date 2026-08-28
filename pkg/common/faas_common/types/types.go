@@ -493,6 +493,7 @@ type ExtendedMetaData struct {
 	EnableMetrics          bool                   `json:"enableMetrics,omitempty"`
 	EnableAgentSession     bool                   `json:"enable_agent_session,omitempty"`
 	EnableSessionCtx       bool                   `json:"enable_session_ctx,omitempty"`
+	Cmds                   [][]string             `json:"cmds,omitempty"`
 }
 
 // UserOtelConfig -
