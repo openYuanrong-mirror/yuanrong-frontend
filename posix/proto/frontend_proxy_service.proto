@@ -96,6 +96,9 @@ message InvokeInstanceStreamResponse {
 message CreateInstanceRequest {
   FrontendRequestContext context = 1;
   core_service.CreateRequest create = 2;
+  // Sandbox create timeout supplied by frontend. FunctionProxy uses this for
+  // its create and ready waiters instead of their legacy fixed defaults.
+  int64 createTimeoutMs = 3;
 }
 
 message CreateInstanceResponse {

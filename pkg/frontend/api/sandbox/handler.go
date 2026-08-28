@@ -1207,9 +1207,10 @@ func createSandboxInstanceRaw(
 		)
 		defer cancel()
 	}
-	respRaw, err := util.GetDirectProxyClient().CreateRaw(util.NewDirectRawRequest(
+	respRaw, err := util.GetDirectProxyClient().CreateRaw(util.NewDirectRawCreateRequest(
 		createCtx, createReqRaw,
 		api.RawRequestOption{TraceParent: ctx.Request.Header.Get(constant.HeaderTraceParent)},
+		invocation.invokeOpts.Timeout,
 	))
 	if err != nil {
 		return "", err

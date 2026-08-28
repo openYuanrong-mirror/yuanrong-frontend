@@ -807,6 +807,7 @@ func TestGRPCFrontendProxyLifecycleClientBuildsCreateRequestAndReturnsInstanceID
 		}},
 		options: api.InvokeOptions{
 			TraceID:          "trace-create",
+			Timeout:          300,
 			CustomExtensions: map[string]string{"custom-a": "value-a"},
 			CreateOpt:        map[string]string{"create-a": "value-b"},
 		},
@@ -1059,8 +1060,9 @@ func TestGRPCFrontendProxyLifecycleClientCreateInstanceRawReturnsReadyNotify(t *
 	require.NoError(t, err)
 
 	got, err := client.CreateInstanceRaw(simpleRuntimeRawCreateRequest{
-		create:  rawCreate,
-		options: api.RawRequestOption{TraceParent: "traceparent-raw"},
+		create:         rawCreate,
+		timeoutSeconds: 300,
+		options:        api.RawRequestOption{TraceParent: "traceparent-raw"},
 	})
 
 	require.NoError(t, err)
@@ -1071,6 +1073,7 @@ func TestGRPCFrontendProxyLifecycleClientCreateInstanceRawReturnsReadyNotify(t *
 	require.NotEqual(t, "raw-create-request", fakeService.createReq.Context.RequestID)
 	require.Equal(t, fakeService.createReq.Context.RequestID, fakeService.createReq.Create.RequestID)
 	require.Equal(t, "trace-raw-create", fakeService.createReq.Context.TraceID)
+	require.Equal(t, int64(300000), fakeService.createReq.CreateTimeoutMs)
 	require.Equal(t, "frontend", fakeService.createReq.Create.CreateOptions["source"])
 	require.Equal(t, "traceparent-raw", fakeService.createReq.Create.CreateOptions[traceParentExtensionKey])
 }

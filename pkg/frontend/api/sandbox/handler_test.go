@@ -113,8 +113,9 @@ type runtimeStub struct {
 		createReq *core.CreateRequest,
 		option api.RawRequestOption,
 	) ([]byte, error)
-	invokeInstanceRaw func(invokeReq *core.InvokeRequest, option api.RawRequestOption) ([]byte, error)
-	invokeInstance    func(
+	inspectDirectRawCreate func(req util.DirectRawRequest)
+	invokeInstanceRaw      func(invokeReq *core.InvokeRequest, option api.RawRequestOption) ([]byte, error)
+	invokeInstance         func(
 		funcMeta api.FunctionMeta,
 		instanceID string,
 		args []api.Arg,
@@ -142,6 +143,9 @@ func (r *directRuntimeStub) CreateInstance(req util.DirectCreateRequest) (string
 }
 
 func (r *directRuntimeStub) CreateRaw(req util.DirectRawRequest) ([]byte, error) {
+	if r.runtime.inspectDirectRawCreate != nil {
+		r.runtime.inspectDirectRawCreate(req)
+	}
 	return r.runtime.CreateInstanceRawContext(req.Context, req.Payload, req.AdaptedRawOption())
 }
 
@@ -433,6 +437,9 @@ func TestCreateSandboxInstanceRawUsesIndependentTimeoutContext(t *testing.T) {
 
 	const createTimeoutSeconds = 2
 	setAPIClientsForTest(t, &runtimeStub{
+		inspectDirectRawCreate: func(req util.DirectRawRequest) {
+			require.Equal(t, createTimeoutSeconds, req.CreateTimeoutSeconds)
+		},
 		createInstanceRawContext: func(
 			createCtx context.Context,
 			_ *core.CreateRequest,

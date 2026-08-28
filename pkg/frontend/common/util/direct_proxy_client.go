@@ -69,6 +69,9 @@ type DirectRawRequest struct {
 	Context     context.Context
 	Payload     []byte
 	TraceParent string
+	// CreateTimeoutSeconds is used only by CreateRaw. InvokeRaw continues to use
+	// the timeout carried by its core InvokeRequest payload.
+	CreateTimeoutSeconds int
 }
 
 // DirectKillRequest carries a direct FunctionProxy kill request.
@@ -122,6 +125,16 @@ func (r DirectCreateRequest) AdaptedCreateValues() (api.FunctionMeta, []api.Arg,
 // NewDirectRawRequest builds a raw request without changing its payload.
 func NewDirectRawRequest(ctx context.Context, payload []byte, option api.RawRequestOption) DirectRawRequest {
 	return DirectRawRequest{Context: ctx, Payload: payload, TraceParent: option.TraceParent}
+}
+
+// NewDirectRawCreateRequest builds a raw create request with the caller's
+// logical create timeout kept alongside the serialized core request.
+func NewDirectRawCreateRequest(
+	ctx context.Context, payload []byte, option api.RawRequestOption, timeoutSeconds int,
+) DirectRawRequest {
+	return DirectRawRequest{
+		Context: ctx, Payload: payload, TraceParent: option.TraceParent, CreateTimeoutSeconds: timeoutSeconds,
+	}
 }
 
 // AdaptedRawOption restores the libruntime option used by Raw/SDK adapters.
@@ -293,7 +306,8 @@ func (c *directProxyClient) CreateRaw(req DirectRawRequest) ([]byte, error) {
 		return nil, fmt.Errorf("direct proxy lifecycle client is not initialized")
 	}
 	return c.lifecycleClient.CreateInstanceRaw(simpleRuntimeRawCreateRequest{
-		ctx: req.Context, create: req.Payload, options: api.RawRequestOption{TraceParent: req.TraceParent},
+		ctx: req.Context, create: req.Payload, timeoutSeconds: req.CreateTimeoutSeconds,
+		options: api.RawRequestOption{TraceParent: req.TraceParent},
 	})
 }
 

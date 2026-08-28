@@ -397,7 +397,8 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntimeRa
 			req.options,
 			tenantIDFromCreateRequest(createReq),
 		),
-		Create: createReq,
+		Create:          createReq,
+		CreateTimeoutMs: timeoutSecondsToMs(req.timeoutSeconds),
 	})
 	if err != nil {
 		return nil, err
@@ -968,10 +969,14 @@ func simpleRuntimeInvokeContextWithParent(
 }
 
 func functionInvokeTimeoutMs(options api.InvokeOptions) int64 {
-	if options.Timeout <= 0 {
+	return timeoutSecondsToMs(options.Timeout)
+}
+
+func timeoutSecondsToMs(timeoutSeconds int) int64 {
+	if timeoutSeconds <= 0 {
 		return 0
 	}
-	return int64(options.Timeout) * int64(time.Second/time.Millisecond)
+	return int64(timeoutSeconds) * int64(time.Second/time.Millisecond)
 }
 
 func rawSimpleRuntimeContext(parent context.Context, _ api.RawRequestOption) (context.Context, context.CancelFunc) {
