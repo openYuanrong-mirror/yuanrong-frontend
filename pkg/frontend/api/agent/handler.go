@@ -532,6 +532,9 @@ func applyAgentFuncMeta(invokeOpts *api.InvokeOptions, funcKey string) {
 	}
 	mergeAgentStaticEnv(invokeOpts, spec)
 	applyAgentCodePath(invokeOpts, spec)
+	if len(spec.ExtendedMetaData.Cmds) > 0 {
+		mergeAgentBootstrapCmds(invokeOpts, spec.ExtendedMetaData.Cmds)
+	}
 }
 
 // applyAgentExecutorCode configures only the lifecycle entries of the platform-owned Executor.
