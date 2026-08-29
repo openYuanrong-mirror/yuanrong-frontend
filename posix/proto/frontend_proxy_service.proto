@@ -114,6 +114,9 @@ message CreateInstanceResponse {
 message KillInstanceRequest {
   FrontendRequestContext context = 1;
   core_service.KillRequest kill = 2;
+  // End-to-end lifecycle budget supplied by frontend. Snapshot and pause use
+  // the same budget for checkpoint capture and artifact publication.
+  int64 lifecycleTimeoutMs = 3;
 }
 
 message KillInstanceResponse {

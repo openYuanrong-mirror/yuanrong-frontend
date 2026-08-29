@@ -150,7 +150,8 @@ var (
 )
 
 type pauseV1Request struct {
-	TTLSeconds int32 `json:"ttlSeconds"`
+	TTLSeconds     int32 `json:"ttlSeconds"`
+	TimeoutSeconds int   `json:"timeoutSeconds"`
 }
 
 type pauseV1Response struct {
@@ -2350,20 +2351,27 @@ func PauseV1Handler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, errors.New("ttlSeconds must be positive"))
 		return
 	}
+	timeoutSeconds, err := resolveSandboxCheckpointTimeout(req.TimeoutSeconds)
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
 	payload, err := proto.Marshal(&core.SnapOptions{
-		Type: common.SnapType_PAUSE_RESUME,
-		Ttl:  req.TTLSeconds,
+		Type:                common.SnapType_PAUSE_RESUME,
+		Ttl:                 req.TTLSeconds,
+		CheckpointTimeoutMs: uint64(timeoutSeconds) * uint64(time.Second/time.Millisecond),
 	})
 	if err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
 		return
 	}
-	killResponse, err := executeSandboxLifecycleKill(
+	killResponse, err := executeSandboxLifecycleKillWithTimeout(
 		ctx,
 		sandboxPauseInstanceSignal,
 		payload,
 		sandboxPauseRequestIDPattern,
 		"pause",
+		timeoutSeconds,
 	)
 	if err != nil {
 		setSandboxLifecycleError(ctx, err)
@@ -2510,6 +2518,19 @@ func executeSandboxLifecycleKill(
 	requestIDPattern *regexp.Regexp,
 	operation string,
 ) (*core.KillResponse, error) {
+	return executeSandboxLifecycleKillWithTimeout(
+		ctx, signal, payload, requestIDPattern, operation, 0,
+	)
+}
+
+func executeSandboxLifecycleKillWithTimeout(
+	ctx *gin.Context,
+	signal int,
+	payload []byte,
+	requestIDPattern *regexp.Regexp,
+	operation string,
+	timeoutSeconds int,
+) (*core.KillResponse, error) {
 	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
 	if instanceID == "" {
 		return nil, errors.New("sandboxID is required")
@@ -2533,6 +2554,7 @@ func executeSandboxLifecycleKill(
 	}
 	invokeOptions := api.InvokeOptions{
 		TraceID: ctx.GetHeader(constant.HeaderTraceID),
+		Timeout: timeoutSeconds,
 		CustomExtensions: map[string]string{
 			"traceparent": ctx.GetHeader(constant.HeaderTraceParent),
 		},

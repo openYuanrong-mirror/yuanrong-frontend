@@ -467,6 +467,7 @@ func (c *grpcFrontendProxyLifecycleClient) KillInstanceWithResponse(
 			Payload:    req.payload,
 			RequestID:  requestID,
 		},
+		LifecycleTimeoutMs: timeoutSecondsToMs(req.options.Timeout),
 	})
 	if err != nil {
 		return nil, err
@@ -1539,7 +1540,8 @@ func buildSimpleRuntimeCreateMetadata(funcMeta api.FunctionMeta, codePaths []str
 func buildSimpleRuntimeMetaConfig(codePaths []string) []byte {
 	var config []byte
 	for _, codePath := range codePaths {
-        config = appendProtoBytes(config, metaConfigCodePathsField, []byte(codePath))	}
+		config = appendProtoBytes(config, metaConfigCodePathsField, []byte(codePath))
+	}
 	return config
 }
 

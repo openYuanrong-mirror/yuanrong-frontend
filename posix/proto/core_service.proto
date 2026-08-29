@@ -207,6 +207,7 @@ message SnapOptions {
   bool            leaveRunning = 3;
   string          functionType = 4;
   string          name = 5;
+  uint64          checkpointTimeoutMs = 6;
 }
 
 message SnapStartOptions {
