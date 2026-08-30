@@ -1487,7 +1487,7 @@ type sandboxInvokeOptionRequest struct {
 }
 
 func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions, error) {
-	cpu, memory := resourceDefaults(req.createReq.Cpu, req.createReq.Memory)
+	cpu, memory := createResources(req.createReq)
 	xpu, err := parseSandboxXPU(req.createReq.XPU)
 	if err != nil {
 		return api.InvokeOptions{}, err
@@ -1549,6 +1549,24 @@ func resourceDefaults(cpu, memory int) (int, int) {
 	}
 	if memory <= 0 {
 		memory = sandboxDefaultMemory
+	}
+	return cpu, memory
+}
+
+func createResources(req CreateRequest) (int, int) {
+	cpu, memory := resourceDefaults(req.Cpu, req.Memory)
+	if strings.TrimSpace(req.SnapshotID) == "" {
+		return cpu, memory
+	}
+	// A Create-from-Snapshot request inherits resources that the caller did
+	// not specify. Keep the negative sentinel expected by
+	// buildSandboxRawCreateRequest instead of turning omission into ordinary
+	// sandbox defaults before FunctionSystem can merge the Snapshot template.
+	if req.Cpu <= 0 {
+		cpu = -1
+	}
+	if req.Memory <= 0 {
+		memory = -1
 	}
 	return cpu, memory
 }

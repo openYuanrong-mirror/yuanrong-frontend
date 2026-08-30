@@ -493,6 +493,55 @@ func TestCreateV1HandlerForwardsFailover(t *testing.T) {
 	require.True(t, raw.GetFailover())
 }
 
+func TestCreateResourcesPreservesSnapshotInheritance(t *testing.T) {
+	tests := []struct {
+		name       string
+		request    CreateRequest
+		wantCPU    int
+		wantMemory int
+	}{
+		{
+			name:       "ordinary create uses defaults",
+			request:    CreateRequest{},
+			wantCPU:    sandboxDefaultCPU,
+			wantMemory: sandboxDefaultMemory,
+		},
+		{
+			name:       "snapshot create inherits omitted resources",
+			request:    CreateRequest{SnapshotID: "snapshot-4g"},
+			wantCPU:    -1,
+			wantMemory: -1,
+		},
+		{
+			name: "snapshot create preserves explicit resources",
+			request: CreateRequest{
+				SnapshotID: "snapshot-4g",
+				Cpu:        2000,
+				Memory:     4096,
+			},
+			wantCPU:    2000,
+			wantMemory: 4096,
+		},
+		{
+			name: "snapshot create can mix inheritance and override",
+			request: CreateRequest{
+				SnapshotID: "snapshot-4g",
+				Memory:     8192,
+			},
+			wantCPU:    -1,
+			wantMemory: 8192,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cpu, memory := createResources(test.request)
+			require.Equal(t, test.wantCPU, cpu)
+			require.Equal(t, test.wantMemory, memory)
+		})
+	}
+}
+
 func (r *runtimeStub) InvokeByInstanceIdRaw(invokeReqRaw []byte, option api.RawRequestOption) ([]byte, error) {
 	var invokeReq core.InvokeRequest
 	if err := proto.Unmarshal(invokeReqRaw, &invokeReq); err != nil {
