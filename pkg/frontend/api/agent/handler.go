@@ -231,9 +231,58 @@ type RuntimeSpec struct {
 	ExtendedHandler *ExtendedHandler `json:"extendedHandler,omitempty"`
 	Rootfs          *RootfsSpec     `json:"rootfs,omitempty"`
 	Cmds            [][]string      `json:"cmds,omitempty"`
+	Probes          *ProbeSet       `json:"probes,omitempty"`
 	CPU             int             `json:"cpu,omitempty"`
 	Memory          int             `json:"memory,omitempty"`
 }
+
+// ProbeSet carries the instance-level startup/liveness probes. Exactly one probe
+// configuration per instance; the probe target is set inside each action, decoupled
+// from the cmds array (no index correspondence). Only honored in platform-executor
+// mode — see validateAgentProbes.
+type ProbeSet struct {
+	Startup  *ProbeSpec `json:"startup,omitempty"`
+	Liveness *ProbeSpec `json:"liveness,omitempty"`
+}
+
+// ProbeSpec is one probe role. Exactly one action (tcpSocket/httpGet/exec) must be
+// set; tuning params carry defaults in the executor when omitted. Serialized into
+// YR_RUNTIME_BOOTSTRAP_PROBE for the executor's probe module (probe.py from_mapping).
+type ProbeSpec struct {
+	HTTPGet   *HTTPGetAction   `json:"httpGet,omitempty"`
+	TCPSocket *TCPSocketAction `json:"tcpSocket,omitempty"`
+	Exec      *ExecAction      `json:"exec,omitempty"`
+
+	InitialDelaySeconds int `json:"initialDelaySeconds,omitempty"`
+	PeriodSeconds       int `json:"periodSeconds,omitempty"`
+	TimeoutSeconds      int `json:"timeoutSeconds,omitempty"`
+	FailureThreshold    int `json:"failureThreshold,omitempty"`
+}
+
+// HTTPGetAction probes an HTTP endpoint; status 200-299 passes.
+type HTTPGetAction struct {
+	Port   int    `json:"port"`
+	Path   string `json:"path,omitempty"`
+	Host   string `json:"host,omitempty"`
+	Scheme string `json:"scheme,omitempty"`
+}
+
+// TCPSocketAction probes a TCP port; connect success passes.
+type TCPSocketAction struct {
+	Port int    `json:"port"`
+	Host string `json:"host,omitempty"`
+}
+
+// ExecAction runs an argv (no shell) in the sandbox; exit 0 passes.
+type ExecAction struct {
+	Command []string `json:"command"`
+}
+
+const (
+	probeMinPort           = 1
+	probeMaxPort           = 65535
+	agentBootstrapProbeEnv = "YR_RUNTIME_BOOTSTRAP_PROBE"
+)
 
 // ExtendedHandler carries the optional init/preStop entry symbols for inline mode,
 // mirroring meta_service's extendedHandler (registered: ExtendedMetaData.Initializer/PreStop).
@@ -305,6 +354,10 @@ func CreateHandler(ctx *gin.Context) {
 		return
 	}
 	if err := validateAgentCodeDescriptor(inline, req.RuntimeSpec, spec); err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateAgentProbes(req, platformExecutor); err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
 		return
 	}
@@ -386,6 +439,100 @@ func validateAgentCodeDescriptor(inline bool, rs *RuntimeSpec, spec *types.FuncS
 			"(got storageType=%q, codePath=%q)", mode, storageType, codePath)
 	}
 	return nil
+}
+
+// validateAgentProbes validates runtime_spec.probes (platform-executor mode only).
+// Returns nil when no probes are configured. Probes in user-handler mode (no platform
+// Executor) are rejected: the executor is not loaded, so probe_liveness would be
+// unavailable and the instance would stick at SUB_HEALTH. Per-role checks enforce
+// exactly one action, valid port/scheme/command, and liveness rejecting
+// periodSeconds/initialDelaySeconds (the heartbeat drives its own cadence).
+func validateAgentProbes(req CreateAgentRequest, platformExecutor bool) error {
+	if req.RuntimeSpec == nil || req.RuntimeSpec.Probes == nil {
+		return nil
+	}
+	if !platformExecutor {
+		return fmt.Errorf("probes require platform-executor mode (no runtime_spec.handler)")
+	}
+	ps := req.RuntimeSpec.Probes
+	if ps.Startup != nil {
+		if err := validateProbeSpec(ps.Startup, "startup", true); err != nil {
+			return err
+		}
+	}
+	if ps.Liveness != nil {
+		if err := validateProbeSpec(ps.Liveness, "liveness", false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateProbeSpec validates one probe role. allowScheduling toggles whether
+// periodSeconds/initialDelaySeconds are accepted (startup yes, liveness no).
+func validateProbeSpec(spec *ProbeSpec, role string, allowScheduling bool) error {
+	if spec == nil {
+		return fmt.Errorf("invalid probe spec: %s is nil", role)
+	}
+	if !allowScheduling {
+		if spec.InitialDelaySeconds != 0 {
+			return fmt.Errorf("invalid probe spec: liveness must not set initialDelaySeconds")
+		}
+		if spec.PeriodSeconds != 0 {
+			return fmt.Errorf("invalid probe spec: liveness must not set periodSeconds")
+		}
+	}
+	actions := 0
+	if spec.HTTPGet != nil {
+		actions++
+		if err := validateHTTPGet(spec.HTTPGet); err != nil {
+			return err
+		}
+	}
+	if spec.TCPSocket != nil {
+		actions++
+		if err := validateTCPSocket(spec.TCPSocket); err != nil {
+			return err
+		}
+	}
+	if spec.Exec != nil {
+		actions++
+		if err := validateExec(spec.Exec); err != nil {
+			return err
+		}
+	}
+	if actions != 1 {
+		return fmt.Errorf("invalid probe spec: %s must set exactly one of tcpSocket/httpGet/exec", role)
+	}
+	return nil
+}
+
+func validateHTTPGet(a *HTTPGetAction) error {
+	if !probeValidPort(a.Port) {
+		return fmt.Errorf("invalid probe spec: httpGet.port must be in [%d, %d]", probeMinPort, probeMaxPort)
+	}
+	if a.Scheme != "" && a.Scheme != "http" && a.Scheme != "https" {
+		return fmt.Errorf("invalid probe spec: httpGet.scheme must be http or https")
+	}
+	return nil
+}
+
+func validateTCPSocket(a *TCPSocketAction) error {
+	if !probeValidPort(a.Port) {
+		return fmt.Errorf("invalid probe spec: tcpSocket.port must be in [%d, %d]", probeMinPort, probeMaxPort)
+	}
+	return nil
+}
+
+func validateExec(a *ExecAction) error {
+	if len(a.Command) == 0 {
+		return fmt.Errorf("invalid probe spec: exec.command must be a non-empty argv array")
+	}
+	return nil
+}
+
+func probeValidPort(port int) bool {
+	return port >= probeMinPort && port <= probeMaxPort
 }
 
 // resolveAgentFuncKeyAndRuntime resolves the user function key and runtime for the agent.
@@ -486,6 +633,7 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest,
 	}
 	if config.platformExecutor {
 		applyAgentExecutorCode(&invokeOpts)
+		applyAgentProbeSpec(&invokeOpts, config)
 	} else {
 		applyAgentCodePaths(&invokeOpts, config.spec)
 	}
@@ -871,6 +1019,42 @@ func mergeAgentBootstrapCmds(invokeOpts *api.InvokeOptions, cmds [][]string) {
 	invokeOpts.CreateOpt["DELEGATE_ENV_VAR"] = string(merged)
 }
 
+// applyAgentProbeSpec serializes runtime_spec.probes into the YR_RUNTIME_BOOTSTRAP_PROBE
+// key inside createOptions["DELEGATE_ENV_VAR"]. The executor's probe module reads this
+// env at startup (probe.py _load_probe_set). A pre-existing YR_RUNTIME_BOOTSTRAP_PROBE
+// key (e.g. set explicitly via env_vars) wins and is left untouched, mirroring
+// mergeAgentBootstrapCmds. Omitted tuning params are dropped so the executor applies
+// its defaults.
+func applyAgentProbeSpec(invokeOpts *api.InvokeOptions, config agentCreateConfig) {
+	c := config.runtimeSpec
+	if c == nil || c.Probes == nil {
+		return
+	}
+	specJSON, err := json.Marshal(c.Probes)
+	if err != nil {
+		log.GetLogger().Warnf("failed to marshal agent probes: %v", err)
+		return
+	}
+	env := map[string]string{}
+	if existing, ok := invokeOpts.CreateOpt["DELEGATE_ENV_VAR"]; ok && existing != "" {
+		if err := json.Unmarshal([]byte(existing), &env); err != nil {
+			log.GetLogger().Warnf("failed to unmarshal agent DELEGATE_ENV_VAR: %v", err)
+			env = map[string]string{}
+		}
+	}
+	if _, exists := env[agentBootstrapProbeEnv]; exists {
+		log.GetLogger().Warnf("agent %s already set, skip merging runtime_spec.probes", agentBootstrapProbeEnv)
+		return
+	}
+	env[agentBootstrapProbeEnv] = string(specJSON)
+	merged, err := json.Marshal(env)
+	if err != nil {
+		log.GetLogger().Warnf("failed to marshal agent env with probes: %v", err)
+		return
+	}
+	invokeOpts.CreateOpt["DELEGATE_ENV_VAR"] = string(merged)
+}
+
 // replaceAgentUserPlaceholder replaces the workspace target placeholder in createOptions["rootfs"]
 // with a real path. When user is non-empty, /home/__AGENT_USER__ → /home/<user>; when empty,
 // the whole /home/__AGENT_USER__ falls back to agentDefaultWorkspaceTarget (e.g. /workspace),
@@ -1144,14 +1328,6 @@ func DeleteHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
-	// libruntime.Kill is idempotent for missing IDs; check cache first so unknown or
-	// already-deleted instances return 404 instead of 200.
-	if instancemanager.GetGlobalInstanceScheduler().
-		GetInstanceByIDAcrossFunctions(instanceID) == nil {
-		ctx.JSON(http.StatusNotFound,
-			gin.H{"code": 404, "message": fmt.Sprintf("instance not found: %s", instanceID)})
-		return
-	}
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
 	if tenantID == "" {
 		tenantID = "default"
@@ -1159,15 +1335,74 @@ func DeleteHandler(ctx *gin.Context) {
 	invokeOpts := api.InvokeOptions{
 		TraceID: ctx.GetHeader(constant.HeaderTraceID),
 	}
+	// KillInstance resolves the owning proxy from the routable table first, then
+	// falls back to the execendpoint summary for non-routable states (FATAL/EXITED/
+	// FAILED) that self-clear from the table. A missing instance (absent from both
+	// the table and the summary cache) returns a not-found error mapped to 404, so
+	// already-deleted instances stay idempotent without leaking FATAL zombies.
 	if err := util.GetDirectProxyClient().KillInstance(util.NewDirectKillRequest(
 		ctx.Request.Context(), instanceID, agentKillInstanceSignal, []byte("agent deleted"), tenantID, invokeOpts,
 	)); err != nil {
+		if isAgentInstanceNotFound(err) {
+			ctx.JSON(http.StatusNotFound,
+				gin.H{"code": 404, "message": fmt.Sprintf("instance not found: %s", instanceID)})
+			return
+		}
 		log.GetLogger().Errorf("failed to kill agent instance %s: %v", instanceID, err)
 		ctx.JSON(http.StatusInternalServerError,
 			gin.H{"code": 500, "message": fmt.Sprintf("failed to delete agent: %v", err)})
 		return
 	}
+	// The kill RPC returned; the backend asynchronously runs the exit handler to
+	// delete the etcd key and stop the sandbox. Poll the in-process caches (driven
+	// by the etcd watcher) until both clear, so a 200 guarantees the frontend side is
+	// consistent rather than merely acknowledging the kill request.
+	if !waitForAgentInstanceDeleted(ctx, instanceID) {
+		log.GetLogger().Warnf("agent instance %s kill sent but frontend caches not fully cleared", instanceID)
+		ctx.JSON(http.StatusInternalServerError,
+			gin.H{"code": 500, "message": fmt.Sprintf("instance %s kill accepted but not fully cleared", instanceID)})
+		return
+	}
 	ctx.JSON(http.StatusOK, gin.H{"code": 200, "status": "deleted"})
+}
+
+// isAgentInstanceNotFound reports whether err means the instance is absent from
+// both the routable table and the execendpoint summary cache — i.e. unknown or
+// already deleted — so DELETE maps it to an idempotent 404 instead of a 500.
+func isAgentInstanceNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "not present in frontend route cache")
+}
+
+// waitForAgentInstanceDeleted polls until the instance is gone from both the
+// routable table and the execendpoint summary cache. The summary cache is
+// watcher-driven and clears only on the etcd DELETE event, so its absence
+// implies the backend has deleted the instance key.
+func waitForAgentInstanceDeleted(ctx *gin.Context, instanceID string) bool {
+	const (
+		pollInterval = 200 * time.Millisecond
+		pollTimeout  = 30 * time.Second
+	)
+	deadline := time.Now().Add(pollTimeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Request.Context().Done():
+			return false
+		default:
+		}
+		if instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID) == nil &&
+			!lookupAgentInstanceSummaryExists(instanceID) {
+			return true
+		}
+		time.Sleep(pollInterval)
+	}
+	return false
+}
+
+func lookupAgentInstanceSummaryExists(instanceID string) bool {
+	return len(lookupAgentInstanceSummaries("", instanceID)) > 0
 }
 
 func shouldTreatCreateTimeoutAsSuccess(instanceID string, err error) bool {
@@ -1254,6 +1489,27 @@ type InstanceDetail struct {
 	EnvVars     map[string]string  `json:"env_vars,omitempty"`
 	Resources   map[string]float64 `json:"resources,omitempty"`
 	StartTime   string             `json:"start_time,omitempty"`
+	StatusCode  int32              `json:"status_code"`
+	Status      string             `json:"status"`
+	StatusMsg   string             `json:"status_msg,omitempty"`
+}
+
+// instanceStateNames maps yr InstanceState codes (instance_state.h) to readable names.
+var instanceStateNames = map[int32]string{
+	1:  "SCHEDULING",
+	2:  "CREATING",
+	3:  "RUNNING",
+	4:  "FAILED",
+	6:  "FATAL",
+	7:  "SCHEDULE_FAILED",
+	11: "SUB_HEALTH",
+}
+
+func instanceStateName(code int32) string {
+	if name, ok := instanceStateNames[code]; ok {
+		return name
+	}
+	return "UNKNOWN"
 }
 
 // RootfsInfo mirrors createOptions["rootfs"]. User and workspace come from the sibling
@@ -1325,6 +1581,9 @@ func GetHandler(ctx *gin.Context) {
 		SandboxID:   s.ContainerID,
 		Resources:   flattenResources(s.Resources),
 		StartTime:   s.StartTime,
+		StatusCode:  s.StatusCode,
+		Status:      instanceStateName(s.StatusCode),
+		StatusMsg:   s.StatusMsg,
 	}
 	if ep, ok := lookupAgentInstanceEndpoint(instanceID); ok {
 		d.NodeIP = extractNodeIP(ep.ProxyGrpcAddress)

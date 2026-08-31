@@ -23,11 +23,20 @@ import (
 	"frontend/pkg/frontend/sandboxrouter/rootfs"
 )
 
-// kernelStatusRunning is constant.KernelInstanceStatusRunning (3). Only RUNNING
-// instances are cached; any other state removes them. Kept as a local const so
-// this package stays dependency-free (stdlib only) and unit-testable, mirroring
+// cacheableInstanceStates are the yr InstanceState codes (instance_state.h) this
+// package caches. "Instance gone" states (NEW/EXITING/EXITED/EVICTING/EVICTED/
+// SUSPEND) are not cached: they remove the summary so GET returns 404. Kept local
+// so this package stays dependency-free (stdlib only) and unit-testable, mirroring
 // route/apply.go.
-const kernelStatusRunning int32 = 3
+var cacheableInstanceStates = map[int32]struct{}{
+	1:  {}, // SCHEDULING
+	2:  {}, // CREATING
+	3:  {}, // RUNNING
+	4:  {}, // FAILED
+	6:  {}, // FATAL
+	7:  {}, // SCHEDULE_FAILED
+	11: {}, // SUB_HEALTH
+}
 
 // EventKind is the kind of instance-info change, mirroring the etcd watch event
 // types while keeping this package free of the etcd client dependency.
@@ -72,9 +81,9 @@ type instanceExecInfo struct {
 
 // ApplyInstanceEvent updates the cache for one /sn/instance watch event:
 //   - DELETE removes the instance's endpoint and summary (instanceID recovered from the key).
-//   - PUT of a RUNNING instance adds/replaces its summary. If it also has a
+//   - PUT of a cacheable state adds/replaces its summary. If it also has a
 //     non-empty proxyGrpcAddress, it adds/replaces its exec endpoint.
-//   - PUT of any other state or unparseable value removes cached data.
+//   - PUT of a non-cacheable state or unparseable value removes cached data.
 //
 // It never panics on bad input; malformed data results in the instance having
 // no cached data.
@@ -95,7 +104,7 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 		id = instanceIDFromKey(key)
 	}
 
-	if info.InstanceStatus.Code != kernelStatusRunning {
+	if _, ok := cacheableInstanceStates[info.InstanceStatus.Code]; !ok {
 		s.Delete(id)
 		return
 	}

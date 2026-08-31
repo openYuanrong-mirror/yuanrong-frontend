@@ -2895,11 +2895,11 @@ func TestRoutingFrontendProxyLifecycleClientKillDoesNotGuessWithoutRouteWhenMult
 	}
 
 	err := client.KillInstance(simpleRuntimeKillRequest{
-		ctx: canceledContextForTest(), instanceID: "missing-instance-route",
+		ctx: context.Background(), instanceID: "missing-instance-route",
 	})
 
 	require.Error(t, err)
-	require.True(t, errors.Is(err, context.Canceled))
+	require.Contains(t, err.Error(), "missing-instance-route")
 	require.Empty(t, factory.address)
 }
 
