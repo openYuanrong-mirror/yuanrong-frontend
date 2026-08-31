@@ -105,6 +105,7 @@ type agentCreateConfig struct {
 	inline           bool
 	spec             *types.FuncSpec
 	platformExecutor bool
+	initTimeout      int
 	preStopTimeout   int
 	runtime          string
 	runtimeSpec      *RuntimeSpec
@@ -127,6 +128,7 @@ const (
 	agentInitTimeoutSeconds      = 305
 	agentGracefulShutdownSeconds = 15
 	agentPreStopTimeoutSeconds   = 10
+	maxPreStopTimeoutSec         = 180
 	agentShutdownReserveSeconds  = 5
 	defaultRecoverRetryTimes     = 3
 	agentDirectoryQuotaMB        = 512
@@ -229,6 +231,7 @@ type RuntimeSpec struct {
 	StorageType     string          `json:"storageType,omitempty"`
 	Handler         string          `json:"handler,omitempty"`
 	ExtendedHandler *ExtendedHandler `json:"extendedHandler,omitempty"`
+	ExtendedTimeout *ExtendedTimeout `json:"extendedTimeout,omitempty"`
 	Rootfs          *RootfsSpec     `json:"rootfs,omitempty"`
 	Cmds            [][]string      `json:"cmds,omitempty"`
 	CPU             int             `json:"cpu,omitempty"`
@@ -240,6 +243,15 @@ type RuntimeSpec struct {
 type ExtendedHandler struct {
 	Initializer string `json:"initializer,omitempty"`
 	PreStop     string `json:"pre_stop,omitempty"`
+}
+
+// ExtendedTimeout carries the optional init/preStop timeouts (seconds) for inline mode,
+// mirroring meta_service's extendedTimeout (registered: ExtendedMetaData.Initializer/PreStop.Timeout).
+// Each field 0/unset → frontend default (initializer: agentInitTimeoutSeconds,
+// pre_stop: agentPreStopTimeoutSeconds); pre_stop must be <= maxPreStopTimeoutSec.
+type ExtendedTimeout struct {
+	Initializer int `json:"initializer,omitempty"`
+	PreStop     int `json:"pre_stop,omitempty"`
 }
 
 // RootfsSpec carries the inline container rootfs config. ImageURL is optional here: it is
@@ -297,7 +309,11 @@ func CreateHandler(ctx *gin.Context) {
 	inlineUserHandler := inline && req.RuntimeSpec != nil && strings.TrimSpace(req.RuntimeSpec.Handler) != ""
 	platformExecutor := (inline && !inlineUserHandler) ||
 		(!inline && (spec == nil || strings.TrimSpace(spec.FuncMetaData.Handler) == ""))
-	preStopTimeout := resolveAgentPreStopTimeout(spec, platformExecutor)
+	initTimeout, preStopTimeout, err := resolveAgentExtendedTimeouts(spec, req.RuntimeSpec)
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
 	if platformExecutor && !isSupportedAgentPythonRuntime(runtime) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest,
 			fmt.Errorf("agent executor requires a supported Python runtime "+
@@ -319,6 +335,7 @@ func CreateHandler(ctx *gin.Context) {
 		inline:           inline,
 		spec:             spec,
 		platformExecutor: platformExecutor,
+		initTimeout:      initTimeout,
 		preStopTimeout:   preStopTimeout,
 		runtime:          runtime,
 		runtimeSpec:      req.RuntimeSpec,
@@ -343,14 +360,47 @@ func isSupportedAgentPythonRuntime(runtime string) bool {
 		strings.Contains(runtime, "python3.11")
 }
 
-func resolveAgentPreStopTimeout(spec *types.FuncSpec, platformExecutor bool) int {
-	if spec != nil && spec.ExtendedMetaData.PreStop.Timeout > 0 {
-		return spec.ExtendedMetaData.PreStop.Timeout
+// resolveAgentExtendedTimeouts resolves the initializer and pre_stop timeouts (seconds) that
+// get synthesized into the inline/platformExecutor funcSpec's ExtendedMetaData and reach the
+// runtime as RUNTIME_INITIALIZER_TIMEOUT / PRE_STOP_TIMEOUT env vars. Resolution order:
+//   - registered (spec != nil): the registered ExtendedMetaData value when > 0, else the
+//     constant default. This preserves any value the caller registered via extendedTimeout,
+//     including the platformExecutor case (a registered funcSpec whose handler is empty falls
+//     back to the platform adx executor entries, but its registered lifecycle timeouts still
+//     apply — the executor entries and the timeout source are independent).
+//   - inline user-handler (rs != nil): the caller's ExtendedTimeout value when > 0, else the
+//     constant default.
+//   - otherwise: front-end constants.
+//
+// pre_stop is capped at maxPreStopTimeoutSec (mirrors meta_service checkPreStopTime); an
+// out-of-range value yields a non-nil error so CreateHandler rejects it with 400 rather than
+// letting the runtime hit @timeout(0) (the original bug) or an unbounded wait.
+//
+// Note: platformExecutor is intentionally not a parameter. Whether the instance runs the
+// platform adx executor entries (yr.agentexecutor.handler.*) vs a user handler only selects
+// the CodePaths/funcSpec entries built by buildAgentCreateArgs; it must not override the
+// caller-registered lifecycle timeouts. Conflating the two was the d2bff83 regression that
+// dropped a registered pre_stop timeout (25s → 10s) whenever the handler was empty.
+func resolveAgentExtendedTimeouts(spec *types.FuncSpec, rs *RuntimeSpec) (initTimeout, preStopTimeout int, err error) {
+	switch {
+	case spec != nil:
+		initTimeout = int(spec.ExtendedMetaData.Initializer.Timeout)
+		preStopTimeout = spec.ExtendedMetaData.PreStop.Timeout
+	case rs != nil && rs.ExtendedTimeout != nil:
+		initTimeout = rs.ExtendedTimeout.Initializer
+		preStopTimeout = rs.ExtendedTimeout.PreStop
 	}
-	if platformExecutor {
-		return agentPreStopTimeoutSeconds
+	if initTimeout <= 0 {
+		initTimeout = agentInitTimeoutSeconds
 	}
-	return 0
+	if preStopTimeout <= 0 {
+		preStopTimeout = agentPreStopTimeoutSeconds
+	}
+	if preStopTimeout > maxPreStopTimeoutSec {
+		return 0, 0, fmt.Errorf("pre_stop timeout %d exceeds max %d",
+			preStopTimeout, maxPreStopTimeoutSec)
+	}
+	return initTimeout, preStopTimeout, nil
 }
 
 // validateAgentCodeDescriptor enforces that storageType and codePath are both set or both
@@ -656,6 +706,7 @@ func buildAgentCreateArgs(config agentCreateConfig, resKey resspeckey.ResourceSp
 	runtime := config.runtime
 	spec := config.spec
 	rs := config.runtimeSpec
+	initTimeout := config.initTimeout
 	preStopTimeout := config.preStopTimeout
 	platformExecutor := config.platformExecutor
 	funcSpecData := []byte("{}")
@@ -669,7 +720,7 @@ func buildAgentCreateArgs(config agentCreateConfig, resKey resspeckey.ResourceSp
 			},
 			ResourceMetaData: types.ResourceMetaData{CPU: resKey.CPU, Memory: resKey.Memory},
 			ExtendedMetaData: types.ExtendedMetaData{
-				Initializer: types.Initializer{Handler: agentExecutorInitEntry, Timeout: agentInitTimeoutSeconds},
+				Initializer: types.Initializer{Handler: agentExecutorInitEntry, Timeout: int64(initTimeout)},
 				PreStop: types.PreStop{
 					Handler: agentExecutorPreStopEntry,
 					Timeout: preStopTimeout,
@@ -712,7 +763,7 @@ func buildAgentCreateArgs(config agentCreateConfig, resKey resspeckey.ResourceSp
 				},
 				ResourceMetaData: types.ResourceMetaData{CPU: resKey.CPU, Memory: resKey.Memory},
 				ExtendedMetaData: types.ExtendedMetaData{
-					Initializer: types.Initializer{Handler: userInitEntry, Timeout: agentInitTimeoutSeconds},
+					Initializer: types.Initializer{Handler: userInitEntry, Timeout: int64(initTimeout)},
 					PreStop: types.PreStop{
 						Handler: preStopEntry,
 						Timeout: preStopTimeout,
