@@ -88,6 +88,7 @@ const (
 	sandboxPauseInstanceSignal      = 18
 	sandboxResumeInstanceSignal     = 19
 	sandboxReloadInstanceSignal     = 25
+	sandboxUpdateNetworkSignal      = 26
 	sandboxPauseDefaultTTLSeconds   = 90_000
 	sandboxLifecycleRequestIDHeader = "X-YR-Request-ID"
 	sandboxRunningPollTimeout       = 5 * time.Second
@@ -150,6 +151,7 @@ var (
 	sandboxXPUCountPattern          = regexp.MustCompile(`^[0-9]+$`)
 	sandboxPauseRequestIDPattern    = regexp.MustCompile(`^pause-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxResumeRequestIDPattern   = regexp.MustCompile(`^resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxNetworkRequestIDPattern  = regexp.MustCompile(`^network-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxReloadRequestIDPattern   = regexp.MustCompile(`^reload-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxSnapshotRequestIDPattern = regexp.MustCompile(`^snapshot-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxDNSLabelPattern          = regexp.MustCompile(`^[a-z0-9_-]+$`)
@@ -178,6 +180,10 @@ type resumeV1Response struct {
 }
 
 type reloadV1Response struct {
+	Success bool `json:"success"`
+}
+
+type updateNetworkV1Response struct {
 	Success bool `json:"success"`
 }
 
@@ -2801,6 +2807,50 @@ func ReloadV1Handler(ctx *gin.Context) {
 		return
 	}
 	app.SetCtxResponse(ctx, reloadV1Response{Success: true}, http.StatusOK, nil)
+}
+
+// UpdateNetworkV1Handler atomically replaces a running sandbox's network policy.
+func UpdateNetworkV1Handler(ctx *gin.Context) {
+	var requested SandboxNetworkPolicy
+	decoder := json.NewDecoder(ctx.Request.Body)
+	if err := decoder.Decode(&requested); err != nil {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			http.StatusBadRequest, fmt.Errorf("invalid network policy: %w", err))
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			http.StatusBadRequest, errors.New("invalid trailing network policy data"))
+		return
+	}
+	normalized, err := normalizeSandboxNetworkPolicy(&requested)
+	if err != nil {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			http.StatusBadRequest, err)
+		return
+	}
+	payload := []byte("{}")
+	if normalized != nil {
+		payload, err = json.Marshal(normalized)
+		if err != nil {
+			app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+				http.StatusInternalServerError, err)
+			return
+		}
+	}
+	_, err = executeSandboxLifecycleKill(
+		ctx,
+		sandboxUpdateNetworkSignal,
+		payload,
+		sandboxNetworkRequestIDPattern,
+		"network",
+	)
+	if err != nil {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			lifecycleHTTPStatus(err), err)
+		return
+	}
+	app.SetCtxResponse(ctx, updateNetworkV1Response{Success: true}, http.StatusOK, nil)
 }
 
 func parseResumePortMappings(encoded string) (map[string]int, error) {

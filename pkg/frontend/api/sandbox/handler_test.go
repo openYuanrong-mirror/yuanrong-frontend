@@ -2885,6 +2885,115 @@ func TestReloadV1HandlerReturnsFalseOnBusinessFailure(t *testing.T) {
 	require.False(t, result.Success)
 }
 
+func TestUpdateNetworkV1HandlerUsesSignal26AndCanonicalPolicy(t *testing.T) {
+	const requestID = "network-123e4567-e89b-12d3-a456-426614174000"
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		captured = proto.Clone(killReq).(*core.KillRequest)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
+	}})
+	body := `{
+		"schemaVersion": 2,
+		"traffic": {
+			"ingressDefaultAction": "allow",
+			"egressDefaultAction": "deny",
+			"mode": "stateful",
+			"rules": [{
+				"action": "allow",
+				"direction": "egress",
+				"protocol": "tcp",
+				"peer": {"domain": "API.GitHub.COM."},
+				"priority": 100
+			}]
+		}
+	}`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/network",
+		strings.NewReader(body),
+	)
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader, requestID)
+
+	UpdateNetworkV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.Equal(t, int32(26), captured.GetSignal())
+	require.Equal(t, requestID, captured.GetRequestID())
+	var policy SandboxNetworkPolicy
+	require.NoError(t, json.Unmarshal(captured.GetPayload(), &policy))
+	require.Equal(t, uint32(2), policy.SchemaVersion)
+	require.Equal(t, "api.github.com", policy.Traffic.Rules[0].Peer.Domain)
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result updateNetworkV1Response
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.True(t, result.Success)
+}
+
+func TestUpdateNetworkV1HandlerClearsWithEmptyPolicy(t *testing.T) {
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		captured = proto.Clone(killReq).(*core.KillRequest)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/network",
+		strings.NewReader("{}"),
+	)
+	ctx.Request.Header.Set(
+		sandboxLifecycleRequestIDHeader,
+		"network-123e4567-e89b-12d3-a456-426614174001",
+	)
+
+	UpdateNetworkV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.JSONEq(t, "{}", string(captured.GetPayload()))
+}
+
+func TestUpdateNetworkV1HandlerRejectsUnknownFields(t *testing.T) {
+	called := false
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		called = true
+		return nil, nil
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/network",
+		strings.NewReader(`{"blockNetwrok":true}`),
+	)
+	ctx.Request.Header.Set(
+		sandboxLifecycleRequestIDHeader,
+		"network-123e4567-e89b-12d3-a456-426614174002",
+	)
+
+	UpdateNetworkV1Handler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.False(t, called)
+}
+
 func TestResumeV1HandlerDoesNotRequireLocalSandboxRouter(t *testing.T) {
 	const instanceID = "default-sandbox-resume-without-local-router"
 	const requestID = "resume-123e4567-e89b-12d3-a456-426614174002"
