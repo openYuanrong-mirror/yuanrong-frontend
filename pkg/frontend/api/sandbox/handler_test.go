@@ -113,8 +113,9 @@ type runtimeStub struct {
 		createReq *core.CreateRequest,
 		option api.RawRequestOption,
 	) ([]byte, error)
-	invokeInstanceRaw func(invokeReq *core.InvokeRequest, option api.RawRequestOption) ([]byte, error)
-	invokeInstance    func(
+	inspectDirectRawCreate func(req util.DirectRawRequest)
+	invokeInstanceRaw      func(invokeReq *core.InvokeRequest, option api.RawRequestOption) ([]byte, error)
+	invokeInstance         func(
 		funcMeta api.FunctionMeta,
 		instanceID string,
 		args []api.Arg,
@@ -142,6 +143,9 @@ func (r *directRuntimeStub) CreateInstance(req util.DirectCreateRequest) (string
 }
 
 func (r *directRuntimeStub) CreateRaw(req util.DirectRawRequest) ([]byte, error) {
+	if r.runtime.inspectDirectRawCreate != nil {
+		r.runtime.inspectDirectRawCreate(req)
+	}
 	return r.runtime.CreateInstanceRawContext(req.Context, req.Payload, req.AdaptedRawOption())
 }
 
@@ -433,6 +437,9 @@ func TestCreateSandboxInstanceRawUsesIndependentTimeoutContext(t *testing.T) {
 
 	const createTimeoutSeconds = 2
 	setAPIClientsForTest(t, &runtimeStub{
+		inspectDirectRawCreate: func(req util.DirectRawRequest) {
+			require.Equal(t, createTimeoutSeconds, req.CreateTimeoutSeconds)
+		},
 		createInstanceRawContext: func(
 			createCtx context.Context,
 			_ *core.CreateRequest,
@@ -464,6 +471,75 @@ func TestCreateSandboxInstanceRawUsesIndependentTimeoutContext(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, "default-sandbox-context", instanceID)
+}
+
+func TestCreateV1HandlerForwardsFailover(t *testing.T) {
+	request := CreateV1Request{Name: "sandbox-a", Namespace: "default", Failover: true}
+	create := createRequestFromV1(request, "python:3.12-slim")
+	raw, err := buildSandboxRawCreateRequest(
+		sandboxInvocation{
+			invokeOpts: api.InvokeOptions{
+				CreateOpt:        map[string]string{},
+				CustomExtensions: map[string]string{},
+			},
+			snapshotID: create.SnapshotID,
+			failover:   create.Failover,
+		},
+		create.Name,
+		create.Namespace,
+	)
+
+	require.NoError(t, err)
+	require.True(t, raw.GetFailover())
+}
+
+func TestCreateResourcesPreservesSnapshotInheritance(t *testing.T) {
+	tests := []struct {
+		name       string
+		request    CreateRequest
+		wantCPU    int
+		wantMemory int
+	}{
+		{
+			name:       "ordinary create uses defaults",
+			request:    CreateRequest{},
+			wantCPU:    sandboxDefaultCPU,
+			wantMemory: sandboxDefaultMemory,
+		},
+		{
+			name:       "snapshot create inherits omitted resources",
+			request:    CreateRequest{SnapshotID: "snapshot-4g"},
+			wantCPU:    -1,
+			wantMemory: -1,
+		},
+		{
+			name: "snapshot create preserves explicit resources",
+			request: CreateRequest{
+				SnapshotID: "snapshot-4g",
+				Cpu:        2000,
+				Memory:     4096,
+			},
+			wantCPU:    2000,
+			wantMemory: 4096,
+		},
+		{
+			name: "snapshot create can mix inheritance and override",
+			request: CreateRequest{
+				SnapshotID: "snapshot-4g",
+				Memory:     8192,
+			},
+			wantCPU:    -1,
+			wantMemory: 8192,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cpu, memory := createResources(test.request)
+			require.Equal(t, test.wantCPU, cpu)
+			require.Equal(t, test.wantMemory, memory)
+		})
+	}
 }
 
 func (r *runtimeStub) InvokeByInstanceIdRaw(invokeReqRaw []byte, option api.RawRequestOption) ([]byte, error) {
@@ -2739,6 +2815,72 @@ func TestResumeV1HandlerUsesSDKRequestIDForSignal19AndReturnsRoute(t *testing.T)
 	require.Equal(t, int32(execendpoint.StatusPaused), summary.StatusCode)
 	require.Equal(t, "paused", summary.StatusMsg)
 	require.Equal(t, "InstanceManagerOwner", summary.NodeID)
+}
+
+func TestReloadV1HandlerUsesSignal25AndReturnsBoolean(t *testing.T) {
+	const requestID = "reload-123e4567-e89b-12d3-a456-426614174000"
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		captured = proto.Clone(killReq).(*core.KillRequest)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/reload",
+		nil,
+	)
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader, requestID)
+
+	ReloadV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.Equal(t, int32(25), captured.GetSignal())
+	require.Equal(t, requestID, captured.GetRequestID())
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result reloadV1Response
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.True(t, result.Success)
+}
+
+func TestReloadV1HandlerReturnsFalseOnBusinessFailure(t *testing.T) {
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		return proto.Marshal(&core.KillResponse{
+			Code:    common.ErrorCode_ERR_INNER_SYSTEM_ERROR,
+			Message: "local snapshot is unavailable",
+		})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/reload",
+		nil,
+	)
+	ctx.Request.Header.Set(
+		sandboxLifecycleRequestIDHeader,
+		"reload-123e4567-e89b-12d3-a456-426614174001",
+	)
+
+	ReloadV1Handler(ctx)
+
+	require.Equal(t, http.StatusConflict, recorder.Code)
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result reloadV1Response
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.False(t, result.Success)
 }
 
 func TestResumeV1HandlerDoesNotRequireLocalSandboxRouter(t *testing.T) {

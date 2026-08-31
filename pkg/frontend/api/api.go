@@ -214,6 +214,7 @@ func InitRoute(r *gin.Engine) {
 		sandboxV1Group.DELETE("/:sandboxID", sandboxTraceHandler(sandbox.DeleteHandler))
 		sandboxV1Group.POST("/:sandboxID/pause", sandboxTraceHandler(sandbox.PauseV1Handler))
 		sandboxV1Group.POST("/:sandboxID/resume", sandboxTraceHandler(sandbox.ResumeV1Handler))
+		sandboxV1Group.POST("/:sandboxID/reload", sandboxTraceHandler(sandbox.ReloadV1Handler))
 		sandboxV1Group.POST("/:sandboxID/snapshots", sandboxTraceHandler(sandbox.CreateReusableSnapshotV1Handler))
 		sandboxV1Group.POST("/:sandboxID/invoke", sandboxTraceHandler(sandbox.InvokeV1Handler))
 	}

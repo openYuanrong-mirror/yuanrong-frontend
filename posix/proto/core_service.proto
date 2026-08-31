@@ -77,6 +77,7 @@ message CreateRequest {
   string			 designatedInstanceID = 7;
   map<string, string> createOptions = 8;
   string              snapshotID = 9;
+  bool                failover = 10;
 }
 
 message SnapshotInfo {
@@ -206,6 +207,7 @@ message SnapOptions {
   bool            leaveRunning = 3;
   string          functionType = 4;
   string          name = 5;
+  uint64          checkpointTimeoutMs = 6;
 }
 
 message SnapStartOptions {

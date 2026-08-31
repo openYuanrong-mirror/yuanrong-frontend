@@ -41,6 +41,11 @@ const reusableSnapshotMasterPath = "/snap-manager/reusable-snapshots"
 
 const reusableSnapshotRequestTimeout = 30 * time.Second
 
+const (
+	sandboxCheckpointDefaultTimeoutSeconds = 300
+	sandboxCheckpointMaxTimeoutSeconds     = 3600
+)
+
 type reusableSnapshotMasterClient interface {
 	GetActiveMasterAddr() string
 }
@@ -55,7 +60,18 @@ var (
 )
 
 type reusableSnapshotCreateRequest struct {
-	Name string `json:"name"`
+	Name           string `json:"name"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+}
+
+func resolveSandboxCheckpointTimeout(requested int) (int, error) {
+	if requested == 0 {
+		return sandboxCheckpointDefaultTimeoutSeconds, nil
+	}
+	if requested < 0 || requested > sandboxCheckpointMaxTimeoutSeconds {
+		return 0, fmt.Errorf("timeoutSeconds must be between 1 and %d", sandboxCheckpointMaxTimeoutSeconds)
+	}
+	return requested, nil
 }
 
 // CreateReusableSnapshotV1Handler creates a non-expiring reusable Snapshot
@@ -73,19 +89,25 @@ func CreateReusableSnapshotV1Handler(ctx *gin.Context) {
 			errors.New("name must be a non-empty string"))
 		return
 	}
+	timeoutSeconds, err := resolveSandboxCheckpointTimeout(request.TimeoutSeconds)
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
 	payload, err := proto.Marshal(&core.SnapOptions{
-		Type:         common.SnapType_SNAPSHOT,
-		Ttl:          0,
-		LeaveRunning: true,
-		Name:         name,
+		Type:                common.SnapType_SNAPSHOT,
+		Ttl:                 0,
+		LeaveRunning:        true,
+		Name:                name,
+		CheckpointTimeoutMs: uint64(timeoutSeconds) * uint64(time.Second/time.Millisecond),
 	})
 	if err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
 		return
 	}
-	killResponse, err := executeSandboxLifecycleKill(
+	killResponse, err := executeSandboxLifecycleKillWithTimeout(
 		ctx, sandboxPauseInstanceSignal, payload,
-		sandboxSnapshotRequestIDPattern, "snapshot",
+		sandboxSnapshotRequestIDPattern, "snapshot", timeoutSeconds,
 	)
 	if err != nil {
 		setSandboxLifecycleError(ctx, err)

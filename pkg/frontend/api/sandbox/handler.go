@@ -84,6 +84,7 @@ const (
 	sandboxKillInstanceSignal       = constant.KillSignalVal
 	sandboxPauseInstanceSignal      = 18
 	sandboxResumeInstanceSignal     = 19
+	sandboxReloadInstanceSignal     = 25
 	sandboxPauseDefaultTTLSeconds   = 90_000
 	sandboxLifecycleRequestIDHeader = "X-YR-Request-ID"
 	sandboxRunningPollTimeout       = 5 * time.Second
@@ -143,12 +144,14 @@ var (
 	sandboxXPUCountPattern          = regexp.MustCompile(`^[0-9]+$`)
 	sandboxPauseRequestIDPattern    = regexp.MustCompile(`^pause-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxResumeRequestIDPattern   = regexp.MustCompile(`^resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxReloadRequestIDPattern   = regexp.MustCompile(`^reload-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxSnapshotRequestIDPattern = regexp.MustCompile(`^snapshot-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxDNSLabelPattern          = regexp.MustCompile(`^[a-z0-9_-]+$`)
 )
 
 type pauseV1Request struct {
-	TTLSeconds int32 `json:"ttlSeconds"`
+	TTLSeconds     int32 `json:"ttlSeconds"`
+	TimeoutSeconds int   `json:"timeoutSeconds"`
 }
 
 type pauseV1Response struct {
@@ -166,6 +169,10 @@ type resumeV1Response struct {
 	FunctionProxyID string         `json:"functionProxyId"`
 	NodeID          string         `json:"nodeId"`
 	PortMappings    map[string]int `json:"portMappings"`
+}
+
+type reloadV1Response struct {
+	Success bool `json:"success"`
 }
 
 type sandboxLifecycleTransportError struct {
@@ -223,6 +230,7 @@ type CreateRequest struct {
 	StorageLimitMb int64                    `json:"storage_limit_mb"`
 	Network        *SandboxNetworkPolicy    `json:"network,omitempty"`
 	SnapshotID     string                   `json:"snapshotId,omitempty"`
+	Failover       bool                     `json:"failover"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -289,6 +297,7 @@ type CreateV1Request struct {
 	Tunnel                 TunnelSpec               `json:"tunnel,omitempty"`
 	Network                *SandboxNetworkPolicy    `json:"network,omitempty"`
 	SnapshotID             string                   `json:"snapshotId,omitempty"`
+	Failover               bool                     `json:"failover"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
 	portRouteKinds         map[int]string
@@ -828,6 +837,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		Network:                req.Network,
 		ScheduleAffinities:     req.ScheduleAffinities,
 		SnapshotID:             strings.TrimSpace(req.SnapshotID),
+		Failover:               req.Failover,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
 		nameGenerated:          req.nameGenerated,
@@ -1133,6 +1143,7 @@ type sandboxInvocation struct {
 	funcID     string
 	invokeOpts api.InvokeOptions
 	snapshotID string
+	failover   bool
 }
 
 func prepareSandboxInvocation(
@@ -1166,7 +1177,12 @@ func prepareSandboxInvocation(
 	if err != nil {
 		return sandboxInvocation{}, err
 	}
-	return sandboxInvocation{funcID: funcID, invokeOpts: invokeOpts, snapshotID: req.SnapshotID}, nil
+	return sandboxInvocation{
+		funcID:     funcID,
+		invokeOpts: invokeOpts,
+		snapshotID: req.SnapshotID,
+		failover:   req.Failover,
+	}, nil
 }
 
 func createSandboxInstanceRaw(
@@ -1192,9 +1208,10 @@ func createSandboxInstanceRaw(
 		)
 		defer cancel()
 	}
-	respRaw, err := util.GetDirectProxyClient().CreateRaw(util.NewDirectRawRequest(
+	respRaw, err := util.GetDirectProxyClient().CreateRaw(util.NewDirectRawCreateRequest(
 		createCtx, createReqRaw,
 		api.RawRequestOption{TraceParent: ctx.Request.Header.Get(constant.HeaderTraceParent)},
+		invocation.invokeOpts.Timeout,
 	))
 	if err != nil {
 		return "", err
@@ -1257,6 +1274,7 @@ func buildSandboxRawCreateRequest(
 		DesignatedInstanceID: namespace + "-" + name,
 		CreateOptions:        createOptions,
 		SnapshotID:           strings.TrimSpace(invocation.snapshotID),
+		Failover:             invocation.failover,
 	}, nil
 }
 
@@ -1469,7 +1487,7 @@ type sandboxInvokeOptionRequest struct {
 }
 
 func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions, error) {
-	cpu, memory := resourceDefaults(req.createReq.Cpu, req.createReq.Memory)
+	cpu, memory := createResources(req.createReq)
 	xpu, err := parseSandboxXPU(req.createReq.XPU)
 	if err != nil {
 		return api.InvokeOptions{}, err
@@ -1531,6 +1549,24 @@ func resourceDefaults(cpu, memory int) (int, int) {
 	}
 	if memory <= 0 {
 		memory = sandboxDefaultMemory
+	}
+	return cpu, memory
+}
+
+func createResources(req CreateRequest) (int, int) {
+	cpu, memory := resourceDefaults(req.Cpu, req.Memory)
+	if strings.TrimSpace(req.SnapshotID) == "" {
+		return cpu, memory
+	}
+	// A Create-from-Snapshot request inherits resources that the caller did
+	// not specify. Keep the negative sentinel expected by
+	// buildSandboxRawCreateRequest instead of turning omission into ordinary
+	// sandbox defaults before FunctionSystem can merge the Snapshot template.
+	if req.Cpu <= 0 {
+		cpu = -1
+	}
+	if req.Memory <= 0 {
+		memory = -1
 	}
 	return cpu, memory
 }
@@ -2333,20 +2369,27 @@ func PauseV1Handler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, errors.New("ttlSeconds must be positive"))
 		return
 	}
+	timeoutSeconds, err := resolveSandboxCheckpointTimeout(req.TimeoutSeconds)
+	if err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
 	payload, err := proto.Marshal(&core.SnapOptions{
-		Type: common.SnapType_PAUSE_RESUME,
-		Ttl:  req.TTLSeconds,
+		Type:                common.SnapType_PAUSE_RESUME,
+		Ttl:                 req.TTLSeconds,
+		CheckpointTimeoutMs: uint64(timeoutSeconds) * uint64(time.Second/time.Millisecond),
 	})
 	if err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
 		return
 	}
-	killResponse, err := executeSandboxLifecycleKill(
+	killResponse, err := executeSandboxLifecycleKillWithTimeout(
 		ctx,
 		sandboxPauseInstanceSignal,
 		payload,
 		sandboxPauseRequestIDPattern,
 		"pause",
+		timeoutSeconds,
 	)
 	if err != nil {
 		setSandboxLifecycleError(ctx, err)
@@ -2430,6 +2473,22 @@ func ResumeV1Handler(ctx *gin.Context) {
 	}, http.StatusOK, nil)
 }
 
+// ReloadV1Handler restores one running sandbox from its latest local anonymous snapshot.
+func ReloadV1Handler(ctx *gin.Context) {
+	_, err := executeSandboxLifecycleKill(
+		ctx,
+		sandboxReloadInstanceSignal,
+		nil,
+		sandboxReloadRequestIDPattern,
+		"reload",
+	)
+	if err != nil {
+		app.SetCtxResponse(ctx, reloadV1Response{Success: false}, sandboxLifecycleHTTPStatus(err), err)
+		return
+	}
+	app.SetCtxResponse(ctx, reloadV1Response{Success: true}, http.StatusOK, nil)
+}
+
 func parseResumePortMappings(encoded string) (map[string]int, error) {
 	const physicalMappingFieldCount = 3
 
@@ -2477,6 +2536,19 @@ func executeSandboxLifecycleKill(
 	requestIDPattern *regexp.Regexp,
 	operation string,
 ) (*core.KillResponse, error) {
+	return executeSandboxLifecycleKillWithTimeout(
+		ctx, signal, payload, requestIDPattern, operation, 0,
+	)
+}
+
+func executeSandboxLifecycleKillWithTimeout(
+	ctx *gin.Context,
+	signal int,
+	payload []byte,
+	requestIDPattern *regexp.Regexp,
+	operation string,
+	timeoutSeconds int,
+) (*core.KillResponse, error) {
 	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
 	if instanceID == "" {
 		return nil, errors.New("sandboxID is required")
@@ -2500,6 +2572,7 @@ func executeSandboxLifecycleKill(
 	}
 	invokeOptions := api.InvokeOptions{
 		TraceID: ctx.GetHeader(constant.HeaderTraceID),
+		Timeout: timeoutSeconds,
 		CustomExtensions: map[string]string{
 			"traceparent": ctx.GetHeader(constant.HeaderTraceParent),
 		},
@@ -2522,6 +2595,10 @@ func executeSandboxLifecycleKill(
 }
 
 func setSandboxLifecycleError(ctx *gin.Context, err error) {
+	app.SetCtxResponse(ctx, nil, sandboxLifecycleHTTPStatus(err), err)
+}
+
+func sandboxLifecycleHTTPStatus(err error) int {
 	statusCode := http.StatusInternalServerError
 	var transportError *sandboxLifecycleTransportError
 	var businessError *sandboxLifecycleBusinessError
@@ -2538,7 +2615,7 @@ func setSandboxLifecycleError(ctx *gin.Context, err error) {
 		strings.Contains(err.Error(), "tenant") {
 		statusCode = http.StatusBadRequest
 	}
-	app.SetCtxResponse(ctx, nil, statusCode, err)
+	return statusCode
 }
 
 func needsDeleteAuthorization(ctx *gin.Context) bool {
