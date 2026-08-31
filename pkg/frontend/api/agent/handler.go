@@ -1936,6 +1936,10 @@ func InvokeHandler(ctx *gin.Context) {
 	}
 	result, err := parseAgentInvokeResponse(respRaw)
 	if err != nil {
+		if errInfo, ok := err.(api.ErrorInfo); ok && errInfo.Code != 0 {
+			app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, errInfo.Err)
+			return
+		}
 		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
 		return
 	}
@@ -2019,7 +2023,11 @@ func parseAgentInvokeResponse(raw []byte) (interface{}, error) {
 		    smallVal[:min(constant.LibruntimeHeaderSize, len(smallVal))])
 	}
 	if resp.InnerCode != "" && resp.InnerCode != "0" {
-		return nil, api.ErrorInfo{Code: atoiSafe(resp.InnerCode), Err: fmt.Errorf("faas inner error code %s", resp.InnerCode)}
+		msg := strings.TrimSpace(fmt.Sprintf("%v", resp.Body))
+		if msg == "" {
+			msg = fmt.Sprintf("empty message, agent inner error code %s", resp.InnerCode)
+		}
+		return nil, api.ErrorInfo{Code: atoiSafe(resp.InnerCode), Err: errors.New(msg)}
 	}
 	return resp.Body, nil
 }
