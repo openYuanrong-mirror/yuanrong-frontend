@@ -276,6 +276,14 @@ func (r *InstanceInfoWatchResolver) Resolve(ctx context.Context, key route.Key) 
 	readCtx, cancel := context.WithTimeout(ctx, r.readTimeout)
 	defer cancel()
 	result := r.reads.DoChan(key.SafeInstanceID, func() (interface{}, error) {
+		// A caller may observe a miss before another read-through populates
+		// the cache, but enter the group after that call has completed. Recheck
+		// inside the shared operation to avoid a redundant authoritative read.
+		if !execendpoint.Default().IsPaused(key.SafeInstanceID) {
+			if _, err := r.cache.Get(key); err == nil {
+				return nil, nil
+			}
+		}
 		return r.refreshInstance(readCtx, key.SafeInstanceID)
 	})
 	select {

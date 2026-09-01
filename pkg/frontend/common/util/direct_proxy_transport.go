@@ -40,9 +40,10 @@ type simpleRuntimeRawInvokeRequest struct {
 }
 
 type simpleRuntimeRawCreateRequest struct {
-	ctx     context.Context
-	create  []byte
-	options api.RawRequestOption
+	ctx            context.Context
+	create         []byte
+	timeoutSeconds int
+	options        api.RawRequestOption
 }
 
 type simpleRuntimeCreateRequest struct {
