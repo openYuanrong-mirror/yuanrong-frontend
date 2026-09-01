@@ -63,15 +63,18 @@ does not reach RUNNING before its create budget finishes is an ordinary-HTTP
 `500` or an SSE final event with `status: "timeout"`. They are separate from
 the Snapshot/Pause logical checkpoint timeout and SDK transport buffer
 described below. The create budget must cover the scheduling budget, the
-305-second runtime initialization budget, and a 30-second Frontend response
-buffer. When only the scheduling budget is supplied, Frontend derives the
-create budget by adding those 335 seconds. For compatibility, legacy timeout
+SDK-supplied runtime initialization budget (30 seconds by default), and a
+30-second Frontend response buffer. The SDK keeps the initialization budget
+internal rather than exposing another constructor option. Clients that omit
+the internal request field retain a 30-second compatibility default. When only
+the scheduling budget is supplied, Frontend derives the
+create budget by adding those 60 seconds. For compatibility, legacy timeout
 pairs that reserved only the former 30-second response buffer remain accepted;
 Frontend preserves their scheduling budget and expands the effective create
 budget to include initialization. A create-only request likewise keeps its
 legacy `create - 30` scheduling budget before the outer budget is expanded.
 A legacy environment value below the new
-default is normalized to the default 365-second create and 30-second schedule
+default is normalized to the default 90-second create and 30-second schedule
 budgets. Sandbox action invocation keeps its independent 60-second timeout.
 
 For a snapshot create, positive `cpu` or `memory` values override the template.
