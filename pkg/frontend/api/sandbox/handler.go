@@ -1711,17 +1711,23 @@ func effectiveSandboxInitCallTimeoutSeconds(requested int) int {
 	return sandboxDefaultInitTimeoutSeconds
 }
 
-func resolveSandboxCreateTimeouts(requestedCreate, requestedSchedule, requestedInit int) (int, int, error) {
+func validateSandboxCreateTimeoutInputs(requestedCreate, requestedSchedule, requestedInit int) error {
 	if requestedCreate < 0 {
-		return 0, 0, fmt.Errorf("createTimeoutSeconds must be a positive integer")
+		return fmt.Errorf("createTimeoutSeconds must be a positive integer")
 	}
 	if requestedSchedule < 0 {
-		return 0, 0, fmt.Errorf("scheduleTimeoutSeconds must be a positive integer")
+		return fmt.Errorf("scheduleTimeoutSeconds must be a positive integer")
 	}
 	if requestedInit < 0 {
-		return 0, 0, fmt.Errorf("initCallTimeoutSeconds must be a positive integer")
+		return fmt.Errorf("initCallTimeoutSeconds must be a positive integer")
 	}
+	return nil
+}
 
+func resolveSandboxCreateTimeouts(requestedCreate, requestedSchedule, requestedInit int) (int, int, error) {
+	if err := validateSandboxCreateTimeoutInputs(requestedCreate, requestedSchedule, requestedInit); err != nil {
+		return 0, 0, err
+	}
 	createTimeout := requestedCreate
 	scheduleTimeout := requestedSchedule
 	createReserve := effectiveSandboxInitCallTimeoutSeconds(requestedInit) + sandboxScheduleBufferSeconds
