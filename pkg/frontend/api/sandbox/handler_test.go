@@ -2885,6 +2885,115 @@ func TestReloadV1HandlerReturnsFalseOnBusinessFailure(t *testing.T) {
 	require.False(t, result.Success)
 }
 
+func TestUpdateNetworkV1HandlerUsesSignal26AndCanonicalPolicy(t *testing.T) {
+	const requestID = "network-123e4567-e89b-12d3-a456-426614174000"
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		captured = proto.Clone(killReq).(*core.KillRequest)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
+	}})
+	body := `{
+		"schemaVersion": 2,
+		"traffic": {
+			"ingressDefaultAction": "allow",
+			"egressDefaultAction": "deny",
+			"mode": "stateful",
+			"rules": [{
+				"action": "allow",
+				"direction": "egress",
+				"protocol": "tcp",
+				"peer": {"domain": "API.GitHub.COM."},
+				"priority": 100
+			}]
+		}
+	}`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/network",
+		strings.NewReader(body),
+	)
+	ctx.Request.Header.Set(sandboxLifecycleRequestIDHeader, requestID)
+
+	UpdateNetworkV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.Equal(t, int32(26), captured.GetSignal())
+	require.Equal(t, requestID, captured.GetRequestID())
+	var policy SandboxNetworkPolicy
+	require.NoError(t, json.Unmarshal(captured.GetPayload(), &policy))
+	require.Equal(t, uint32(2), policy.SchemaVersion)
+	require.Equal(t, "api.github.com", policy.Traffic.Rules[0].Peer.Domain)
+	var response job.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	var result updateNetworkV1Response
+	require.NoError(t, json.Unmarshal(response.Data, &result))
+	require.True(t, result.Success)
+}
+
+func TestUpdateNetworkV1HandlerClearsWithEmptyPolicy(t *testing.T) {
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		killReq *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		captured = proto.Clone(killReq).(*core.KillRequest)
+		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/network",
+		strings.NewReader("{}"),
+	)
+	ctx.Request.Header.Set(
+		sandboxLifecycleRequestIDHeader,
+		"network-123e4567-e89b-12d3-a456-426614174001",
+	)
+
+	UpdateNetworkV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.JSONEq(t, "{}", string(captured.GetPayload()))
+}
+
+func TestUpdateNetworkV1HandlerRejectsUnknownFields(t *testing.T) {
+	called := false
+	setAPIClientsForTest(t, &runtimeStub{killRaw: func(
+		_ *core.KillRequest,
+		_ api.RawRequestOption,
+	) ([]byte, error) {
+		called = true
+		return nil, nil
+	}})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "sandboxID", Value: "default-sandbox-1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/sandbox/v1/sandboxes/default-sandbox-1/network",
+		strings.NewReader(`{"blockNetwrok":true}`),
+	)
+	ctx.Request.Header.Set(
+		sandboxLifecycleRequestIDHeader,
+		"network-123e4567-e89b-12d3-a456-426614174002",
+	)
+
+	UpdateNetworkV1Handler(ctx)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.False(t, called)
+}
+
 func TestResumeV1HandlerDoesNotRequireLocalSandboxRouter(t *testing.T) {
 	const instanceID = "default-sandbox-resume-without-local-router"
 	const requestID = "resume-123e4567-e89b-12d3-a456-426614174002"
@@ -3306,6 +3415,102 @@ func TestCreateV1HandlerNormalizesDNSBlacklist(t *testing.T) {
 	)
 }
 
+func TestCreateV1HandlerNormalizesACLVersion2(t *testing.T) {
+	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
+		t,
+		`{
+            "network": {
+                "schemaVersion": 2,
+                "traffic": {
+                    "ingressDefaultAction": "ALLOW",
+                    "egressDefaultAction": "deny",
+                    "mode": "stateful",
+                    "rules": [
+                        {
+                            "action": "allow",
+                            "direction": "egress",
+                            "protocol": "tcp",
+                            "peer": {
+                                "cidr": "192.0.2.129/24",
+                                "portRange": {"first": 80, "last": 443}
+                            },
+                            "priority": 110
+                        },
+                        {
+                            "action": "deny",
+                            "direction": "egress",
+                            "protocol": "udp",
+                            "peer": {"domain": "BÜCHER.example."},
+                            "sandboxPortRange": {"first": 5000, "last": 5010}
+                        }
+                    ]
+                },
+                "dns": {
+                    "defaultAction": "allow",
+                    "rules": [
+                        {"action": "deny", "pattern": "*.Example.COM."}
+                    ]
+                }
+            }
+        }`,
+	)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, called)
+	require.NotNil(t, captured)
+	require.JSONEq(
+		t,
+		`{
+            "schemaVersion": 2,
+            "traffic": {
+                "ingressDefaultAction": "allow",
+                "egressDefaultAction": "deny",
+                "mode": "stateful",
+                "rules": [
+                    {
+                        "action": "allow",
+                        "direction": "egress",
+                        "protocol": "tcp",
+                        "peer": {
+                            "cidr": "192.0.2.0/24",
+                            "portRange": {"first": 80, "last": 443}
+                        },
+                        "priority": 110
+                    },
+                    {
+                        "action": "deny",
+                        "direction": "egress",
+                        "protocol": "udp",
+                        "peer": {"domain": "xn--bcher-kva.example"},
+                        "sandboxPortRange": {"first": 5000, "last": 5010},
+                        "priority": 100
+                    }
+                ]
+            },
+            "dns": {
+                "defaultAction": "allow",
+                "rules": [
+                    {"action": "deny", "pattern": "*.example.com"}
+                ]
+            }
+        }`,
+		captured.GetCreateOptions()["network_policy"],
+	)
+}
+
+func TestCreateV1HandlerOmitsEmptyACLVersion2(t *testing.T) {
+	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
+		t,
+		`{"network":{"schemaVersion":2}}`,
+	)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, called)
+	require.NotNil(t, captured)
+	_, exists := captured.GetCreateOptions()["network_policy"]
+	require.False(t, exists)
+}
+
 func TestCreateV1HandlerOmitsEmptyNetworkPolicy(t *testing.T) {
 	recorder, captured, called := invokeCreateV1ForNetworkPolicyTest(
 		t,
@@ -3324,6 +3529,20 @@ func TestCreateV1HandlerRejectsInvalidNetworkPolicy(t *testing.T) {
 		`{"network":{"blockNetwork":true,"dnsBlacklist":["github.com"]}}`,
 		`{"network":{"dnsBlacklist":["github.*"]}}`,
 		`{"network":{"dnsBlacklist":["github..com"]}}`,
+		`{"network":{"dnsBlacklist":["github.com.."]}}`,
+		`{"network":{"traffic":{"ingressDefaultAction":"allow"}}}`,
+		`{"network":{"schemaVersion":2,"blockNetwork":true}}`,
+		`{"network":{"schemaVersion":3}}`,
+		`{"network":{"schemaVersion":2,"unknown":true}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","unknown":true}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","rules":[{"action":"allow","direction":"egress","protocol":"tcp","unknown":true}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","rules":[{"action":"allow","direction":"egress","protocol":"tcp","peer":{"unknown":true}}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","rules":[{"action":"allow","direction":"egress","protocol":"tcp","peer":{"portRange":{"first":80,"last":443,"unknown":true}}}]}}}`,
+		`{"network":{"schemaVersion":2,"dns":{"defaultAction":"deny","rules":[{"action":"allow","pattern":"example.com","unknown":true}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"ingress","protocol":"tcp","peer":{"domain":"example.com"},"priority":100}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"egress","protocol":"tcp","peer":{"cidr":"2001:db8::/32"},"priority":100}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"egress","protocol":"any","peer":{"portRange":{"first":443,"last":443}},"priority":100}]}}}`,
+		`{"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"allow","egressDefaultAction":"deny","mode":"stateful","rules":[{"action":"allow","direction":"egress","protocol":"tcp","priority":4294967295}]}}}`,
 	}
 	for _, body := range invalidBodies {
 		t.Run(body, func(t *testing.T) {

@@ -18,6 +18,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -27,6 +28,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
@@ -38,6 +40,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/ugorji/go/codec"
+	"golang.org/x/net/idna"
 	"google.golang.org/protobuf/proto"
 
 	"frontend/pkg/common/faas_common/constant"
@@ -85,6 +88,7 @@ const (
 	sandboxPauseInstanceSignal      = 18
 	sandboxResumeInstanceSignal     = 19
 	sandboxReloadInstanceSignal     = 25
+	sandboxUpdateNetworkSignal      = 26
 	sandboxPauseDefaultTTLSeconds   = 90_000
 	sandboxLifecycleRequestIDHeader = "X-YR-Request-ID"
 	sandboxRunningPollTimeout       = 5 * time.Second
@@ -113,6 +117,9 @@ const (
 	sandboxStorageLimitExtension    = "STORAGE_LIMIT"
 	bytesPerMiB                     = 1024 * 1024
 	decimalRadix                    = 10
+	maxSandboxTrafficRules          = 256
+	defaultSandboxRulePriority      = 100
+	maxSandboxUserRulePriority      = math.MaxUint32 - 1
 )
 
 var selectSandboxSchedulerID = func(funcKey string) (string, error) {
@@ -144,6 +151,7 @@ var (
 	sandboxXPUCountPattern          = regexp.MustCompile(`^[0-9]+$`)
 	sandboxPauseRequestIDPattern    = regexp.MustCompile(`^pause-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxResumeRequestIDPattern   = regexp.MustCompile(`^resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxNetworkRequestIDPattern  = regexp.MustCompile(`^network-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxReloadRequestIDPattern   = regexp.MustCompile(`^reload-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxSnapshotRequestIDPattern = regexp.MustCompile(`^snapshot-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	sandboxDNSLabelPattern          = regexp.MustCompile(`^[a-z0-9_-]+$`)
@@ -172,6 +180,10 @@ type resumeV1Response struct {
 }
 
 type reloadV1Response struct {
+	Success bool `json:"success"`
+}
+
+type updateNetworkV1Response struct {
 	Success bool `json:"success"`
 }
 
@@ -265,10 +277,73 @@ type TunnelSpec struct {
 	ProxyPort int  `json:"proxyPort,omitempty"`
 }
 
-// SandboxNetworkPolicy is the public creation-time network policy.
+// SandboxPortRange is an inclusive TCP or UDP port interval.
+type SandboxPortRange struct {
+	First uint32 `json:"first"`
+	Last  uint32 `json:"last"`
+}
+
+// SandboxNetworkEndpoint selects a remote CIDR/domain and optional port range.
+type SandboxNetworkEndpoint struct {
+	CIDR      string            `json:"cidr,omitempty"`
+	Domain    string            `json:"domain,omitempty"`
+	PortRange *SandboxPortRange `json:"portRange,omitempty"`
+}
+
+// SandboxTrafficRule is expressed from the sandbox's point of view.
+type SandboxTrafficRule struct {
+	Action           string                  `json:"action"`
+	Direction        string                  `json:"direction"`
+	Protocol         string                  `json:"protocol"`
+	Peer             *SandboxNetworkEndpoint `json:"peer,omitempty"`
+	SandboxPortRange *SandboxPortRange       `json:"sandboxPortRange,omitempty"`
+	Priority         uint32                  `json:"priority"`
+}
+
+// SandboxTrafficPolicy has independent ingress and egress defaults.
+type SandboxTrafficPolicy struct {
+	IngressDefaultAction string               `json:"ingressDefaultAction"`
+	EgressDefaultAction  string               `json:"egressDefaultAction"`
+	Mode                 string               `json:"mode"`
+	Rules                []SandboxTrafficRule `json:"rules"`
+}
+
+// SandboxDNSRule matches an exact name or one leading-wildcard suffix.
+type SandboxDNSRule struct {
+	Action  string `json:"action"`
+	Pattern string `json:"pattern"`
+}
+
+// SandboxDNSPolicy controls conventional DNS queries.
+type SandboxDNSPolicy struct {
+	DefaultAction string           `json:"defaultAction"`
+	Rules         []SandboxDNSRule `json:"rules"`
+}
+
+// SandboxNetworkPolicy is the public creation-time network policy. Legacy
+// fields are retained for old clients and cannot be combined with schema v2.
 type SandboxNetworkPolicy struct {
-	BlockNetwork bool     `json:"blockNetwork,omitempty"`
-	DNSBlacklist []string `json:"dnsBlacklist,omitempty"`
+	BlockNetwork  bool                  `json:"blockNetwork,omitempty"`
+	DNSBlacklist  []string              `json:"dnsBlacklist,omitempty"`
+	SchemaVersion uint32                `json:"schemaVersion,omitempty"`
+	Traffic       *SandboxTrafficPolicy `json:"traffic,omitempty"`
+	DNS           *SandboxDNSPolicy     `json:"dns,omitempty"`
+}
+
+// UnmarshalJSON rejects misspelled ACL fields instead of silently weakening a
+// default-deny request. Unknown fields elsewhere in create requests retain the
+// frontend's legacy behavior.
+func (policy *SandboxNetworkPolicy) UnmarshalJSON(data []byte) error {
+	type alias SandboxNetworkPolicy
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode((*alias)(policy)); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("invalid trailing network policy data")
+	}
+	return nil
 }
 
 // CreateV1Request holds POST /api/sandbox/v1/sandboxes parameters.
@@ -717,6 +792,33 @@ func normalizeSandboxNetworkPolicy(policy *SandboxNetworkPolicy) (*SandboxNetwor
 	if policy == nil {
 		return nil, nil
 	}
+	if policy.SchemaVersion != 0 && policy.SchemaVersion != 2 {
+		return nil, fmt.Errorf("network schemaVersion must be 2 or omitted for legacy policies")
+	}
+	if policy.SchemaVersion == 2 {
+		if policy.BlockNetwork || len(policy.DNSBlacklist) > 0 {
+			return nil, fmt.Errorf("legacy and schema v2 network policy fields cannot be combined")
+		}
+		traffic, err := normalizeSandboxTrafficPolicy(policy.Traffic)
+		if err != nil {
+			return nil, err
+		}
+		dns, err := normalizeSandboxDNSPolicy(policy.DNS)
+		if err != nil {
+			return nil, err
+		}
+		if traffic == nil && dns == nil {
+			return nil, nil
+		}
+		return &SandboxNetworkPolicy{
+			SchemaVersion: 2,
+			Traffic:       traffic,
+			DNS:           dns,
+		}, nil
+	}
+	if policy.Traffic != nil || policy.DNS != nil {
+		return nil, fmt.Errorf("schema v2 network fields require schemaVersion 2")
+	}
 	if policy.BlockNetwork && len(policy.DNSBlacklist) > 0 {
 		return nil, fmt.Errorf("blockNetwork and dnsBlacklist cannot be combined")
 	}
@@ -742,19 +844,233 @@ func normalizeSandboxNetworkPolicy(policy *SandboxNetworkPolicy) (*SandboxNetwor
 	}, nil
 }
 
+func normalizeSandboxTrafficPolicy(policy *SandboxTrafficPolicy) (*SandboxTrafficPolicy, error) {
+	if policy == nil {
+		return nil, nil
+	}
+	ingress, err := normalizeSandboxNetworkChoice(
+		policy.IngressDefaultAction, "traffic.ingressDefaultAction", "allow", "deny",
+	)
+	if err != nil {
+		return nil, err
+	}
+	egress, err := normalizeSandboxNetworkChoice(
+		policy.EgressDefaultAction, "traffic.egressDefaultAction", "allow", "deny",
+	)
+	if err != nil {
+		return nil, err
+	}
+	mode := policy.Mode
+	if strings.TrimSpace(mode) == "" {
+		mode = "stateful"
+	}
+	mode, err = normalizeSandboxNetworkChoice(mode, "traffic.mode", "stateful", "stateless")
+	if err != nil {
+		return nil, err
+	}
+	if len(policy.Rules) > maxSandboxTrafficRules {
+		return nil, fmt.Errorf("traffic.rules supports at most %d entries", maxSandboxTrafficRules)
+	}
+	rules := make([]SandboxTrafficRule, 0, len(policy.Rules))
+	for index, rule := range policy.Rules {
+		normalized, err := normalizeSandboxTrafficRule(rule, index)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, normalized)
+	}
+	return &SandboxTrafficPolicy{
+		IngressDefaultAction: ingress,
+		EgressDefaultAction:  egress,
+		Mode:                 mode,
+		Rules:                rules,
+	}, nil
+}
+
+func normalizeSandboxTrafficRule(rule SandboxTrafficRule, index int) (SandboxTrafficRule, error) {
+	prefix := fmt.Sprintf("traffic.rules[%d]", index)
+	action, err := normalizeSandboxNetworkChoice(rule.Action, prefix+".action", "allow", "deny")
+	if err != nil {
+		return SandboxTrafficRule{}, err
+	}
+	direction, err := normalizeSandboxNetworkChoice(
+		rule.Direction, prefix+".direction", "ingress", "egress", "both",
+	)
+	if err != nil {
+		return SandboxTrafficRule{}, err
+	}
+	protocol, err := normalizeSandboxNetworkChoice(
+		rule.Protocol, prefix+".protocol", "any", "tcp", "udp", "icmp",
+	)
+	if err != nil {
+		return SandboxTrafficRule{}, err
+	}
+	priority := rule.Priority
+	if priority == 0 {
+		priority = defaultSandboxRulePriority
+	}
+	if priority > maxSandboxUserRulePriority {
+		return SandboxTrafficRule{}, fmt.Errorf(
+			"%s.priority must be in 1..%d", prefix, maxSandboxUserRulePriority,
+		)
+	}
+	peer, err := normalizeSandboxNetworkEndpoint(rule.Peer, direction, protocol, prefix+".peer")
+	if err != nil {
+		return SandboxTrafficRule{}, err
+	}
+	sandboxPorts, err := normalizeSandboxPortRange(rule.SandboxPortRange, prefix+".sandboxPortRange")
+	if err != nil {
+		return SandboxTrafficRule{}, err
+	}
+	if sandboxPorts != nil && protocol != "tcp" && protocol != "udp" {
+		return SandboxTrafficRule{}, fmt.Errorf("%s requires protocol tcp or udp", prefix+".sandboxPortRange")
+	}
+	return SandboxTrafficRule{
+		Action:           action,
+		Direction:        direction,
+		Protocol:         protocol,
+		Peer:             peer,
+		SandboxPortRange: sandboxPorts,
+		Priority:         priority,
+	}, nil
+}
+
+func normalizeSandboxNetworkEndpoint(
+	peer *SandboxNetworkEndpoint, direction, protocol, prefix string,
+) (*SandboxNetworkEndpoint, error) {
+	if peer == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(peer.CIDR) != "" && strings.TrimSpace(peer.Domain) != "" {
+		return nil, fmt.Errorf("%s cannot contain both cidr and domain", prefix)
+	}
+	cidr := ""
+	if strings.TrimSpace(peer.CIDR) != "" {
+		var err error
+		cidr, err = normalizeSandboxCIDR(peer.CIDR)
+		if err != nil {
+			return nil, fmt.Errorf("%s.cidr: %w", prefix, err)
+		}
+	}
+	domain := ""
+	if strings.TrimSpace(peer.Domain) != "" {
+		if direction != "egress" {
+			return nil, fmt.Errorf("%s.domain is valid only for egress", prefix)
+		}
+		var err error
+		domain, err = normalizeSandboxDomainPattern(peer.Domain, "domain")
+		if err != nil {
+			return nil, fmt.Errorf("%s.domain: %w", prefix, err)
+		}
+	}
+	ports, err := normalizeSandboxPortRange(peer.PortRange, prefix+".portRange")
+	if err != nil {
+		return nil, err
+	}
+	if ports != nil && protocol != "tcp" && protocol != "udp" {
+		return nil, fmt.Errorf("%s.portRange requires protocol tcp or udp", prefix)
+	}
+	if cidr == "" && domain == "" && ports == nil {
+		return nil, nil
+	}
+	return &SandboxNetworkEndpoint{CIDR: cidr, Domain: domain, PortRange: ports}, nil
+}
+
+func normalizeSandboxPortRange(portRange *SandboxPortRange, prefix string) (*SandboxPortRange, error) {
+	if portRange == nil {
+		return nil, nil
+	}
+	if portRange.First == 0 || portRange.Last == 0 || portRange.First > portRange.Last ||
+		portRange.Last > maxSandboxPort {
+		return nil, fmt.Errorf("%s must satisfy 1 <= first <= last <= %d", prefix, maxSandboxPort)
+	}
+	return &SandboxPortRange{First: portRange.First, Last: portRange.Last}, nil
+}
+
+func normalizeSandboxCIDR(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if !strings.Contains(trimmed, "/") {
+		address, err := netip.ParseAddr(trimmed)
+		if err != nil || !address.Is4() {
+			return "", fmt.Errorf("%q is not an IPv4 address or CIDR", value)
+		}
+		return netip.PrefixFrom(address, 32).String(), nil
+	}
+	prefix, err := netip.ParsePrefix(trimmed)
+	if err != nil || !prefix.Addr().Is4() {
+		return "", fmt.Errorf("%q is not an IPv4 address or CIDR", value)
+	}
+	return prefix.Masked().String(), nil
+}
+
+func normalizeSandboxDNSPolicy(policy *SandboxDNSPolicy) (*SandboxDNSPolicy, error) {
+	if policy == nil {
+		return nil, nil
+	}
+	defaultAction, err := normalizeSandboxNetworkChoice(
+		policy.DefaultAction, "dns.defaultAction", "allow", "deny",
+	)
+	if err != nil {
+		return nil, err
+	}
+	rules := make([]SandboxDNSRule, 0, len(policy.Rules))
+	for index, rule := range policy.Rules {
+		action, err := normalizeSandboxNetworkChoice(
+			rule.Action, fmt.Sprintf("dns.rules[%d].action", index), "allow", "deny",
+		)
+		if err != nil {
+			return nil, err
+		}
+		pattern, err := normalizeSandboxDomainPattern(rule.Pattern, "DNS")
+		if err != nil {
+			return nil, fmt.Errorf("dns.rules[%d].pattern: %w", index, err)
+		}
+		rules = append(rules, SandboxDNSRule{Action: action, Pattern: pattern})
+	}
+	return &SandboxDNSPolicy{DefaultAction: defaultAction, Rules: rules}, nil
+}
+
+func normalizeSandboxNetworkChoice(value, name string, allowed ...string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	for _, candidate := range allowed {
+		if normalized == candidate {
+			return normalized, nil
+		}
+	}
+	return "", fmt.Errorf("%s must be one of %s", name, strings.Join(allowed, ", "))
+}
+
 func normalizeSandboxDNSPattern(pattern string) (string, error) {
+	return normalizeSandboxDomainPattern(pattern, "DNS blacklist")
+}
+
+func normalizeSandboxDomainPattern(pattern, description string) (string, error) {
 	value := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(pattern), "."))
 	wildcard := strings.HasPrefix(value, "*.")
 	if wildcard {
 		value = strings.TrimPrefix(value, "*.")
 	}
-	if value == "" || strings.ContainsAny(value, "*?") || len(value) > 253 {
-		return "", fmt.Errorf("invalid DNS blacklist pattern %q", pattern)
+	if value == "" || strings.ContainsAny(value, "*?") {
+		return "", fmt.Errorf("invalid %s pattern %q", description, pattern)
+	}
+	ascii, err := idna.Lookup.ToASCII(value)
+	if err != nil {
+		ascii = value
+		for _, char := range ascii {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') &&
+				char != '-' && char != '_' && char != '.' {
+				return "", fmt.Errorf("invalid %s pattern %q", description, pattern)
+			}
+		}
+	}
+	value = strings.ToLower(ascii)
+	if len(value) > 253 {
+		return "", fmt.Errorf("invalid %s pattern %q", description, pattern)
 	}
 	for _, label := range strings.Split(value, ".") {
 		if len(label) == 0 || len(label) > 63 || strings.HasPrefix(label, "-") ||
 			strings.HasSuffix(label, "-") || !sandboxDNSLabelPattern.MatchString(label) {
-			return "", fmt.Errorf("invalid DNS blacklist pattern %q", pattern)
+			return "", fmt.Errorf("invalid %s pattern %q", description, pattern)
 		}
 	}
 	if wildcard {
@@ -1530,13 +1846,15 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions,
 		invokeOpts.CustomResources[sandboxStorageResourceName] =
 			float64(req.createReq.StorageLimitMb) * bytesPerMiB
 	}
-	fillSandboxCustomExtensions(
+	if err := fillSandboxCustomExtensions(
 		&invokeOpts,
 		req.createReq,
 		req.rootfs,
 		req.idleTimeoutSeconds,
 		req.traceParent,
-	)
+	); err != nil {
+		return api.InvokeOptions{}, err
+	}
 	if err := fillSandboxCreateOptions(req.ctx, &invokeOpts, req.createReq, req.funcID); err != nil {
 		return api.InvokeOptions{}, err
 	}
@@ -1577,7 +1895,7 @@ func fillSandboxCustomExtensions(
 	rootfs string,
 	idleTimeoutSeconds int,
 	traceParent string,
-) {
+) error {
 	if traceParent != "" {
 		invokeOpts.CustomExtensions["traceparent"] = traceParent
 	}
@@ -1614,12 +1932,13 @@ func fillSandboxCustomExtensions(
 		}
 	}
 	if req.Network != nil {
-		if networkJSON, err := json.Marshal(req.Network); err == nil {
-			invokeOpts.CustomExtensions["network_policy"] = string(networkJSON)
-		} else {
-			log.GetLogger().Warnf("failed to marshal sandbox network policy: %v", err)
+		networkJSON, err := json.Marshal(req.Network)
+		if err != nil {
+			return fmt.Errorf("failed to marshal sandbox network policy: %w", err)
 		}
+		invokeOpts.CustomExtensions["network_policy"] = string(networkJSON)
 	}
+	return nil
 }
 
 func fillSandboxCreateOptions(
@@ -2488,6 +2807,50 @@ func ReloadV1Handler(ctx *gin.Context) {
 		return
 	}
 	app.SetCtxResponse(ctx, reloadV1Response{Success: true}, http.StatusOK, nil)
+}
+
+// UpdateNetworkV1Handler atomically replaces a running sandbox's network policy.
+func UpdateNetworkV1Handler(ctx *gin.Context) {
+	var requested SandboxNetworkPolicy
+	decoder := json.NewDecoder(ctx.Request.Body)
+	if err := decoder.Decode(&requested); err != nil {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			http.StatusBadRequest, fmt.Errorf("invalid network policy: %w", err))
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			http.StatusBadRequest, errors.New("invalid trailing network policy data"))
+		return
+	}
+	normalized, err := normalizeSandboxNetworkPolicy(&requested)
+	if err != nil {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			http.StatusBadRequest, err)
+		return
+	}
+	payload := []byte("{}")
+	if normalized != nil {
+		payload, err = json.Marshal(normalized)
+		if err != nil {
+			app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+				http.StatusInternalServerError, err)
+			return
+		}
+	}
+	_, err = executeSandboxLifecycleKill(
+		ctx,
+		sandboxUpdateNetworkSignal,
+		payload,
+		sandboxNetworkRequestIDPattern,
+		"network",
+	)
+	if err != nil {
+		app.SetCtxResponse(ctx, updateNetworkV1Response{Success: false},
+			lifecycleHTTPStatus(err), err)
+		return
+	}
+	app.SetCtxResponse(ctx, updateNetworkV1Response{Success: true}, http.StatusOK, nil)
 }
 
 func parseResumePortMappings(encoded string) (map[string]int, error) {
