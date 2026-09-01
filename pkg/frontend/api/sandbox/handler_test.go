@@ -100,6 +100,7 @@ type sandboxTimeoutTestCase struct {
 	name             string
 	createTimeout    int
 	scheduleTimeout  int
+	initTimeout      int
 	wantCreate       int
 	wantSchedule     int
 	wantErrorMessage string
@@ -1011,7 +1012,7 @@ func assertSchedulerCreateOptions(t *testing.T, capturedInvokeOpt api.InvokeOpti
 	_, hasStaticOwner := capturedInvokeOpt.CreateOpt["resource.owner"]
 	require.False(t, hasStaticOwner)
 	require.Equal(t, fmt.Sprintf("%d", sandboxCreateTimeoutSeconds), capturedInvokeOpt.CreateOpt["call_timeout"])
-	require.Equal(t, "305", capturedInvokeOpt.CreateOpt["init_call_timeout"])
+	require.Equal(t, "30", capturedInvokeOpt.CreateOpt["init_call_timeout"])
 	require.Equal(t, "5", capturedInvokeOpt.CreateOpt["GRACEFUL_SHUTDOWN_TIME"])
 	require.Equal(t, "/tmp", capturedInvokeOpt.CreateOpt["DELEGATE_DIRECTORY_INFO"])
 	require.Equal(t, "512", capturedInvokeOpt.CreateOpt["DELEGATE_DIRECTORY_QUOTA"])
@@ -1878,6 +1879,7 @@ func TestCreateV1HandlerRejectsInvalidScheduleAffinity(t *testing.T) {
 }
 
 func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
+	const sdkInitCallTimeoutSeconds = 45
 	var capturedInvokeOpt api.InvokeOptions
 	setAPIClientsForTest(t, &runtimeStub{
 		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
@@ -1889,10 +1891,11 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	body, err := json.Marshal(CreateV1Request{
-		Name:                 "sandbox-sse",
-		Namespace:            "default",
-		Image:                "ubuntu:22.04",
-		CreateTimeoutSeconds: customCreateTimeoutSeconds,
+		Name:                   "sandbox-sse",
+		Namespace:              "default",
+		Image:                  "ubuntu:22.04",
+		CreateTimeoutSeconds:   customCreateTimeoutSeconds,
+		InitCallTimeoutSeconds: sdkInitCallTimeoutSeconds,
 	})
 	require.NoError(t, err)
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
@@ -1910,10 +1913,13 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "event: final")
 	require.Contains(t, recorder.Body.String(), `"sandboxId":"default-sandbox-sse"`)
 	require.Contains(t, recorder.Body.String(), `"status":"running"`)
-	require.Equal(t, customCreateTimeoutSeconds, capturedInvokeOpt.Timeout)
+	expectedCreateTimeout := customCreateTimeoutSeconds - sandboxScheduleBufferSeconds +
+		sdkInitCallTimeoutSeconds + sandboxScheduleBufferSeconds
+	require.Equal(t, expectedCreateTimeout, capturedInvokeOpt.Timeout)
 	expectedScheduleMs := int64(customCreateTimeoutSeconds-sandboxScheduleBufferSeconds) * millisecondsPerSecond
 	require.Equal(t, expectedScheduleMs, capturedInvokeOpt.ScheduleTimeoutMs)
-	require.Equal(t, strconv.Itoa(customCreateTimeoutSeconds), capturedInvokeOpt.CreateOpt["call_timeout"])
+	require.Equal(t, strconv.Itoa(expectedCreateTimeout), capturedInvokeOpt.CreateOpt["call_timeout"])
+	require.Equal(t, strconv.Itoa(sdkInitCallTimeoutSeconds), capturedInvokeOpt.CreateOpt["init_call_timeout"])
 }
 
 func TestCreateV1HandlerReadsRequestBodyToEOFBeforeSSE(t *testing.T) {
@@ -2337,25 +2343,38 @@ func TestSandboxCreateReplayStoreReplaysCompletedError(t *testing.T) {
 var timeoutTestCases = []sandboxTimeoutTestCase{
 	{
 		name:         "default create derives schedule",
-		wantCreate:   60,
+		wantCreate:   90,
 		wantSchedule: 30,
 	},
 	{
 		name:          "create derives schedule",
-		createTimeout: 120,
-		wantCreate:    120,
-		wantSchedule:  90,
+		createTimeout: 425,
+		wantCreate:    455,
+		wantSchedule:  395,
 	},
 	{
 		name:            "schedule derives create",
 		scheduleTimeout: 90,
-		wantCreate:      120,
+		wantCreate:      150,
 		wantSchedule:    90,
 	},
 	{
-		name:             "create must exceed buffer",
+		name:            "sdk init budget derives create",
+		scheduleTimeout: 90,
+		initTimeout:     45,
+		wantCreate:      165,
+		wantSchedule:    90,
+	},
+	{
+		name:             "create must exceed legacy response reserve",
 		createTimeout:    30,
 		wantErrorMessage: "createTimeoutSeconds must be greater than 30",
+	},
+	{
+		name:          "legacy create expands outer budget",
+		createTimeout: 60,
+		wantCreate:    90,
+		wantSchedule:  30,
 	},
 	{
 		name:             "create must be positive",
@@ -2368,23 +2387,35 @@ var timeoutTestCases = []sandboxTimeoutTestCase{
 		wantErrorMessage: "scheduleTimeoutSeconds must be a positive integer",
 	},
 	{
+		name:             "init must be positive",
+		initTimeout:      -1,
+		wantErrorMessage: "initCallTimeoutSeconds must be a positive integer",
+	},
+	{
 		name:             "schedule must not exceed create",
-		createTimeout:    60,
-		scheduleTimeout:  70,
+		createTimeout:    400,
+		scheduleTimeout:  410,
 		wantErrorMessage: "scheduleTimeoutSeconds must be less than or equal to createTimeoutSeconds",
 	},
 	{
-		name:             "explicit timeouts must reserve buffer",
-		createTimeout:    60,
-		scheduleTimeout:  45,
+		name:             "explicit timeouts must reserve legacy response budget",
+		createTimeout:    100,
+		scheduleTimeout:  80,
 		wantErrorMessage: "createTimeoutSeconds - scheduleTimeoutSeconds must be at least 30",
 	},
 	{
+		name:            "explicit timeouts preserve exact total reserve",
+		createTimeout:   180,
+		scheduleTimeout: 120,
+		wantCreate:      180,
+		wantSchedule:    120,
+	},
+	{
 		name:            "explicit timeouts preserve caller budgets",
-		createTimeout:   120,
-		scheduleTimeout: 80,
-		wantCreate:      120,
-		wantSchedule:    80,
+		createTimeout:   500,
+		scheduleTimeout: 100,
+		wantCreate:      500,
+		wantSchedule:    100,
 	},
 }
 
@@ -2393,7 +2424,7 @@ func TestResolveSandboxCreateTimeouts(t *testing.T) {
 	for _, tt := range timeoutTestCases {
 		t.Run(tt.name, func(t *testing.T) {
 			createTimeout, scheduleTimeout, err := resolveSandboxCreateTimeouts(
-				tt.createTimeout, tt.scheduleTimeout,
+				tt.createTimeout, tt.scheduleTimeout, tt.initTimeout,
 			)
 			if tt.wantErrorMessage != "" {
 				require.EqualError(t, err, tt.wantErrorMessage)
@@ -2404,6 +2435,14 @@ func TestResolveSandboxCreateTimeouts(t *testing.T) {
 			require.Equal(t, tt.wantSchedule, scheduleTimeout)
 		})
 	}
+}
+
+func TestResolveSandboxCreateTimeoutsNormalizesLegacyEnvironment(t *testing.T) {
+	t.Setenv("YR_SANDBOX_CREATE_TIMEOUT", "60")
+	createTimeout, scheduleTimeout, err := resolveSandboxCreateTimeouts(0, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, sandboxCreateTimeoutSeconds, createTimeout)
+	require.Equal(t, sandboxDefaultScheduleSeconds, scheduleTimeout)
 }
 
 func TestCreateV1HandlerSSEDoesNotReportUnconfirmedTimeoutAsRunning(t *testing.T) {

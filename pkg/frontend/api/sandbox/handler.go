@@ -69,13 +69,16 @@ import (
 const (
 	// Sandbox v1 always executes through the dedicated Rust slot (rrt).
 	// The public runtime field selects only the sandbox isolation runtime.
-	defaultSandboxRuntime           = "rrt"
-	defaultSandboxFunctionID        = "default/0-defaultservice-rrt/$latest"
-	sandboxCreateTimeoutSeconds     = 60
-	sandboxScheduleBufferSeconds    = 30
+	defaultSandboxRuntime            = "rrt"
+	defaultSandboxFunctionID         = "default/0-defaultservice-rrt/$latest"
+	sandboxDefaultScheduleSeconds    = 30
+	sandboxScheduleBufferSeconds     = 30
+	sandboxDefaultInitTimeoutSeconds = 30
+	sandboxCreateTimeoutSeconds      = sandboxDefaultScheduleSeconds + sandboxDefaultInitTimeoutSeconds +
+		sandboxScheduleBufferSeconds
+	sandboxInvokeTimeoutSeconds     = 60
 	sandboxDefaultCPU               = 1000
 	sandboxDefaultMemory            = 2048
-	sandboxInitTimeoutSeconds       = 305
 	sandboxGracefulShutdownSeconds  = 5
 	sandboxDirectoryQuotaMB         = 512
 	sandboxInstanceType             = "reserved"
@@ -249,9 +252,12 @@ type CreateRequest struct {
 	// Optional logical create budget. A positive request value overrides the
 	// environment and default without changing the legacy request shape.
 	CreateTimeoutSeconds int `json:"createTimeoutSeconds"`
-	// Optional scheduling budget. When only one timeout is supplied, the other
-	// is derived using sandboxScheduleBufferSeconds.
+	// Optional scheduling budget. The logical create budget must also cover the
+	// runtime initialization budget and the frontend response buffer.
 	ScheduleTimeoutSeconds int `json:"scheduleTimeoutSeconds"`
+	// InitCallTimeoutSeconds is an SDK-owned internal budget. Zero keeps
+	// compatibility with clients that predate this request field.
+	InitCallTimeoutSeconds int `json:"initCallTimeoutSeconds,omitempty"`
 	// nameGenerated marks an anonymous request whose instance name was assigned
 	// by this frontend. It is excluded from JSON and request digests.
 	nameGenerated bool
@@ -375,6 +381,7 @@ type CreateV1Request struct {
 	Failover               bool                     `json:"failover"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
+	InitCallTimeoutSeconds int                      `json:"initCallTimeoutSeconds,omitempty"`
 	portRouteKinds         map[int]string
 	nameGenerated          bool
 }
@@ -1156,6 +1163,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		Failover:               req.Failover,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
+		InitCallTimeoutSeconds: req.InitCallTimeoutSeconds,
 		nameGenerated:          req.nameGenerated,
 	}
 }
@@ -1812,7 +1820,9 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (api.InvokeOptions,
 		return api.InvokeOptions{}, err
 	}
 	createTimeoutSeconds, scheduleTimeoutSeconds, err := resolveSandboxCreateTimeouts(
-		req.createReq.CreateTimeoutSeconds, req.createReq.ScheduleTimeoutSeconds,
+		req.createReq.CreateTimeoutSeconds,
+		req.createReq.ScheduleTimeoutSeconds,
+		req.createReq.InitCallTimeoutSeconds,
 	)
 	if err != nil {
 		return api.InvokeOptions{}, err
@@ -1975,7 +1985,9 @@ func fillSandboxCreateOptions(
 	invokeOpts.CreateOpt[constant.InstanceTypeNote] = sandboxInstanceType
 	invokeOpts.CreateOpt[constant.SchedulerManagedNote] = strconv.FormatBool(false)
 	invokeOpts.CreateOpt["call_timeout"] = fmt.Sprintf("%d", invokeOpts.Timeout)
-	invokeOpts.CreateOpt["init_call_timeout"] = fmt.Sprintf("%d", sandboxInitTimeoutSeconds)
+	invokeOpts.CreateOpt["init_call_timeout"] = fmt.Sprintf(
+		"%d", effectiveSandboxInitCallTimeoutSeconds(req.InitCallTimeoutSeconds),
+	)
 	invokeOpts.CreateOpt["GRACEFUL_SHUTDOWN_TIME"] = fmt.Sprintf("%d", sandboxGracefulShutdownSeconds)
 	invokeOpts.CreateOpt["DELEGATE_DIRECTORY_INFO"] = sandboxDelegateDirectory
 	invokeOpts.CreateOpt["DELEGATE_DIRECTORY_QUOTA"] = fmt.Sprintf("%d", sandboxDirectoryQuotaMB)
@@ -2011,21 +2023,48 @@ func getSandboxCreateTimeoutSeconds(requested int) int {
 	return value
 }
 
-func resolveSandboxCreateTimeouts(requestedCreate, requestedSchedule int) (int, int, error) {
+func effectiveSandboxInitCallTimeoutSeconds(requested int) int {
+	if requested > 0 {
+		return requested
+	}
+	return sandboxDefaultInitTimeoutSeconds
+}
+
+func validateSandboxCreateTimeoutInputs(requestedCreate, requestedSchedule, requestedInit int) error {
 	if requestedCreate < 0 {
-		return 0, 0, fmt.Errorf("createTimeoutSeconds must be a positive integer")
+		return fmt.Errorf("createTimeoutSeconds must be a positive integer")
 	}
 	if requestedSchedule < 0 {
-		return 0, 0, fmt.Errorf("scheduleTimeoutSeconds must be a positive integer")
+		return fmt.Errorf("scheduleTimeoutSeconds must be a positive integer")
 	}
+	if requestedInit < 0 {
+		return fmt.Errorf("initCallTimeoutSeconds must be a positive integer")
+	}
+	return nil
+}
 
+func resolveSandboxCreateTimeouts(requestedCreate, requestedSchedule, requestedInit int) (int, int, error) {
+	if err := validateSandboxCreateTimeoutInputs(requestedCreate, requestedSchedule, requestedInit); err != nil {
+		return 0, 0, err
+	}
 	createTimeout := requestedCreate
 	scheduleTimeout := requestedSchedule
+	createReserve := effectiveSandboxInitCallTimeoutSeconds(requestedInit) + sandboxScheduleBufferSeconds
 	if createTimeout == 0 && scheduleTimeout == 0 {
+		scheduleTimeout = sandboxDefaultScheduleSeconds
 		createTimeout = getSandboxCreateTimeoutSeconds(0)
+		minimumCreateTimeout := scheduleTimeout + createReserve
+		if createTimeout < minimumCreateTimeout {
+			log.GetLogger().Warnf(
+				"YR_SANDBOX_CREATE_TIMEOUT=%d uses the legacy create budget; expanding it to %d",
+				createTimeout, minimumCreateTimeout,
+			)
+			createTimeout = minimumCreateTimeout
+		}
+		return createTimeout, scheduleTimeout, nil
 	}
 	if createTimeout == 0 {
-		return scheduleTimeout + sandboxScheduleBufferSeconds, scheduleTimeout, nil
+		return scheduleTimeout + createReserve, scheduleTimeout, nil
 	}
 	if scheduleTimeout == 0 {
 		if createTimeout <= sandboxScheduleBufferSeconds {
@@ -2033,18 +2072,23 @@ func resolveSandboxCreateTimeouts(requestedCreate, requestedSchedule int) (int, 
 				"createTimeoutSeconds must be greater than %d", sandboxScheduleBufferSeconds,
 			)
 		}
-		return createTimeout, createTimeout - sandboxScheduleBufferSeconds, nil
+		legacyScheduleTimeout := createTimeout - sandboxScheduleBufferSeconds
+		return legacyScheduleTimeout + createReserve, legacyScheduleTimeout, nil
 	}
 	if scheduleTimeout > createTimeout {
 		return 0, 0, fmt.Errorf(
 			"scheduleTimeoutSeconds must be less than or equal to createTimeoutSeconds",
 		)
 	}
-	if createTimeout-scheduleTimeout < sandboxScheduleBufferSeconds {
+	remainingCreateBudget := createTimeout - scheduleTimeout
+	if remainingCreateBudget < sandboxScheduleBufferSeconds {
 		return 0, 0, fmt.Errorf(
 			"createTimeoutSeconds - scheduleTimeoutSeconds must be at least %d",
 			sandboxScheduleBufferSeconds,
 		)
+	}
+	if remainingCreateBudget < createReserve {
+		return scheduleTimeout + createReserve, scheduleTimeout, nil
 	}
 	return createTimeout, scheduleTimeout, nil
 }
@@ -2282,7 +2326,7 @@ func InvokeV1Handler(ctx *gin.Context) {
 		instanceID:  instanceID,
 		action:      req.Action,
 		args:        req.Args,
-		timeout:     sandboxCreateTimeoutSeconds,
+		timeout:     sandboxInvokeTimeoutSeconds,
 		traceID:     traceID,
 		traceParent: ctx.Request.Header.Get(constant.HeaderTraceParent),
 	})
