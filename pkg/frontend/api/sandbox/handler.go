@@ -2384,12 +2384,13 @@ func PauseV1Handler(ctx *gin.Context) {
 		return
 	}
 	killResponse, err := executeSandboxLifecycleKillWithTimeout(
-		ctx,
-		sandboxPauseInstanceSignal,
-		payload,
-		sandboxPauseRequestIDPattern,
-		"pause",
-		timeoutSeconds,
+		ctx, lifecycleKillOptions{
+			signal:           sandboxPauseInstanceSignal,
+			payload:          payload,
+			requestIDPattern: sandboxPauseRequestIDPattern,
+			operation:        "pause",
+			timeoutSeconds:   timeoutSeconds,
+		},
 	)
 	if err != nil {
 		setSandboxLifecycleError(ctx, err)
@@ -2483,7 +2484,7 @@ func ReloadV1Handler(ctx *gin.Context) {
 		"reload",
 	)
 	if err != nil {
-		app.SetCtxResponse(ctx, reloadV1Response{Success: false}, sandboxLifecycleHTTPStatus(err), err)
+		app.SetCtxResponse(ctx, reloadV1Response{Success: false}, lifecycleHTTPStatus(err), err)
 		return
 	}
 	app.SetCtxResponse(ctx, reloadV1Response{Success: true}, http.StatusOK, nil)
@@ -2537,25 +2538,35 @@ func executeSandboxLifecycleKill(
 	operation string,
 ) (*core.KillResponse, error) {
 	return executeSandboxLifecycleKillWithTimeout(
-		ctx, signal, payload, requestIDPattern, operation, 0,
+		ctx, lifecycleKillOptions{
+			signal:           signal,
+			payload:          payload,
+			requestIDPattern: requestIDPattern,
+			operation:        operation,
+		},
 	)
+}
+
+type lifecycleKillOptions struct {
+	signal           int
+	payload          []byte
+	requestIDPattern *regexp.Regexp
+	operation        string
+	timeoutSeconds   int
 }
 
 func executeSandboxLifecycleKillWithTimeout(
 	ctx *gin.Context,
-	signal int,
-	payload []byte,
-	requestIDPattern *regexp.Regexp,
-	operation string,
-	timeoutSeconds int,
+	options lifecycleKillOptions,
 ) (*core.KillResponse, error) {
 	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
 	if instanceID == "" {
 		return nil, errors.New("sandboxID is required")
 	}
 	requestID := strings.TrimSpace(ctx.GetHeader(sandboxLifecycleRequestIDHeader))
-	if !requestIDPattern.MatchString(requestID) {
-		return nil, fmt.Errorf("%s must contain a valid SDK %s request ID", sandboxLifecycleRequestIDHeader, operation)
+	if !options.requestIDPattern.MatchString(requestID) {
+		return nil, fmt.Errorf("%s must contain a valid SDK %s request ID",
+			sandboxLifecycleRequestIDHeader, options.operation)
 	}
 	needsAuth, statusCode, err := ensureDeleteJWTContext(ctx, ctx.GetHeader(constant.HeaderTraceID))
 	if err != nil {
@@ -2572,13 +2583,13 @@ func executeSandboxLifecycleKillWithTimeout(
 	}
 	invokeOptions := api.InvokeOptions{
 		TraceID: ctx.GetHeader(constant.HeaderTraceID),
-		Timeout: timeoutSeconds,
+		Timeout: options.timeoutSeconds,
 		CustomExtensions: map[string]string{
 			"traceparent": ctx.GetHeader(constant.HeaderTraceParent),
 		},
 	}
 	killRequest := util.NewDirectKillRequest(
-		ctx.Request.Context(), instanceID, signal, payload, tenantID, invokeOptions)
+		ctx.Request.Context(), instanceID, options.signal, options.payload, tenantID, invokeOptions)
 	killRequest.RequestID = requestID
 	response, err := util.GetDirectProxyClient().KillInstanceWithResponse(killRequest)
 	if err != nil {
@@ -2586,7 +2597,7 @@ func executeSandboxLifecycleKillWithTimeout(
 	}
 	if response.GetCode() != common.ErrorCode_ERR_NONE {
 		return nil, &sandboxLifecycleBusinessError{
-			operation: operation,
+			operation: options.operation,
 			code:      response.GetCode(),
 			message:   response.GetMessage(),
 		}
@@ -2595,10 +2606,10 @@ func executeSandboxLifecycleKillWithTimeout(
 }
 
 func setSandboxLifecycleError(ctx *gin.Context, err error) {
-	app.SetCtxResponse(ctx, nil, sandboxLifecycleHTTPStatus(err), err)
+	app.SetCtxResponse(ctx, nil, lifecycleHTTPStatus(err), err)
 }
 
-func sandboxLifecycleHTTPStatus(err error) int {
+func lifecycleHTTPStatus(err error) int {
 	statusCode := http.StatusInternalServerError
 	var transportError *sandboxLifecycleTransportError
 	var businessError *sandboxLifecycleBusinessError

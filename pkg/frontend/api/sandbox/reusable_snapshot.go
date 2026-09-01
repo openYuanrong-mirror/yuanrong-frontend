@@ -106,8 +106,13 @@ func CreateReusableSnapshotV1Handler(ctx *gin.Context) {
 		return
 	}
 	killResponse, err := executeSandboxLifecycleKillWithTimeout(
-		ctx, sandboxPauseInstanceSignal, payload,
-		sandboxSnapshotRequestIDPattern, "snapshot", timeoutSeconds,
+		ctx, lifecycleKillOptions{
+			signal:           sandboxPauseInstanceSignal,
+			payload:          payload,
+			requestIDPattern: sandboxSnapshotRequestIDPattern,
+			operation:        "snapshot",
+			timeoutSeconds:   timeoutSeconds,
+		},
 	)
 	if err != nil {
 		setSandboxLifecycleError(ctx, err)

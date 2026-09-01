@@ -2824,7 +2824,9 @@ func TestReloadV1HandlerUsesSignal25AndReturnsBoolean(t *testing.T) {
 		killReq *core.KillRequest,
 		_ api.RawRequestOption,
 	) ([]byte, error) {
-		captured = proto.Clone(killReq).(*core.KillRequest)
+		cloned, ok := proto.Clone(killReq).(*core.KillRequest)
+		require.True(t, ok)
+		captured = cloned
 		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
 	}})
 	recorder := httptest.NewRecorder()
