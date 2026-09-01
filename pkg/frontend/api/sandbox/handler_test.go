@@ -2441,8 +2441,8 @@ func TestResolveSandboxCreateTimeoutsNormalizesLegacyEnvironment(t *testing.T) {
 	t.Setenv("YR_SANDBOX_CREATE_TIMEOUT", "60")
 	createTimeout, scheduleTimeout, err := resolveSandboxCreateTimeouts(0, 0, 0)
 	require.NoError(t, err)
-	require.Equal(t, 90, createTimeout)
-	require.Equal(t, 30, scheduleTimeout)
+	require.Equal(t, sandboxCreateTimeoutSeconds, createTimeout)
+	require.Equal(t, sandboxDefaultScheduleSeconds, scheduleTimeout)
 }
 
 func TestCreateV1HandlerSSEDoesNotReportUnconfirmedTimeoutAsRunning(t *testing.T) {
