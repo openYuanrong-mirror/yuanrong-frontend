@@ -1910,10 +1910,12 @@ func TestCreateV1HandlerSSEUsesRequestedTimeoutAndReturnsFinal(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "event: final")
 	require.Contains(t, recorder.Body.String(), `"sandboxId":"default-sandbox-sse"`)
 	require.Contains(t, recorder.Body.String(), `"status":"running"`)
-	require.Equal(t, customCreateTimeoutSeconds, capturedInvokeOpt.Timeout)
+	expectedCreateTimeout := customCreateTimeoutSeconds - sandboxScheduleBufferSeconds +
+		sandboxInitTimeoutSeconds + sandboxScheduleBufferSeconds
+	require.Equal(t, expectedCreateTimeout, capturedInvokeOpt.Timeout)
 	expectedScheduleMs := int64(customCreateTimeoutSeconds-sandboxScheduleBufferSeconds) * millisecondsPerSecond
 	require.Equal(t, expectedScheduleMs, capturedInvokeOpt.ScheduleTimeoutMs)
-	require.Equal(t, strconv.Itoa(customCreateTimeoutSeconds), capturedInvokeOpt.CreateOpt["call_timeout"])
+	require.Equal(t, strconv.Itoa(expectedCreateTimeout), capturedInvokeOpt.CreateOpt["call_timeout"])
 }
 
 func TestCreateV1HandlerReadsRequestBodyToEOFBeforeSSE(t *testing.T) {
@@ -2343,8 +2345,8 @@ var timeoutTestCases = []sandboxTimeoutTestCase{
 	{
 		name:          "create derives schedule",
 		createTimeout: 425,
-		wantCreate:    425,
-		wantSchedule:  90,
+		wantCreate:    730,
+		wantSchedule:  395,
 	},
 	{
 		name:            "schedule derives create",
@@ -2353,9 +2355,15 @@ var timeoutTestCases = []sandboxTimeoutTestCase{
 		wantSchedule:    90,
 	},
 	{
-		name:             "create must exceed init and response reserve",
-		createTimeout:    335,
-		wantErrorMessage: "createTimeoutSeconds must be greater than 335",
+		name:             "create must exceed legacy response reserve",
+		createTimeout:    30,
+		wantErrorMessage: "createTimeoutSeconds must be greater than 30",
+	},
+	{
+		name:          "legacy create expands outer budget",
+		createTimeout: 60,
+		wantCreate:    365,
+		wantSchedule:  30,
 	},
 	{
 		name:             "create must be positive",
@@ -2374,10 +2382,17 @@ var timeoutTestCases = []sandboxTimeoutTestCase{
 		wantErrorMessage: "scheduleTimeoutSeconds must be less than or equal to createTimeoutSeconds",
 	},
 	{
-		name:             "explicit timeouts must reserve init and response budgets",
-		createTimeout:    400,
+		name:             "explicit timeouts must reserve legacy response budget",
+		createTimeout:    100,
 		scheduleTimeout:  80,
-		wantErrorMessage: "createTimeoutSeconds - scheduleTimeoutSeconds must be at least 335",
+		wantErrorMessage: "createTimeoutSeconds - scheduleTimeoutSeconds must be at least 30",
+	},
+	{
+		name:            "legacy explicit timeouts expand outer budget",
+		createTimeout:   180,
+		scheduleTimeout: 120,
+		wantCreate:      455,
+		wantSchedule:    120,
 	},
 	{
 		name:            "explicit timeouts preserve caller budgets",
@@ -2404,6 +2419,14 @@ func TestResolveSandboxCreateTimeouts(t *testing.T) {
 			require.Equal(t, tt.wantSchedule, scheduleTimeout)
 		})
 	}
+}
+
+func TestResolveSandboxCreateTimeoutsNormalizesLegacyEnvironment(t *testing.T) {
+	t.Setenv("YR_SANDBOX_CREATE_TIMEOUT", "60")
+	createTimeout, scheduleTimeout, err := resolveSandboxCreateTimeouts(0, 0)
+	require.NoError(t, err)
+	require.Equal(t, 365, createTimeout)
+	require.Equal(t, 30, scheduleTimeout)
 }
 
 func TestCreateV1HandlerSSEDoesNotReportUnconfirmedTimeoutAsRunning(t *testing.T) {

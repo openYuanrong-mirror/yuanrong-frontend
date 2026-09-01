@@ -73,6 +73,7 @@ const (
 	sandboxInitTimeoutSeconds     = 305
 	sandboxCreateTimeoutSeconds   = sandboxDefaultScheduleSeconds + sandboxInitTimeoutSeconds +
 		sandboxScheduleBufferSeconds
+	sandboxInvokeTimeoutSeconds     = 60
 	sandboxDefaultCPU               = 1000
 	sandboxDefaultMemory            = 2048
 	sandboxGracefulShutdownSeconds  = 5
@@ -1708,28 +1709,42 @@ func resolveSandboxCreateTimeouts(requestedCreate, requestedSchedule int) (int, 
 	if createTimeout == 0 && scheduleTimeout == 0 {
 		scheduleTimeout = sandboxDefaultScheduleSeconds
 		createTimeout = getSandboxCreateTimeoutSeconds(0)
+		minimumCreateTimeout := scheduleTimeout + createReserve
+		if createTimeout < minimumCreateTimeout {
+			log.GetLogger().Warnf(
+				"YR_SANDBOX_CREATE_TIMEOUT=%d uses the legacy create budget; expanding it to %d",
+				createTimeout, minimumCreateTimeout,
+			)
+			createTimeout = minimumCreateTimeout
+		}
+		return createTimeout, scheduleTimeout, nil
 	}
 	if createTimeout == 0 {
 		return scheduleTimeout + createReserve, scheduleTimeout, nil
 	}
 	if scheduleTimeout == 0 {
-		if createTimeout <= createReserve {
+		if createTimeout <= sandboxScheduleBufferSeconds {
 			return 0, 0, fmt.Errorf(
-				"createTimeoutSeconds must be greater than %d", createReserve,
+				"createTimeoutSeconds must be greater than %d", sandboxScheduleBufferSeconds,
 			)
 		}
-		return createTimeout, createTimeout - createReserve, nil
+		legacyScheduleTimeout := createTimeout - sandboxScheduleBufferSeconds
+		return legacyScheduleTimeout + createReserve, legacyScheduleTimeout, nil
 	}
 	if scheduleTimeout > createTimeout {
 		return 0, 0, fmt.Errorf(
 			"scheduleTimeoutSeconds must be less than or equal to createTimeoutSeconds",
 		)
 	}
-	if createTimeout-scheduleTimeout < createReserve {
+	remainingCreateBudget := createTimeout - scheduleTimeout
+	if remainingCreateBudget < sandboxScheduleBufferSeconds {
 		return 0, 0, fmt.Errorf(
 			"createTimeoutSeconds - scheduleTimeoutSeconds must be at least %d",
-			createReserve,
+			sandboxScheduleBufferSeconds,
 		)
+	}
+	if remainingCreateBudget < createReserve {
+		return scheduleTimeout + createReserve, scheduleTimeout, nil
 	}
 	return createTimeout, scheduleTimeout, nil
 }
@@ -1967,7 +1982,7 @@ func InvokeV1Handler(ctx *gin.Context) {
 		instanceID:  instanceID,
 		action:      req.Action,
 		args:        req.Args,
-		timeout:     sandboxCreateTimeoutSeconds,
+		timeout:     sandboxInvokeTimeoutSeconds,
 		traceID:     traceID,
 		traceParent: ctx.Request.Header.Get(constant.HeaderTraceParent),
 	})
