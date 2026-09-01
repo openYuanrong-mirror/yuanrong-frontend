@@ -66,13 +66,15 @@ import (
 const (
 	// Sandbox v1 always executes through the dedicated Rust slot (rrt).
 	// The public runtime field selects only the sandbox isolation runtime.
-	defaultSandboxRuntime           = "rrt"
-	defaultSandboxFunctionID        = "default/0-defaultservice-rrt/$latest"
-	sandboxCreateTimeoutSeconds     = 60
-	sandboxScheduleBufferSeconds    = 30
+	defaultSandboxRuntime         = "rrt"
+	defaultSandboxFunctionID      = "default/0-defaultservice-rrt/$latest"
+	sandboxDefaultScheduleSeconds = 30
+	sandboxScheduleBufferSeconds  = 30
+	sandboxInitTimeoutSeconds     = 305
+	sandboxCreateTimeoutSeconds   = sandboxDefaultScheduleSeconds + sandboxInitTimeoutSeconds +
+		sandboxScheduleBufferSeconds
 	sandboxDefaultCPU               = 1000
 	sandboxDefaultMemory            = 2048
-	sandboxInitTimeoutSeconds       = 305
 	sandboxGracefulShutdownSeconds  = 5
 	sandboxDirectoryQuotaMB         = 512
 	sandboxInstanceType             = "reserved"
@@ -237,8 +239,8 @@ type CreateRequest struct {
 	// Optional logical create budget. A positive request value overrides the
 	// environment and default without changing the legacy request shape.
 	CreateTimeoutSeconds int `json:"createTimeoutSeconds"`
-	// Optional scheduling budget. When only one timeout is supplied, the other
-	// is derived using sandboxScheduleBufferSeconds.
+	// Optional scheduling budget. The logical create budget must also cover the
+	// runtime initialization budget and the frontend response buffer.
 	ScheduleTimeoutSeconds int `json:"scheduleTimeoutSeconds"`
 	// nameGenerated marks an anonymous request whose instance name was assigned
 	// by this frontend. It is excluded from JSON and request digests.
@@ -1702,29 +1704,31 @@ func resolveSandboxCreateTimeouts(requestedCreate, requestedSchedule int) (int, 
 
 	createTimeout := requestedCreate
 	scheduleTimeout := requestedSchedule
+	const createReserve = sandboxInitTimeoutSeconds + sandboxScheduleBufferSeconds
 	if createTimeout == 0 && scheduleTimeout == 0 {
+		scheduleTimeout = sandboxDefaultScheduleSeconds
 		createTimeout = getSandboxCreateTimeoutSeconds(0)
 	}
 	if createTimeout == 0 {
-		return scheduleTimeout + sandboxScheduleBufferSeconds, scheduleTimeout, nil
+		return scheduleTimeout + createReserve, scheduleTimeout, nil
 	}
 	if scheduleTimeout == 0 {
-		if createTimeout <= sandboxScheduleBufferSeconds {
+		if createTimeout <= createReserve {
 			return 0, 0, fmt.Errorf(
-				"createTimeoutSeconds must be greater than %d", sandboxScheduleBufferSeconds,
+				"createTimeoutSeconds must be greater than %d", createReserve,
 			)
 		}
-		return createTimeout, createTimeout - sandboxScheduleBufferSeconds, nil
+		return createTimeout, createTimeout - createReserve, nil
 	}
 	if scheduleTimeout > createTimeout {
 		return 0, 0, fmt.Errorf(
 			"scheduleTimeoutSeconds must be less than or equal to createTimeoutSeconds",
 		)
 	}
-	if createTimeout-scheduleTimeout < sandboxScheduleBufferSeconds {
+	if createTimeout-scheduleTimeout < createReserve {
 		return 0, 0, fmt.Errorf(
 			"createTimeoutSeconds - scheduleTimeoutSeconds must be at least %d",
-			sandboxScheduleBufferSeconds,
+			createReserve,
 		)
 	}
 	return createTimeout, scheduleTimeout, nil

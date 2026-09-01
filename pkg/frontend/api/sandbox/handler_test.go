@@ -2337,25 +2337,25 @@ func TestSandboxCreateReplayStoreReplaysCompletedError(t *testing.T) {
 var timeoutTestCases = []sandboxTimeoutTestCase{
 	{
 		name:         "default create derives schedule",
-		wantCreate:   60,
+		wantCreate:   365,
 		wantSchedule: 30,
 	},
 	{
 		name:          "create derives schedule",
-		createTimeout: 120,
-		wantCreate:    120,
+		createTimeout: 425,
+		wantCreate:    425,
 		wantSchedule:  90,
 	},
 	{
 		name:            "schedule derives create",
 		scheduleTimeout: 90,
-		wantCreate:      120,
+		wantCreate:      425,
 		wantSchedule:    90,
 	},
 	{
-		name:             "create must exceed buffer",
-		createTimeout:    30,
-		wantErrorMessage: "createTimeoutSeconds must be greater than 30",
+		name:             "create must exceed init and response reserve",
+		createTimeout:    335,
+		wantErrorMessage: "createTimeoutSeconds must be greater than 335",
 	},
 	{
 		name:             "create must be positive",
@@ -2369,22 +2369,22 @@ var timeoutTestCases = []sandboxTimeoutTestCase{
 	},
 	{
 		name:             "schedule must not exceed create",
-		createTimeout:    60,
-		scheduleTimeout:  70,
+		createTimeout:    400,
+		scheduleTimeout:  410,
 		wantErrorMessage: "scheduleTimeoutSeconds must be less than or equal to createTimeoutSeconds",
 	},
 	{
-		name:             "explicit timeouts must reserve buffer",
-		createTimeout:    60,
-		scheduleTimeout:  45,
-		wantErrorMessage: "createTimeoutSeconds - scheduleTimeoutSeconds must be at least 30",
+		name:             "explicit timeouts must reserve init and response budgets",
+		createTimeout:    400,
+		scheduleTimeout:  80,
+		wantErrorMessage: "createTimeoutSeconds - scheduleTimeoutSeconds must be at least 335",
 	},
 	{
 		name:            "explicit timeouts preserve caller budgets",
-		createTimeout:   120,
-		scheduleTimeout: 80,
-		wantCreate:      120,
-		wantSchedule:    80,
+		createTimeout:   500,
+		scheduleTimeout: 100,
+		wantCreate:      500,
+		wantSchedule:    100,
 	},
 }
 

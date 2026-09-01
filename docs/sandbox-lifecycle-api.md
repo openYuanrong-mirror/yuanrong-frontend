@@ -62,7 +62,10 @@ resolved create budget and scheduling budget to the invocation; a create that
 does not reach RUNNING before its create budget finishes is an ordinary-HTTP
 `500` or an SSE final event with `status: "timeout"`. They are separate from
 the Snapshot/Pause logical checkpoint timeout and SDK transport buffer
-described below.
+described below. The create budget must cover the scheduling budget, the
+305-second runtime initialization budget, and a 30-second Frontend response
+buffer. When only the scheduling budget is supplied, Frontend derives the
+create budget by adding those 335 seconds.
 
 For a snapshot create, positive `cpu` or `memory` values override the template.
 Omitted, zero, and `null` values preserve template inheritance: `null`
