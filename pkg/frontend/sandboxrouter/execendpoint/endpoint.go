@@ -32,6 +32,15 @@ import (
 	"time"
 )
 
+const (
+	// StatusRunning mirrors FunctionSystem's RUNNING InstanceState.
+	StatusRunning int32 = 3
+	// StatusFailed mirrors FunctionSystem's FAILED InstanceState.
+	StatusFailed int32 = 4
+	// StatusFatal mirrors FunctionSystem's FATAL InstanceState.
+	StatusFatal int32 = 6
+)
+
 // Endpoint is the minimal backend coordinate the exec path needs for one
 // instance: where to dial (ProxyGrpcAddress) and which container to exec into
 // (ContainerID).
