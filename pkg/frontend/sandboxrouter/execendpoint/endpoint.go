@@ -37,6 +37,10 @@ import (
 const (
 	// StatusRunning mirrors FunctionSystem's RUNNING InstanceState.
 	StatusRunning int32 = 3
+	// StatusFailed mirrors FunctionSystem's FAILED InstanceState.
+	StatusFailed int32 = 4
+	// StatusFatal mirrors FunctionSystem's FATAL InstanceState.
+	StatusFatal int32 = 6
 	// StatusPaused mirrors FunctionSystem's PAUSED InstanceState.
 	StatusPaused int32 = 13
 
