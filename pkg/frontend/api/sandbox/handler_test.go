@@ -1353,6 +1353,72 @@ func TestCreateV1HandlerRejectsRootfsImageAlias(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "image rootfs requires imageurl")
 }
 
+func TestCreateV1HandlerForwardsInheritedImageEntrypoint(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "sandbox-entrypoint", nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{"rootfs":{"type":"image","imageurl":"example/image:latest"},"inheritEntrypoint":true}`)
+	var err error
+	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, "true", capturedInvokeOpt.CustomExtensions["inherit_entrypoint"])
+}
+
+func TestCreateV1HandlerOmitsInheritedImageEntrypointByDefault(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "sandbox-no-entrypoint", nil
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{"rootfs":{"type":"image","imageurl":"example/image:latest"}}`)
+	var err error
+	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
+	require.NoError(t, err)
+
+	CreateV1Handler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotContains(t, capturedInvokeOpt.CustomExtensions, "inherit_entrypoint")
+}
+
+func TestCreateV1HandlerRejectsInheritedEntrypointWithoutFreshImage(t *testing.T) {
+	tests := []string{
+		`{"rootfs":{"type":"local","path":"/rootfs"},"inheritEntrypoint":true}`,
+		`{"rootfs":{"type":"s3","storageInfo":{"endpoint":"e","bucket":"b","object":"o"}},"inheritEntrypoint":true}`,
+		`{"rootfs":{"type":"image","imageurl":"example/image:latest"},"snapshotId":"snapshot-1","inheritEntrypoint":true}`,
+	}
+	for _, body := range tests {
+		t.Run(body, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			var err error
+			ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", strings.NewReader(body))
+			require.NoError(t, err)
+
+			CreateV1Handler(ctx)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
+			require.Contains(t, recorder.Body.String(), "inheritEntrypoint")
+		})
+	}
+}
+
 func TestCreateV1HandlerPreservesRuntimeOnlyRootfsOverlay(t *testing.T) {
 	var capturedInvokeOpt api.InvokeOptions
 	setAPIClientsForTest(t, &runtimeStub{
