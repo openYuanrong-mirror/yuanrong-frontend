@@ -1351,6 +1351,18 @@ func DeleteHandler(ctx *gin.Context) {
 				gin.H{"code": 404, "message": fmt.Sprintf("instance not found: %s", instanceID)})
 			return
 		}
+		// A non-routable terminal state (FATAL/FAILED) reaches the owning proxy only
+		// via the summary fallback, and the proxy answers route-stale/owner-unknown
+		// because the backend already cleared the instance. The etcd key is gone but
+		// the summary cache is retained (so GET-before-DELETE still reports the final
+		// failure state); drop the residual cache and treat the delete as complete.
+		if lookupAgentInstanceSummaryExists(instanceID) {
+			execendpoint.Default().Delete(instanceID)
+			log.GetLogger().Infof("agent instance %s kill failed (%v) but summary remained; cleared residual cache",
+				instanceID, err)
+			ctx.JSON(http.StatusOK, gin.H{"code": 200, "status": "deleted"})
+			return
+		}
 		log.GetLogger().Errorf("failed to kill agent instance %s: %v", instanceID, err)
 		ctx.JSON(http.StatusInternalServerError,
 			gin.H{"code": 500, "message": fmt.Sprintf("failed to delete agent: %v", err)})
@@ -1382,7 +1394,11 @@ func isAgentInstanceNotFound(err error) bool {
 // waitForAgentInstanceDeleted polls until the instance is gone from both the
 // routable table and the execendpoint summary cache. The summary cache is
 // watcher-driven and clears only on the etcd DELETE event, so its absence
-// implies the backend has deleted the instance key.
+// implies the backend has deleted the instance key. A terminal state
+// (FATAL/FAILED) is retained by the watcher's EventDelete branch so
+// GET-after-failure still reports the final state; once the routable table has
+// cleared, that retention is the only reason the summary lingers, so it is
+// dropped here instead of waiting out the full poll timeout.
 func waitForAgentInstanceDeleted(ctx *gin.Context, instanceID string) bool {
 	const (
 		pollInterval = 200 * time.Millisecond
@@ -1395,9 +1411,17 @@ func waitForAgentInstanceDeleted(ctx *gin.Context, instanceID string) bool {
 			return false
 		default:
 		}
-		if instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID) == nil &&
-			!lookupAgentInstanceSummaryExists(instanceID) {
-			return true
+		if instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID) == nil {
+			if !lookupAgentInstanceSummaryExists(instanceID) {
+				return true
+			}
+			// Backend deleted the instance; a lingering summary must be a terminal
+			// state retained by the watcher's EventDelete branch — clear and done.
+			if summary, ok := execendpoint.Default().GetSummary(instanceID); ok &&
+				(summary.StatusCode == execendpoint.StatusFatal || summary.StatusCode == execendpoint.StatusFailed) {
+				execendpoint.Default().Delete(instanceID)
+				return true
+			}
 		}
 		time.Sleep(pollInterval)
 	}
