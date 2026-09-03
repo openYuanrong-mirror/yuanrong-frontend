@@ -233,19 +233,20 @@ type CreateRequest struct {
 	// It is deliberately not part of the public SDK request contract.
 	portRouteKinds map[int]string
 	// Resource and runtime extras (honored by v1 create; 0/nil = use default).
-	Cpu            int                      `json:"cpu"`
-	Memory         int                      `json:"memory"`
-	CpuLimit       int                      `json:"cpu_limit"`
-	MemLimit       int                      `json:"mem_limit"`
-	Env            map[string]string        `json:"env"`
-	Mounts         []map[string]interface{} `json:"mounts"`
-	ExtraConfig    map[string]interface{}   `json:"extra_config"`
-	XPU            string                   `json:"xpu"`
-	StorageMb      *int64                   `json:"storageMb,omitempty"`
-	StorageLimitMb int64                    `json:"storage_limit_mb"`
-	Network        *SandboxNetworkPolicy    `json:"network,omitempty"`
-	SnapshotID     string                   `json:"snapshotId,omitempty"`
-	Failover       bool                     `json:"failover"`
+	Cpu               int                      `json:"cpu"`
+	Memory            int                      `json:"memory"`
+	CpuLimit          int                      `json:"cpu_limit"`
+	MemLimit          int                      `json:"mem_limit"`
+	Env               map[string]string        `json:"env"`
+	Mounts            []map[string]interface{} `json:"mounts"`
+	ExtraConfig       map[string]interface{}   `json:"extra_config"`
+	XPU               string                   `json:"xpu"`
+	StorageMb         *int64                   `json:"storageMb,omitempty"`
+	StorageLimitMb    int64                    `json:"storage_limit_mb"`
+	Network           *SandboxNetworkPolicy    `json:"network,omitempty"`
+	SnapshotID        string                   `json:"snapshotId,omitempty"`
+	Failover          bool                     `json:"failover"`
+	InheritEntrypoint bool                     `json:"inheritEntrypoint,omitempty"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -379,6 +380,7 @@ type CreateV1Request struct {
 	Network                *SandboxNetworkPolicy    `json:"network,omitempty"`
 	SnapshotID             string                   `json:"snapshotId,omitempty"`
 	Failover               bool                     `json:"failover"`
+	InheritEntrypoint      bool                     `json:"inheritEntrypoint,omitempty"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
 	InitCallTimeoutSeconds int                      `json:"initCallTimeoutSeconds,omitempty"`
@@ -721,6 +723,15 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	rootfs, err := buildRootfsOption(req.Rootfs, req.Image)
 	if err != nil {
 		return "", nil, err
+	}
+	if req.InheritEntrypoint {
+		resolvedRootfs, image := normalizeRootfsSpec(req.Rootfs, req.Image)
+		if strings.TrimSpace(req.SnapshotID) != "" {
+			return "", nil, fmt.Errorf("inheritEntrypoint cannot be combined with snapshotId")
+		}
+		if resolvedRootfs.Type != "image" || image == "" {
+			return "", nil, fmt.Errorf("inheritEntrypoint requires an image rootfs")
+		}
 	}
 	network, err := normalizeSandboxNetworkPolicy(req.Network)
 	if err != nil {
@@ -1161,6 +1172,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		ScheduleAffinities:     req.ScheduleAffinities,
 		SnapshotID:             strings.TrimSpace(req.SnapshotID),
 		Failover:               req.Failover,
+		InheritEntrypoint:      req.InheritEntrypoint,
 		CreateTimeoutSeconds:   req.CreateTimeoutSeconds,
 		ScheduleTimeoutSeconds: req.ScheduleTimeoutSeconds,
 		InitCallTimeoutSeconds: req.InitCallTimeoutSeconds,
@@ -1926,6 +1938,9 @@ func fillSandboxCustomExtensions(
 	}
 	if rootfs != "" {
 		invokeOpts.CustomExtensions["rootfs"] = rootfs
+	}
+	if req.InheritEntrypoint {
+		invokeOpts.CustomExtensions["inherit_entrypoint"] = "true"
 	}
 	if len(req.Mounts) > 0 {
 		if mountsJSON, err := json.Marshal(req.Mounts); err == nil {
