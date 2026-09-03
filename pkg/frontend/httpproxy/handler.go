@@ -26,13 +26,16 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
+	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/frontend/wsproxy"
 )
@@ -63,6 +66,20 @@ var routeQueryKeys = map[string]struct{}{
 // clean 4xx/502 can be written; once Hijack takes the connection there is no
 // HTTP layer left to report errors on.
 func HandleHTTP(w http.ResponseWriter, r *http.Request) {
+	// Boundary logging (RFC 0016): the trace middleware on /serverless/v1/http has
+	// already resolved X-Trace-Id (external or minted); echo it on the response and
+	// emit enter/exit keyed by instance_id once routing is known.
+	traceID := r.Header.Get(constant.HeaderTraceID)
+	instanceID := strings.TrimSpace(r.URL.Query().Get("instance"))
+	start := time.Now()
+	log.GetLogger().Info(fmt.Sprintf("[agent.http.enter] httpproxy trace_id=%s instance_id=%s",
+		traceID, instanceID))
+	w.Header().Set(constant.HeaderTraceID, traceID)
+	defer func() {
+		log.GetLogger().Info(fmt.Sprintf("[agent.http.exit] httpproxy trace_id=%s instance_id=%s cost_ms=%d",
+			traceID, instanceID, time.Since(start).Milliseconds()))
+	}()
+
 	pr, ok := rewriteRequest(w, r)
 	if !ok {
 		return
