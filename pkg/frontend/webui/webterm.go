@@ -751,7 +751,14 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer releaseGrpcConn(info.ProxyGrpcAddress)
 
 	sessionID := uuid.New().String()
-	log.GetLogger().Infof("WebSocket client connected, session: %s", sessionID)
+	traceID := query.Get("trace")
+	logFields := fmt.Sprintf("session: %s instance: %s", sessionID, instance)
+	if traceID != "" {
+		logFields = fmt.Sprintf("%s trace_id=%s", logFields, traceID)
+	}
+	// Neutral tag: /terminal/ws serves yrcli exec/cp, the web terminal and
+	// sandbox cp alike; trace_id appears only when the caller supplied trace=.
+	log.GetLogger().Infof("[terminal.ws.enter] WebSocket client connected, %s", logFields)
 
 	// Support multi-value command= params (new format: each argv element is a separate param)
 	// and legacy single-value format (space-separated string, e.g. "echo hello").
@@ -1060,7 +1067,12 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	<-done
-	log.GetLogger().Infof("Session %s disconnected", sessionID)
+	if traceID != "" {
+		log.GetLogger().Infof("[terminal.ws.exit] Session %s instance: %s trace_id=%s disconnected",
+			sessionID, instance, traceID)
+	} else {
+		log.GetLogger().Infof("Session %s disconnected", sessionID)
+	}
 }
 
 // HandleInstances returns RUNNING instance list from the local instance watcher cache.

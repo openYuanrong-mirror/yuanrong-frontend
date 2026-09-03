@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 
+	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/logger/log"
 	fronttls "frontend/pkg/common/faas_common/tls"
 	"frontend/pkg/common/faas_common/types"
@@ -92,7 +93,7 @@ func dialSandboxTunnel(w http.ResponseWriter, r *http.Request) (tunnelContext, b
 	if !ok {
 		return tunnelContext{}, false
 	}
-	return dialInstanceTunnel(w, instanceID, port, tunnelAddress)
+	return dialInstanceTunnel(w, r, instanceID, port, tunnelAddress)
 }
 
 // DialSandboxTunnel is the exported entry point for sibling packages (e.g.
@@ -132,7 +133,7 @@ func resolveAndAuthorize(w http.ResponseWriter, r *http.Request, tenantID, insta
 
 // dialInstanceTunnel loads the platform TLS config and dials the function_proxy
 // tcp.tunnel. Writes a clean HTTP status on failure and returns ok=false.
-func dialInstanceTunnel(w http.ResponseWriter, instanceID string, port int,
+func dialInstanceTunnel(w http.ResponseWriter, r *http.Request, instanceID string, port int,
 	tunnelAddress string) (tunnelContext, bool) {
 	tunnelTLSConfig, terr := loadTunnelTLSConfig()
 	if terr != nil {
@@ -141,22 +142,29 @@ func dialInstanceTunnel(w http.ResponseWriter, instanceID string, port int,
 		return tunnelContext{}, false
 	}
 	requestID := newRequestID()
+	// Prefer the external X-Trace-Id (resolved/echoed by the trace middleware on
+	// /serverless/v1/{ws,http}); fall back to the minted requestID so the tunnel
+	// header always carries a usable correlation id.
+	traceID := r.Header.Get(constant.HeaderTraceID)
+	if traceID == "" {
+		traceID = requestID
+	}
 	tunnelConn, err := dialTunnel(tunnelAddress, tunnelTLSConfig, tunnelHeader{
 		TunnelVersion: tunnelVersion,
 		InstanceID:    instanceID,
 		Protocol:      "tcp",
 		TargetPort:    port,
 		RequestID:     requestID,
-		TraceID:       requestID,
+		TraceID:       traceID,
 	})
 	if err != nil {
-		log.GetLogger().Infof("wsproxy dialTunnel instance=%s port=%d failed: %v",
-			instanceID, port, err)
+		log.GetLogger().Infof("wsproxy dialTunnel instance=%s port=%d trace_id=%s failed: %v",
+			instanceID, port, traceID, err)
 		http.Error(w, "failed to dial sandbox", http.StatusBadGateway)
 		return tunnelContext{}, false
 	}
-	log.GetLogger().Infof("wsproxy tunnel established instance=%s port=%d requestID=%s",
-		instanceID, port, requestID)
+	log.GetLogger().Infof("wsproxy tunnel established instance=%s port=%d requestID=%s trace_id=%s",
+		instanceID, port, requestID, traceID)
 	return tunnelContext{tunnelConn: tunnelConn, instanceID: instanceID, port: port, requestID: requestID}, true
 }
 

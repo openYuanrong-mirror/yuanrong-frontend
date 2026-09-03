@@ -217,6 +217,7 @@ func InitRoute(r *gin.Engine) {
 
 	// agent management (create/kill/get/list by user function URN, with workspace/user/userid)
 	agentGroup := r.Group("/api/agent")
+	agentGroup.Use(agentTraceMiddleware)
 	{
 		agentGroup.POST("", agent.CreateHandler)
 		agentGroup.POST("/:instanceId/invoke", agent.InvokeHandler)
@@ -245,12 +246,13 @@ func InitRoute(r *gin.Engine) {
 
 	// Agent WS passthrough: L4-tunnel external WebSocket connections through
 	// to an in-sandbox AgentServer (reuses function_proxy tcp.tunnel).
-	r.GET("/serverless/v1/ws", gin.WrapF(wsproxy.HandleWebSocket))
+	// traceHTTPHandler resolves/echoes X-Trace-Id before the upgrade handshake.
+	r.GET("/serverless/v1/ws", traceHTTPHandler(wsproxy.HandleWebSocket))
 
 	// HTTP passthrough: L4-tunnel external HTTP requests through to an
 	// in-sandbox HTTP server (reuses function_proxy tcp.tunnel).
-	r.Any("/serverless/v1/http", gin.WrapF(httpproxy.HandleHTTP))
-	r.Any("/serverless/v1/http/*splat", gin.WrapF(httpproxy.HandleHTTP))
+	r.Any("/serverless/v1/http", traceHTTPHandler(httpproxy.HandleHTTP))
+	r.Any("/serverless/v1/http/*splat", traceHTTPHandler(httpproxy.HandleHTTP))
 
 	// Function invoke tool (requires authentication)
 	r.GET("/functions", gin.WrapF(webui.HandleInvokePage))
