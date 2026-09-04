@@ -1089,13 +1089,34 @@ func HandleInstances(w http.ResponseWriter, r *http.Request) {
 	}
 
 	summaries := lookupLocalInstanceSummaries(tenantID, instanceID)
+	var instances []map[string]interface{}
 	total := len(summaries)
-	if paginated {
-		summaries = paginateInstanceSummaries(summaries, page, pageSize)
+	if instanceID != "" && total == 0 {
+		// The watcher starts asynchronously and can briefly lag a newly created
+		// sandbox. For an exact lookup, ask the authoritative master once rather
+		// than turning a cache miss into a false "sandbox not found" result.
+		var response InstanceListResponse
+		if err := queryMasterFunc("/instance-manager/query-tenant-instances", map[string]string{
+			"tenant_id":   tenantID,
+			"instance_id": instanceID,
+			"fields":      "summary",
+		}, &response); err != nil {
+			log.GetLogger().Infof("Failed to resolve instance %s from master after local cache miss: %v", instanceID, err)
+			writeMasterQueryError(w, err, http.StatusBadGateway)
+			return
+		}
+		instances = summarizeInstances(response)
+		total = len(instances)
+		if paginated && page > 1 {
+			instances = []map[string]interface{}{}
+		}
+	} else {
+		if paginated {
+			summaries = paginateInstanceSummaries(summaries, page, pageSize)
+		}
+		instances = summarizeLocalInstanceSummaries(summaries)
 	}
 
-	// Convert to frontend expected format (simplified instance info)
-	instances := summarizeLocalInstanceSummaries(summaries)
 	if paginated {
 		err := json.NewEncoder(w).Encode(paginatedInstanceListResponse{
 			Instances: instances,

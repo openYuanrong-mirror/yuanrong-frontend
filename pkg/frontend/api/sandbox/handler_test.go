@@ -155,6 +155,10 @@ func (r *directRuntimeStub) InvokeRaw(req util.DirectRawRequest) ([]byte, error)
 }
 
 func (r *directRuntimeStub) KillInstance(req util.DirectKillRequest) error {
+	if r.runtime.killRaw != nil {
+		_, err := r.KillInstanceWithResponse(req)
+		return err
+	}
 	return r.runtime.Kill(req.InstanceID, req.Signal, req.Payload, req.AdaptedInvokeOptions())
 }
 
@@ -1271,6 +1275,10 @@ func TestCreateV1HandlerDefaultsAndReturnsSandboxID(t *testing.T) {
 	body, err := json.Marshal(CreateV1Request{
 		Image:              "ubuntu:22.04",
 		IdleTimeoutSeconds: 123,
+		DataPlane: &SandboxDataPlanePolicy{
+			TunnelSecurityMode:      SandboxDataPlaneSecurityTLSToken,
+			PortForwardSecurityMode: SandboxDataPlaneSecurityTLS,
+		},
 	})
 	require.NoError(t, err)
 	ctx.Request, err = http.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
@@ -1283,6 +1291,8 @@ func TestCreateV1HandlerDefaultsAndReturnsSandboxID(t *testing.T) {
 	require.Equal(t, defaultSandboxFunctionID, capturedCreateReq.GetFunction())
 	require.True(t, strings.HasPrefix(capturedCreateReq.GetDesignatedInstanceID(), "default-sandbox-"))
 	require.Equal(t, "123", capturedInvokeOpt.CustomExtensions["idle_timeout"])
+	require.Equal(t, "tls-token", capturedInvokeOpt.CustomExtensions["data_plane_tunnel_security_mode"])
+	require.Equal(t, "tls", capturedInvokeOpt.CustomExtensions["data_plane_port_forward_security_mode"])
 	require.JSONEq(
 		t,
 		`{"runtime":"runsc","type":"image","imageurl":"ubuntu:22.04"}`,
@@ -1570,7 +1580,19 @@ func TestCreateV1HandlerPassesS3RootfsAndRequiredNodeAffinity(t *testing.T) {
 	require.JSONEq(t, `{"seccomp":"strict"}`, createOptions["extra_config"])
 	require.JSONEq(
 		t,
-		`{"RRT_HTTP_PORT":"50090","SANDBOX_ENV":"enabled"}`,
+		`{
+			"RRT_HTTP_PORT":"50090",
+			"RRT_COMMAND_RESULT_TTL_SECS":"3600",
+			"RRT_COMMAND_STDOUT_LIMIT_BYTES":"4194304",
+			"RRT_COMMAND_STDERR_LIMIT_BYTES":"4194304",
+			"RRT_COMMAND_REGISTRY_MAX_RECORDS":"4096",
+			"RRT_COMMAND_REGISTRY_MAX_BYTES":"268435456",
+			"RRT_COMMAND_REGISTRY_MEMORY_HIGH_WATERMARK_BYTES":"201326592",
+			"RRT_COMMAND_ACTIVITY_HEARTBEAT_SECS":"10",
+			"RRT_COMMAND_WATCH_MAX_SUBSCRIPTIONS":"4096",
+			"RRT_COMMAND_WATCH_MAX_FRAME_BYTES":"1048576",
+			"SANDBOX_ENV":"enabled"
+		}`,
 		createOptions[constant.DelegateEnvVar],
 	)
 
@@ -2406,6 +2428,166 @@ func TestSandboxCreateReplayStoreReplaysCompletedError(t *testing.T) {
 	require.Equal(t, 1, createCalls)
 }
 
+func TestSandboxCreateReplayStoreEvictsOldestCompletedResult(t *testing.T) {
+	now := time.Unix(100, 0)
+	store := newSandboxCreateReplayStore(time.Minute, 2)
+	store.now = func() time.Time { return now }
+	createCalls := make(map[string]int)
+	create := func(key string) func() (sandboxCreateResult, error) {
+		return func() (sandboxCreateResult, error) {
+			createCalls[key]++
+			return sandboxCreateResult{
+				instanceID: fmt.Sprintf("%s-%d", key, createCalls[key]),
+				status:     sandboxCreateStatusRunning,
+			}, nil
+		}
+	}
+
+	_, _, _ = store.do("a", "a", [32]byte{1}, create("a"))
+	now = now.Add(time.Second)
+	_, _, _ = store.do("b", "b", [32]byte{2}, create("b"))
+	now = now.Add(time.Second)
+	_, _, _ = store.do("c", "c", [32]byte{3}, create("c"))
+
+	b, bErr, bReuse := store.do("b", "b", [32]byte{2}, create("b"))
+	a, aErr, aReuse := store.do("a", "a", [32]byte{1}, create("a"))
+
+	require.NoError(t, bErr)
+	require.NoError(t, aErr)
+	require.Equal(t, sandboxCreateReuseCompleted, bReuse)
+	require.Equal(t, sandboxCreateReuseNone, aReuse)
+	require.Equal(t, "b-1", b.instanceID)
+	require.Equal(t, "a-2", a.instanceID)
+}
+
+func TestSandboxCreateReplayStoreBackgroundCleanupExpiresCompletedResults(t *testing.T) {
+	now := time.Unix(100, 0)
+	store := newSandboxCreateReplayStore(time.Second, 10)
+	store.now = func() time.Time { return now }
+	_, _, _ = store.do("expired", "expired", [32]byte{1}, func() (sandboxCreateResult, error) {
+		return sandboxCreateResult{instanceID: "sandbox-expired"}, nil
+	})
+
+	now = now.Add(2 * time.Second)
+	store.cleanup(now, sandboxCreateReplayCleanupBatch)
+
+	store.mu.Lock()
+	_, exists := store.entries["expired"]
+	store.mu.Unlock()
+	require.False(t, exists)
+}
+
+func TestSandboxCreateReplayStoreCleanupIsBounded(t *testing.T) {
+	now := time.Unix(100, 0)
+	store := newSandboxCreateReplayStore(time.Second, 10)
+	store.now = func() time.Time { return now }
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("expired-%d", i)
+		_, _, _ = store.do(key, key, [32]byte{byte(i + 1)}, func() (sandboxCreateResult, error) {
+			return sandboxCreateResult{instanceID: key}, nil
+		})
+	}
+
+	now = now.Add(2 * time.Second)
+	store.cleanup(now, 2)
+
+	store.mu.Lock()
+	require.Len(t, store.entries, 1)
+	store.mu.Unlock()
+	store.cleanup(now, 2)
+	store.mu.Lock()
+	require.Empty(t, store.entries)
+	store.mu.Unlock()
+}
+
+func TestSandboxCreateReplayStoreCoalescesConcurrentRequest(t *testing.T) {
+	store := newSandboxCreateReplayStore(time.Minute, 10)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var createCalls atomic.Int32
+	create := func() (sandboxCreateResult, error) {
+		createCalls.Add(1)
+		close(started)
+		<-release
+		return sandboxCreateResult{instanceID: "sandbox-concurrent"}, nil
+	}
+
+	type replayResult struct {
+		result sandboxCreateResult
+		err    error
+		reuse  sandboxCreateReuse
+	}
+	results := make(chan replayResult, 2)
+	go func() {
+		result, err, reuse := store.do("same", "same", [32]byte{1}, create)
+		results <- replayResult{result: result, err: err, reuse: reuse}
+	}()
+	<-started
+	go func() {
+		result, err, reuse := store.do("same", "same", [32]byte{1}, create)
+		results <- replayResult{result: result, err: err, reuse: reuse}
+	}()
+	close(release)
+
+	first := <-results
+	second := <-results
+	require.NoError(t, first.err)
+	require.NoError(t, second.err)
+	require.Equal(t, "sandbox-concurrent", first.result.instanceID)
+	require.Equal(t, "sandbox-concurrent", second.result.instanceID)
+	reuses := []sandboxCreateReuse{first.reuse, second.reuse}
+	require.Contains(t, reuses, sandboxCreateReuseNone)
+	if first.reuse != sandboxCreateReuseNone {
+		require.Contains(t, []sandboxCreateReuse{sandboxCreateReuseInflight, sandboxCreateReuseCompleted}, first.reuse)
+	}
+	if second.reuse != sandboxCreateReuseNone {
+		require.Contains(t, []sandboxCreateReuse{sandboxCreateReuseInflight, sandboxCreateReuseCompleted}, second.reuse)
+	}
+	require.Equal(t, int32(1), createCalls.Load())
+}
+
+func BenchmarkSandboxCreateReplayStoreAtCapacity(b *testing.B) {
+	store := newSandboxCreateReplayStore(time.Hour, 10000)
+	digest := [32]byte{1}
+	for i := 0; i < store.maxEntries; i++ {
+		key := fmt.Sprintf("seed-%d", i)
+		_, _, _ = store.do(key, key, digest, func() (sandboxCreateResult, error) {
+			return sandboxCreateResult{instanceID: key}, nil
+		})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("benchmark-%d", i)
+		_, _, _ = store.do(key, key, digest, func() (sandboxCreateResult, error) {
+			return sandboxCreateResult{instanceID: key}, nil
+		})
+	}
+}
+
+func BenchmarkSandboxCreateReplayStoreAtCapacityParallel(b *testing.B) {
+	store := newSandboxCreateReplayStore(time.Hour, 10000)
+	digest := [32]byte{1}
+	for i := 0; i < store.maxEntries; i++ {
+		key := fmt.Sprintf("parallel-seed-%d", i)
+		_, _, _ = store.do(key, key, digest, func() (sandboxCreateResult, error) {
+			return sandboxCreateResult{instanceID: key}, nil
+		})
+	}
+
+	var sequence atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := sequence.Add(1)
+			key := fmt.Sprintf("parallel-benchmark-%d", id)
+			_, _, _ = store.do(key, key, digest, func() (sandboxCreateResult, error) {
+				return sandboxCreateResult{instanceID: key}, nil
+			})
+		}
+	})
+}
+
 var timeoutTestCases = []sandboxTimeoutTestCase{
 	{
 		name:         "default create derives schedule",
@@ -2577,6 +2759,16 @@ func TestCreateV1HandlerFrontendOwnsTunnelSetup(t *testing.T) {
 	assertTunnelResponse(t, recorder)
 }
 
+func TestPrepareSandboxRRTHTTPUsesPlatformCommandBudgets(t *testing.T) {
+	t.Setenv("YR_RRT_COMMAND_STDOUT_LIMIT_BYTES", "1024")
+	req := &CreateV1Request{Env: map[string]string{
+		"RRT_COMMAND_STDOUT_LIMIT_BYTES": "untrusted-user-value",
+	}}
+	prepareSandboxRRTHTTP(req)
+	require.Equal(t, "1024", req.Env["RRT_COMMAND_STDOUT_LIMIT_BYTES"])
+	require.Equal(t, "50090", req.Env["RRT_HTTP_PORT"])
+}
+
 func assertTunnelCreateOptions(t *testing.T, capturedInvokeOpt api.InvokeOptions) {
 	t.Helper()
 	require.JSONEq(
@@ -2592,7 +2784,21 @@ func assertTunnelCreateOptions(t *testing.T, capturedInvokeOpt api.InvokeOptions
 	)
 	require.JSONEq(
 		t,
-		`{"RRT_HTTP_PORT":"50090","RRT_TUNNEL_WS_PORT":"8765","RRT_TUNNEL_HTTP_PORT":"8766","USER_ENV":"ok"}`,
+		`{
+			"RRT_HTTP_PORT":"50090",
+			"RRT_TUNNEL_WS_PORT":"8765",
+			"RRT_TUNNEL_HTTP_PORT":"8766",
+			"RRT_COMMAND_RESULT_TTL_SECS":"3600",
+			"RRT_COMMAND_STDOUT_LIMIT_BYTES":"4194304",
+			"RRT_COMMAND_STDERR_LIMIT_BYTES":"4194304",
+			"RRT_COMMAND_REGISTRY_MAX_RECORDS":"4096",
+			"RRT_COMMAND_REGISTRY_MAX_BYTES":"268435456",
+			"RRT_COMMAND_REGISTRY_MEMORY_HIGH_WATERMARK_BYTES":"201326592",
+			"RRT_COMMAND_ACTIVITY_HEARTBEAT_SECS":"10",
+			"RRT_COMMAND_WATCH_MAX_SUBSCRIPTIONS":"4096",
+			"RRT_COMMAND_WATCH_MAX_FRAME_BYTES":"1048576",
+			"USER_ENV":"ok"
+		}`,
 		capturedInvokeOpt.CreateOpt[constant.DelegateEnvVar],
 	)
 }
@@ -3303,6 +3509,29 @@ func TestDeleteHandlerDeletesSandboxInstance(t *testing.T) {
 	var data map[string]string
 	require.NoError(t, json.Unmarshal(resp.Data, &data))
 	require.Equal(t, "deleted", requireStringMapValue(t, data, "status"))
+}
+
+func TestDeleteHandlerForwardsClientRequestID(t *testing.T) {
+	const requestID = "delete-123e4567-e89b-12d3-a456-426614174000"
+	var captured *core.KillRequest
+	setAPIClientsForTest(t, &runtimeStub{
+		killRaw: func(request *core.KillRequest, _ api.RawRequestOption) ([]byte, error) {
+			captured = proto.Clone(request).(*core.KillRequest)
+			return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "instanceId", Value: "sandbox-delete-request-id"}}
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/api/sandbox/sandbox-delete-request-id", nil)
+	ctx.Request.Header.Set(constant.HeaderRequestID, requestID)
+
+	DeleteHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotNil(t, captured)
+	require.Equal(t, requestID, captured.GetRequestID())
 }
 
 func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {

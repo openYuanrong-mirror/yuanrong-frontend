@@ -112,6 +112,9 @@ const (
 	sandboxCreateStatusFailed       = "failed"
 	sandboxCreateReplayTTL          = 10 * time.Minute
 	sandboxCreateReplayMaxEntries   = 10000
+	sandboxCreateReplayCleanupEvery = time.Second
+	sandboxCreateReplayCleanupBatch = 64
+	sandboxCreateReplayCompactAt    = 1024
 	sandboxCreateRequestBodyLimit   = 1 << 20
 	sandboxRawRequestIDLength       = 18
 	sandboxRawRequestSequence       = "00"
@@ -247,6 +250,7 @@ type CreateRequest struct {
 	SnapshotID        string                   `json:"snapshotId,omitempty"`
 	Failover          bool                     `json:"failover"`
 	InheritEntrypoint bool                     `json:"inheritEntrypoint,omitempty"`
+	DataPlane         *SandboxDataPlanePolicy  `json:"dataPlane,omitempty"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -353,6 +357,21 @@ func (policy *SandboxNetworkPolicy) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type SandboxDataPlaneSecurityMode string
+
+const (
+	SandboxDataPlaneSecurityTLS      SandboxDataPlaneSecurityMode = "tls"
+	SandboxDataPlaneSecurityTLSToken SandboxDataPlaneSecurityMode = "tls-token"
+)
+
+// SandboxDataPlanePolicy selects the minimum client-side security for this
+// sandbox. Both modes require TLS; tls-token additionally requires a validated
+// user token. Direct access is fixed to tls-token and has no override.
+type SandboxDataPlanePolicy struct {
+	TunnelSecurityMode      SandboxDataPlaneSecurityMode `json:"tunnelSecurityMode,omitempty"`
+	PortForwardSecurityMode SandboxDataPlaneSecurityMode `json:"portForwardSecurityMode,omitempty"`
+}
+
 // CreateV1Request holds POST /api/sandbox/v1/sandboxes parameters.
 type CreateV1Request struct {
 	Name      string `json:"name"`
@@ -381,6 +400,7 @@ type CreateV1Request struct {
 	SnapshotID             string                   `json:"snapshotId,omitempty"`
 	Failover               bool                     `json:"failover"`
 	InheritEntrypoint      bool                     `json:"inheritEntrypoint,omitempty"`
+	DataPlane              *SandboxDataPlanePolicy  `json:"dataPlane,omitempty"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
 	InitCallTimeoutSeconds int                      `json:"initCallTimeoutSeconds,omitempty"`
@@ -430,12 +450,19 @@ type sandboxCreateReplayEntry struct {
 	completedAt time.Time
 }
 
+type sandboxCreateReplayCompletion struct {
+	key   string
+	entry *sandboxCreateReplayEntry
+}
+
 type sandboxCreateReplayStore struct {
-	mu         sync.Mutex
-	entries    map[string]*sandboxCreateReplayEntry
-	ttl        time.Duration
-	maxEntries int
-	now        func() time.Time
+	mu              sync.Mutex
+	entries         map[string]*sandboxCreateReplayEntry
+	completionQueue []sandboxCreateReplayCompletion
+	completionHead  int
+	ttl             time.Duration
+	maxEntries      int
+	now             func() time.Time
 }
 
 type sandboxCreateReuse int
@@ -502,6 +529,10 @@ var createReplayStore = newSandboxCreateReplayStore(
 	sandboxCreateReplayMaxEntries,
 )
 
+func init() {
+	createReplayStore.startCleanup(sandboxCreateReplayCleanupEvery)
+}
+
 func newSandboxCreateReplayStore(ttl time.Duration, maxEntries int) *sandboxCreateReplayStore {
 	return &sandboxCreateReplayStore{
 		entries:    make(map[string]*sandboxCreateReplayEntry),
@@ -509,6 +540,19 @@ func newSandboxCreateReplayStore(ttl time.Duration, maxEntries int) *sandboxCrea
 		maxEntries: maxEntries,
 		now:        time.Now,
 	}
+}
+
+func (store *sandboxCreateReplayStore) startCleanup(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			store.cleanup(store.now(), sandboxCreateReplayCleanupBatch)
+		}
+	}()
 }
 
 func (group *sandboxCreateSingleflight) do(
@@ -552,7 +596,7 @@ func (store *sandboxCreateReplayStore) do(
 ) (sandboxCreateResult, error, sandboxCreateReuse) {
 	store.mu.Lock()
 	now := store.now()
-	store.pruneLocked(now)
+	store.cleanupLocked(now, sandboxCreateReplayCleanupBatch)
 	if entry, ok := store.entries[key]; ok {
 		if entry.digest != digest {
 			store.mu.Unlock()
@@ -582,34 +626,68 @@ func (store *sandboxCreateReplayStore) do(
 	store.mu.Lock()
 	entry.completedAt = store.now()
 	close(entry.done)
-	store.pruneLocked(entry.completedAt)
+	store.completionQueue = append(store.completionQueue, sandboxCreateReplayCompletion{
+		key:   key,
+		entry: entry,
+	})
+	store.cleanupLocked(entry.completedAt, sandboxCreateReplayCleanupBatch)
 	store.mu.Unlock()
 	return entry.result, entry.err, sandboxCreateReuseNone
 }
 
-func (store *sandboxCreateReplayStore) pruneLocked(now time.Time) {
-	for key, entry := range store.entries {
-		if !entry.completedAt.IsZero() && now.Sub(entry.completedAt) >= store.ttl {
-			delete(store.entries, key)
+func (store *sandboxCreateReplayStore) cleanup(now time.Time, expiredLimit int) {
+	store.mu.Lock()
+	store.cleanupLocked(now, expiredLimit)
+	store.mu.Unlock()
+}
+
+// cleanupLocked removes completed entries in completion order. Each queue
+// record is appended and removed once, so expiry and capacity eviction are
+// amortized O(1) instead of scanning the entire replay map per request.
+func (store *sandboxCreateReplayStore) cleanupLocked(now time.Time, expiredLimit int) {
+	expiredRemoved := 0
+	for store.completionHead < len(store.completionQueue) {
+		record := store.completionQueue[store.completionHead]
+		entry, exists := store.entries[record.key]
+		if !exists || entry != record.entry {
+			store.popCompletionLocked()
+			continue
+		}
+
+		overCapacity := store.maxEntries > 0 && len(store.entries) > store.maxEntries
+		expired := store.ttl <= 0 || !now.Before(entry.completedAt.Add(store.ttl))
+		if !overCapacity && (!expired || expiredRemoved >= expiredLimit) {
+			break
+		}
+
+		delete(store.entries, record.key)
+		store.popCompletionLocked()
+		if expired {
+			expiredRemoved++
 		}
 	}
-	for store.maxEntries > 0 && len(store.entries) > store.maxEntries {
-		var oldestKey string
-		var oldest time.Time
-		for key, entry := range store.entries {
-			if entry.completedAt.IsZero() {
-				continue
-			}
-			if oldestKey == "" || entry.completedAt.Before(oldest) {
-				oldestKey = key
-				oldest = entry.completedAt
-			}
-		}
-		if oldestKey == "" {
-			return
-		}
-		delete(store.entries, oldestKey)
+	store.compactCompletionQueueLocked()
+}
+
+func (store *sandboxCreateReplayStore) popCompletionLocked() {
+	store.completionQueue[store.completionHead] = sandboxCreateReplayCompletion{}
+	store.completionHead++
+}
+
+func (store *sandboxCreateReplayStore) compactCompletionQueueLocked() {
+	if store.completionHead == len(store.completionQueue) {
+		store.completionQueue = nil
+		store.completionHead = 0
+		return
 	}
+	if store.completionHead < sandboxCreateReplayCompactAt ||
+		store.completionHead*2 < len(store.completionQueue) {
+		return
+	}
+	remaining := copy(store.completionQueue, store.completionQueue[store.completionHead:])
+	clear(store.completionQueue[remaining:])
+	store.completionQueue = store.completionQueue[:remaining]
+	store.completionHead = 0
 }
 
 // InvokeV1Request is the single data-plane envelope for file/process/shell actions.
@@ -720,6 +798,9 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if err := validateSandboxStorage(req.StorageMb, req.StorageLimitMb); err != nil {
 		return "", nil, err
 	}
+	if err := validateSandboxDataPlanePolicy(req.DataPlane); err != nil {
+		return "", nil, err
+	}
 	rootfs, err := buildRootfsOption(req.Rootfs, req.Image)
 	if err != nil {
 		return "", nil, err
@@ -740,6 +821,21 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	req.Network = network
 	prepareSandboxRRTHTTP(req)
 	return rootfs, prepareSandboxTunnel(req), nil
+}
+
+func validateSandboxDataPlanePolicy(policy *SandboxDataPlanePolicy) error {
+	if policy == nil {
+		return nil
+	}
+	for name, mode := range map[string]SandboxDataPlaneSecurityMode{
+		"tunnelSecurityMode":      policy.TunnelSecurityMode,
+		"portForwardSecurityMode": policy.PortForwardSecurityMode,
+	} {
+		if mode != "" && mode != SandboxDataPlaneSecurityTLS && mode != SandboxDataPlaneSecurityTLSToken {
+			return fmt.Errorf("dataPlane.%s must be tls or tls-token", name)
+		}
+	}
+	return nil
 }
 
 func parseSandboxXPU(value string) (*sandboxXPURequest, error) {
@@ -1169,6 +1265,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		StorageMb:              req.StorageMb,
 		StorageLimitMb:         req.StorageLimitMb,
 		Network:                req.Network,
+		DataPlane:              req.DataPlane,
 		ScheduleAffinities:     req.ScheduleAffinities,
 		SnapshotID:             strings.TrimSpace(req.SnapshotID),
 		Failover:               req.Failover,
@@ -1239,6 +1336,33 @@ func prepareSandboxRRTHTTP(req *CreateV1Request) {
 	// Frontend owns the direct-invoke RRT HTTP server port. SDK callers use
 	// /direct/{safeID}/invoke and never need to know or set RRT_HTTP_PORT.
 	req.Env["RRT_HTTP_PORT"] = strconv.Itoa(sandboxDefaultRRTHTTPPort)
+	// Command recovery budgets are platform-owned. Copy the resolved Frontend
+	// deployment values into every RRT sandbox so users cannot silently disable
+	// retention, output bounds, watch activity leasing, or registry limits.
+	commandEnvDefaults := map[string]string{
+		"RRT_COMMAND_RESULT_TTL_SECS":                      "3600",
+		"RRT_COMMAND_STDOUT_LIMIT_BYTES":                   "4194304",
+		"RRT_COMMAND_STDERR_LIMIT_BYTES":                   "4194304",
+		"RRT_COMMAND_REGISTRY_MAX_RECORDS":                 "4096",
+		"RRT_COMMAND_REGISTRY_MAX_BYTES":                   "268435456",
+		"RRT_COMMAND_REGISTRY_MEMORY_HIGH_WATERMARK_BYTES": "201326592",
+		"RRT_COMMAND_ACTIVITY_HEARTBEAT_SECS":              "10",
+		"RRT_COMMAND_WATCH_MAX_SUBSCRIPTIONS":              "4096",
+		"RRT_COMMAND_WATCH_MAX_FRAME_BYTES":                "1048576",
+	}
+	for key, fallback := range commandEnvDefaults {
+		deploymentKey := "YR_" + key
+		if key == "RRT_COMMAND_WATCH_MAX_SUBSCRIPTIONS" {
+			deploymentKey = "YR_COMMAND_WATCH_MAX_SUBSCRIPTIONS_PER_CONNECTION"
+		} else if key == "RRT_COMMAND_WATCH_MAX_FRAME_BYTES" {
+			deploymentKey = "YR_COMMAND_WATCH_MAX_FRAME_BYTES"
+		}
+		value := strings.TrimSpace(os.Getenv(deploymentKey))
+		if value == "" {
+			value = fallback
+		}
+		req.Env[key] = value
+	}
 }
 
 func usesSandboxRRTRuntime(runtime string) bool {
@@ -1962,6 +2086,16 @@ func fillSandboxCustomExtensions(
 			return fmt.Errorf("failed to marshal sandbox network policy: %w", err)
 		}
 		invokeOpts.CustomExtensions["network_policy"] = string(networkJSON)
+	}
+	if req.DataPlane != nil {
+		if req.DataPlane.TunnelSecurityMode != "" {
+			invokeOpts.CustomExtensions["data_plane_tunnel_security_mode"] =
+				string(req.DataPlane.TunnelSecurityMode)
+		}
+		if req.DataPlane.PortForwardSecurityMode != "" {
+			invokeOpts.CustomExtensions["data_plane_port_forward_security_mode"] =
+				string(req.DataPlane.PortForwardSecurityMode)
+		}
 	}
 	return nil
 }
@@ -2692,7 +2826,8 @@ func isSandboxInstanceRunning(instanceID, functionID, resourceSpecNote string) b
 // DeleteHandler handles DELETE /api/sandbox/:instanceId.
 // It sends a kill signal directly to the sandbox instance via the libruntime API.
 func DeleteHandler(ctx *gin.Context) {
-	ensureSandboxTrace(ctx)
+	traceID := ensureSandboxTrace(ctx)
+	requestID := ensureSandboxRequestID(ctx, traceID)
 	instanceID := ctx.Param("instanceId")
 	if instanceID == "" {
 		instanceID = ctx.Param("sandboxID")
@@ -2719,10 +2854,12 @@ func DeleteHandler(ctx *gin.Context) {
 	if tenantID == "" {
 		tenantID = "default"
 	}
-	invokeOpts := api.InvokeOptions{TraceID: ctx.GetHeader(constant.HeaderTraceID)}
-	if err := util.GetDirectProxyClient().KillInstance(util.NewDirectKillRequest(
+	invokeOpts := api.InvokeOptions{TraceID: traceID}
+	killRequest := util.NewDirectKillRequest(
 		ctx.Request.Context(), instanceID, sandboxKillInstanceSignal, []byte("sandbox deleted"), tenantID, invokeOpts,
-	)); err != nil {
+	)
+	killRequest.RequestID = requestID
+	if err := util.GetDirectProxyClient().KillInstance(killRequest); err != nil {
 		log.GetLogger().Errorf("failed to kill sandbox instance %s: %v", instanceID, err)
 		app.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to delete sandbox: %v", err))
 		return

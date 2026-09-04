@@ -347,7 +347,7 @@ func (g *FunctionInstancesMap) delInstance(funcKey string, instance *types.Insta
 		g.lock.Lock()
 		if resInstancesMap.size() == 0 {
 			delete(g.instancesMap, funcKey)
-			logger.Infof("no instances in funcKey, delete this funcKey map")
+			logger.Debugf("no instances in funcKey, delete this funcKey map")
 		}
 		g.lock.Unlock()
 	}
@@ -463,7 +463,7 @@ func (f *functionInstanceMap) delInstance(instance *types.InstanceSpecification,
 		f.lock.Lock()
 		if q.size() == 0 {
 			delete(f.instanceQueues, resKey.String())
-			logger.Infof("no instances, delete this resKey map")
+			logger.Debugf("no instances, delete this resKey map")
 		}
 		f.lock.Unlock()
 	}
@@ -474,7 +474,7 @@ func (i *functionInstanceQueue) addInstance(instance *types.InstanceSpecificatio
 	defer i.lock.Unlock()
 	i.instances[instance.InstanceID] = instance
 	subject.PublishEvent(subscriber.Update, instance)
-	logger.Infof("add instance ok")
+	logger.Debugf("add instance ok")
 }
 
 func (i *functionInstanceQueue) size() int {
@@ -488,12 +488,12 @@ func (i *functionInstanceQueue) delInstance(instance *types.InstanceSpecificatio
 	defer i.lock.Unlock()
 	_, ok := i.instances[instance.InstanceID]
 	if !ok {
-		logger.Infof("no need delete unexist instance")
+		logger.Debugf("no need delete unexist instance")
 		return
 	}
 	delete(i.instances, instance.InstanceID)
 	subject.PublishEvent(subscriber.Delete, instance)
-	logger.Infof("delete instance ok")
+	logger.Debugf("delete instance ok")
 }
 
 func (i *functionInstanceQueue) getInstance(instanceId string) *types.InstanceSpecification {
