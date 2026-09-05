@@ -39,6 +39,7 @@ const (
 type route struct {
 	InstanceID string
 	TargetPort int
+	TraceID    string
 }
 
 func parseTargetPort(value string) (int, error) {
@@ -71,33 +72,43 @@ func parseRoute(username string) (route, error) {
 	if len(decoded) < 1 {
 		return route{}, fmt.Errorf("instance SSH route requires instanceID")
 	}
-	targetPort, err := parseRouteOptions(decoded[1:])
+	targetPort, traceID, err := parseRouteOptions(decoded[1:])
 	if err != nil {
 		return route{}, err
 	}
-	return route{InstanceID: decoded[0], TargetPort: targetPort}, nil
+	return route{InstanceID: decoded[0], TargetPort: targetPort, TraceID: traceID}, nil
 }
 
-func parseRouteOptions(fields []string) (int, error) {
+// parseRouteOptions consumes the optional key=value fields after the instance id.
+// Supported keys: port=<n> (existing) and trace=<id> (RFC 0016, optional correlation
+// id carried into the tunnel header and boundary logs; truncated to maxRouteField
+// like every other route field). Unknown keys are rejected.
+func parseRouteOptions(fields []string) (int, string, error) {
 	var targetPort int
+	var traceID string
 	for _, field := range fields {
 		key, value, found := strings.Cut(field, "=")
 		if !found || value == "" {
-			return 0, fmt.Errorf("invalid SSH route option %q", field)
+			return 0, "", fmt.Errorf("invalid SSH route option %q", field)
 		}
 		switch key {
 		case "port":
 			if targetPort != 0 {
-				return 0, fmt.Errorf("duplicate SSH route option port")
+				return 0, "", fmt.Errorf("duplicate SSH route option port")
 			}
 			port, err := parseTargetPort(value)
 			if err != nil {
-				return 0, err
+				return 0, "", err
 			}
 			targetPort = port
+		case "trace":
+			if traceID != "" {
+				return 0, "", fmt.Errorf("duplicate SSH route option trace")
+			}
+			traceID = value
 		default:
-			return 0, fmt.Errorf("unsupported SSH route option %q", key)
+			return 0, "", fmt.Errorf("unsupported SSH route option %q", key)
 		}
 	}
-	return targetPort, nil
+	return targetPort, traceID, nil
 }

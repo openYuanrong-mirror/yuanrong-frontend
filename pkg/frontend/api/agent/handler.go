@@ -120,28 +120,28 @@ type agentExecutorHTTPRequest struct {
 }
 
 const (
-	defaultAgentCPU              = 1000
-	defaultAgentMemory           = 2048
-	agentCreateGrpcDeadlineSeconds = 70
+	defaultAgentCPU                   = 1000
+	defaultAgentMemory                = 2048
+	agentCreateGrpcDeadlineSeconds    = 70
 	agentCreateBusinessTimeoutSeconds = 70
-	agentInitTimeoutSeconds      = 305
-	agentGracefulShutdownSeconds = 15
-	agentPreStopTimeoutSeconds   = 10
-	agentShutdownReserveSeconds  = 5
-	defaultRecoverRetryTimes     = 3
-	agentDirectoryQuotaMB        = 512
-	agentInstanceType            = "reserved"
-	agentDelegateDirectory       = "/tmp"
-	agentConcurrency             = "1"
-	agentKillInstanceSignal      = constant.KillSignalVal
-	agentRunningPollTimeout      = 5 * time.Second
-	agentRunningPollInterval     = 200 * time.Millisecond
-	agentCreateTimeoutCode       = 3002
-	agentStorageResourceName     = "storage"
-	agentStorageBytesPerMiB      = 1024 * 1024
-	sshEnableEnv                 = "YR_FRONTEND_SSH_ENABLE"
-	sshPublicKeyDirectoryEnv     = "YR_SSH_BACKEND_PUBLIC_KEY_DIR"
-	sshContainerMountDirectory   = "/run/openyuanrong/ssh"
+	agentInitTimeoutSeconds           = 305
+	agentGracefulShutdownSeconds      = 15
+	agentPreStopTimeoutSeconds        = 10
+	agentShutdownReserveSeconds       = 5
+	defaultRecoverRetryTimes          = 3
+	agentDirectoryQuotaMB             = 512
+	agentInstanceType                 = "reserved"
+	agentDelegateDirectory            = "/tmp"
+	agentConcurrency                  = "1"
+	agentKillInstanceSignal           = constant.KillSignalVal
+	agentRunningPollTimeout           = 5 * time.Second
+	agentRunningPollInterval          = 200 * time.Millisecond
+	agentCreateTimeoutCode            = 3002
+	agentStorageResourceName          = "storage"
+	agentStorageBytesPerMiB           = 1024 * 1024
+	sshEnableEnv                      = "YR_FRONTEND_SSH_ENABLE"
+	sshPublicKeyDirectoryEnv          = "YR_SSH_BACKEND_PUBLIC_KEY_DIR"
+	sshContainerMountDirectory        = "/run/openyuanrong/ssh"
 )
 
 // getAgentExecutorFuncKey maps the requested runtime to the faas system executor function
@@ -223,17 +223,17 @@ type CreateAgentRequest struct {
 // no-op and relies on caller mounts; working_dir/s3 pull the resource from the codePath URI).
 // See design §4.5.1, §6 C4/C8.
 type RuntimeSpec struct {
-	Runtime         string          `json:"runtime,omitempty"`
-	SandboxType     string          `json:"sandbox_type,omitempty"`
-	CodePath        string          `json:"codePath,omitempty"`
-	StorageType     string          `json:"storageType,omitempty"`
-	Handler         string          `json:"handler,omitempty"`
+	Runtime         string           `json:"runtime,omitempty"`
+	SandboxType     string           `json:"sandbox_type,omitempty"`
+	CodePath        string           `json:"codePath,omitempty"`
+	StorageType     string           `json:"storageType,omitempty"`
+	Handler         string           `json:"handler,omitempty"`
 	ExtendedHandler *ExtendedHandler `json:"extendedHandler,omitempty"`
-	Rootfs          *RootfsSpec     `json:"rootfs,omitempty"`
-	Cmds            [][]string      `json:"cmds,omitempty"`
-	Probes          *ProbeSet       `json:"probes,omitempty"`
-	CPU             int             `json:"cpu,omitempty"`
-	Memory          int             `json:"memory,omitempty"`
+	Rootfs          *RootfsSpec      `json:"rootfs,omitempty"`
+	Cmds            [][]string       `json:"cmds,omitempty"`
+	Probes          *ProbeSet        `json:"probes,omitempty"`
+	CPU             int              `json:"cpu,omitempty"`
+	Memory          int              `json:"memory,omitempty"`
 }
 
 // ProbeSet carries the instance-level startup/liveness probes. Exactly one probe
@@ -316,6 +316,8 @@ func CreateHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err))
 		return
 	}
+	exitLog := traceEnter(ctx, "create", "", kv("name", req.Name), kv("ns", req.Namespace))
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 
 	inline := isInlineMode(req)
 	if !inline && req.Urn == "" {
@@ -613,6 +615,7 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest,
 	invokeOpts := api.InvokeOptions{
 		Cpu:              cpu,
 		Memory:           memory,
+		TraceID:          ctx.GetHeader(constant.HeaderTraceID),
 		Timeout:          agentCreateGrpcDeadlineSeconds,
 		CreateOpt:        map[string]string{"create_error_policy": "last_failure_on_timeout"},
 		CustomExtensions: map[string]string{"lifecycle": "detached", "Concurrency": agentConcurrency},
@@ -1250,6 +1253,8 @@ func applyAgentCreateOpts(invokeOpts *api.InvokeOptions, ctx *gin.Context, req C
 		tenantID = "default"
 	}
 	invokeOpts.CreateOpt["tenantId"] = tenantID
+	// Persisted so Get/List can echo the creation trace id back.
+	invokeOpts.CreateOpt["trace_id"] = ctx.GetHeader(constant.HeaderTraceID)
 	if config.inline {
 		invokeOpts.CreateOpt[constant.FunctionKeyNote] = config.funcKey
 	} else {
@@ -1291,6 +1296,8 @@ func createAgentInstance(
 	ctx *gin.Context, req CreateAgentRequest, funcMeta api.FunctionMeta, invokeOpts api.InvokeOptions,
 	args []api.Arg,
 ) {
+	exitLog := traceEnter(ctx, "create", "", kv("name", req.Name), kv("ns", req.Namespace))
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	directReq, err := util.NewDirectCreateRequest(funcMeta, args, invokeOpts)
 	if err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
@@ -1328,6 +1335,8 @@ func DeleteHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
+	exitLog := traceEnter(ctx, "delete", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
 	if tenantID == "" {
 		tenantID = "default"
@@ -1508,6 +1517,7 @@ type InstanceDetail struct {
 	SandboxIP   string             `json:"sandbox_ip,omitempty"`
 	SandboxType string             `json:"sandbox_type,omitempty"`
 	SandboxID   string             `json:"sandbox_id,omitempty"`
+	TraceID     string             `json:"trace_id,omitempty"`
 	Rootfs      *RootfsInfo        `json:"rootfs,omitempty"`
 	Ports       []string           `json:"ports,omitempty"`
 	EnvVars     map[string]string  `json:"env_vars,omitempty"`
@@ -1570,6 +1580,8 @@ type networkJSON struct {
 
 // ListHandler handles GET /api/agent: returns the brief view of every cached (RUNNING) instance.
 func ListHandler(ctx *gin.Context) {
+	exitLog := traceEnter(ctx, "list", "")
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	summaries := lookupAgentInstanceSummaries("", "")
 	instances := make([]InstanceBrief, 0, len(summaries))
 	for _, s := range summaries {
@@ -1592,6 +1604,8 @@ func ListHandler(ctx *gin.Context) {
 // GET /api/agent (no path segment) routes to ListHandler, so :instanceId is never empty here.
 func GetHandler(ctx *gin.Context) {
 	instanceID := ctx.Param("instanceId")
+	exitLog := traceEnter(ctx, "get", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	summaries := lookupAgentInstanceSummaries("", instanceID)
 	if len(summaries) == 0 {
 		ctx.JSON(http.StatusNotFound, gin.H{"code": http.StatusNotFound,
@@ -1644,6 +1658,7 @@ func applyDetailCreateOptions(d *InstanceDetail, opts map[string]string) {
 	d.Rootfs = parseRootfs(opts["rootfs"], opts["host_user"], opts["workspace"], d.InstanceID)
 	d.Ports = parsePorts(opts["network"])
 	d.EnvVars = parseEnvVars(opts["DELEGATE_ENV_VAR"])
+	d.TraceID = opts["trace_id"]
 }
 
 // parseRootfs decodes createOptions["rootfs"] into RootfsInfo. User and workspace come from
@@ -1750,6 +1765,8 @@ func FileUploadHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
+	exitLog := traceEnter(ctx, "upload", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
 	if tenantID == "" {
 		tenantID = "default"
@@ -1903,6 +1920,8 @@ func FileListHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
+	exitLog := traceEnter(ctx, "filelist", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
 	if tenantID == "" {
 		tenantID = "default"
@@ -1956,6 +1975,8 @@ func FileMkdirHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
+	exitLog := traceEnter(ctx, "mkdir", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
 	if tenantID == "" {
 		tenantID = "default"
@@ -2026,6 +2047,8 @@ func FileDownloadHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
+	exitLog := traceEnter(ctx, "download", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
 	if tenantID == "" {
 		tenantID = "default"
@@ -2171,6 +2194,8 @@ func InvokeHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
 		return
 	}
+	exitLog := traceEnter(ctx, "invoke", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 	summaries := lookupAgentInstanceSummaries("", instanceID)
 	if len(summaries) == 0 {
 		ctx.JSON(http.StatusNotFound,
@@ -2280,16 +2305,16 @@ func parseAgentInvokeResponse(raw []byte) (interface{}, error) {
 		payload = payload[constant.LibruntimeHeaderSize:]
 	}
 	var resp struct {
-		Body        interface{} `json:"body"`
-		InnerCode   string      `json:"innerCode,omitempty"`
-		TraceID     string      `json:"traceId,omitempty"`
-		BillingDur  string      `json:"billingDuration,omitempty"`
-		LogResult   string      `json:"logResult,omitempty"`
-		InvokerSum  string      `json:"invokerSummary,omitempty"`
+		Body       interface{} `json:"body"`
+		InnerCode  string      `json:"innerCode,omitempty"`
+		TraceID    string      `json:"traceId,omitempty"`
+		BillingDur string      `json:"billingDuration,omitempty"`
+		LogResult  string      `json:"logResult,omitempty"`
+		InvokerSum string      `json:"invokerSummary,omitempty"`
 	}
 	if err := json.Unmarshal(payload, &resp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal faas call result JSON: %w (payload head=%x)", err,
-		    smallVal[:min(constant.LibruntimeHeaderSize, len(smallVal))])
+			smallVal[:min(constant.LibruntimeHeaderSize, len(smallVal))])
 	}
 	if resp.InnerCode != "" && resp.InnerCode != "0" {
 		return nil, api.ErrorInfo{Code: atoiSafe(resp.InnerCode), Err: fmt.Errorf("faas inner error code %s", resp.InnerCode)}
@@ -2308,3 +2333,47 @@ func atoiSafe(s string) int {
 // agentInvokeTimeout caps a single invoke call. Agent handlers are user code so the
 // default mirrors agent create timeout; can be tuned via flag if needed.
 const agentInvokeTimeout = 0 // 0 = no client-side deadline; runtime/proxy enforce theirs
+
+// traceEnter emits the enter line and returns a closure that emits the matching
+// exit line: each handler emits one [agent.<op>.enter]/[agent.<op>.exit] pair
+// keyed by trace_id=/instance_id= for full-chain grep and delimitation.
+func traceEnter(ctx *gin.Context, op, instanceID string, extra ...traceKV) func(result string) {
+	traceID := ctx.GetHeader(constant.HeaderTraceID)
+	line := fmt.Sprintf("[agent.%s.enter] frontend trace_id=%s", op, traceID)
+	if instanceID != "" {
+		line += " instance_id=" + instanceID
+	}
+	for _, item := range extra {
+		if item.value != "" {
+			line += " " + item.key + "=" + item.value
+		}
+	}
+	log.GetLogger().Info(line)
+	start := time.Now()
+	return func(result string) {
+		if result == "" {
+			result = "OK"
+		}
+		exitLine := fmt.Sprintf("[agent.%s.exit] frontend trace_id=%s result=%s cost_ms=%d",
+			op, traceID, result, time.Since(start).Milliseconds())
+		if instanceID != "" {
+			exitLine += " instance_id=" + instanceID
+		}
+		log.GetLogger().Info(exitLine)
+	}
+}
+
+// traceKV is an optional key=value pair appended to the enter line; empty values are dropped.
+type traceKV struct {
+	key   string
+	value string
+}
+
+func kv(key, value string) traceKV {
+	return traceKV{key: key, value: value}
+}
+
+// resultHTTP renders the HTTP status as the exit result (HTTP:<status>).
+func resultHTTP(status int) string {
+	return fmt.Sprintf("HTTP:%d", status)
+}

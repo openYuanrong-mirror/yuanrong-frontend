@@ -135,9 +135,22 @@ func (s *server) handleConnection(connection net.Conn) {
 	if err != nil {
 		return
 	}
+	// RFC 0016: trace id from the optional trace= username option; SSH has no
+	// HTTP header, so fall back to a minted uuid (same fallback as HTTP paths).
+	traceID := targetRoute.TraceID
+	if traceID == "" {
+		traceID = uuid.NewString()
+	}
+	start := time.Now()
+	log.GetLogger().Info(fmt.Sprintf("[agent.ssh.enter] sshproxy trace_id=%s instance_id=%s",
+		traceID, targetRoute.InstanceID))
+	defer func() {
+		log.GetLogger().Info(fmt.Sprintf("[agent.ssh.exit] sshproxy trace_id=%s instance_id=%s cost_ms=%d",
+			traceID, targetRoute.InstanceID, time.Since(start).Milliseconds()))
+	}()
 	instance, tunnelAddress, err := s.resolveInstance(targetRoute)
 	if err != nil {
-		log.GetLogger().Warnf("resolve frontend SSH target failed: %s", err)
+		log.GetLogger().Warnf("resolve frontend SSH target failed trace_id=%s: %s", traceID, err)
 		return
 	}
 	subject := ""
@@ -145,14 +158,15 @@ func (s *server) handleConnection(connection net.Conn) {
 		subject = clientConn.Permissions.Extensions["subject"]
 	}
 	if err = s.config.authorizer.authorizeResolvedTarget(subject, targetRoute, instance); err != nil {
-		log.GetLogger().Warnf("authorize frontend SSH target failed: %s", err)
+		log.GetLogger().Warnf("authorize frontend SSH target failed trace_id=%s: %s", traceID, err)
 		return
 	}
 	requestID := uuid.NewString()
 	backend, err := s.dialBackend(
-		instance, tunnelAddress, targetRoute.TargetPort, requestID)
+		instance, tunnelAddress, targetRoute.TargetPort, requestID, traceID)
 	if err != nil {
-		log.GetLogger().Warnf("backend SSH handshake for instance %s failed: %s", instance.InstanceID, err)
+		log.GetLogger().Warnf("backend SSH handshake for instance %s trace_id=%s failed: %s",
+			instance.InstanceID, traceID, err)
 		return
 	}
 	defer closeWithLog("frontend SSH tunnel", backend.tunnel)
@@ -169,7 +183,7 @@ func (s *server) handleConnection(connection net.Conn) {
 }
 
 func (s *server) dialBackend(instance *types.InstanceSpecification, tunnelAddress string,
-	targetPort int, requestID string,
+	targetPort int, requestID string, traceID string,
 ) (*backendConnection, error) {
 	backendConfig := &ssh.ClientConfig{
 		User:            instance.CreateOptions[hostUserCreateOption],
@@ -185,7 +199,7 @@ func (s *server) dialBackend(instance *types.InstanceSpecification, tunnelAddres
 			Protocol:      "tcp",
 			TargetPort:    targetPort,
 			RequestID:     requestID,
-			TraceID:       requestID,
+			TraceID:       traceID,
 		})
 		if dialErr == nil {
 			_ = tunnel.SetDeadline(time.Now().Add(backendHandshakeWait))
