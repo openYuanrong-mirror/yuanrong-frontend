@@ -44,7 +44,7 @@ const (
 //     any other state, missing portForward, or unparseable value removes them.
 //
 // It never panics on bad input; malformed data results in the instance having
-// no routes, which the proxy surfaces as 404.
+// no routes; the resolver chooses a lifecycle rejection or a missing-route result.
 func ApplyInstanceEvent(c *Cache, kind EventKind, key string, value []byte) {
 	if kind == EventDelete {
 		c.DeleteInstance(instanceIDFromKey(key))

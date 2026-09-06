@@ -184,8 +184,9 @@ func TestApplyEventCacheableStates(t *testing.T) {
 		json := `{"instanceID":"inst-abc","proxyGrpcAddress":"10.0.0.1:22774",` +
 			`"instanceStatus":{"code":` + strconv.Itoa(int(code)) + `,"msg":"` + name + `"}}`
 		ApplyInstanceEvent(s, EventPut, instanceKey, []byte(json))
-		if _, ok := s.Get("inst-abc"); !ok {
-			t.Errorf("code %d (%s) should be cached as exec endpoint", code, name)
+		wantEndpoint := code != 4 && code != 6 && code != 7
+		if _, ok := s.Get("inst-abc"); ok != wantEndpoint {
+			t.Errorf("code %d (%s) endpoint presence = %v, want %v", code, name, ok, wantEndpoint)
 		}
 		summaries := s.ListSummaries("default", "")
 		if len(summaries) != 1 {
