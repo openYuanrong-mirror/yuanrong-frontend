@@ -48,16 +48,28 @@ var errNoEtcdClient = errors.New("sandboxrouter: router etcd client not initiali
 var ErrAuthoritativeInstanceNotFound = errors.New("authoritative instance not found")
 
 const (
-	instanceRoutePathPrefix   = "/yr/route/business/yrk"
-	defaultReadThroughTimeout = 500 * time.Millisecond
-	functionKeyParts          = 3
+	instanceRoutePathPrefix    = "/yr/route/business/yrk"
+	defaultReadThroughTimeout  = 500 * time.Millisecond
+	defaultFailureRetention    = 10 * time.Minute
+	defaultMaxRetainedFailures = 4096
+	functionKeyParts           = 3
 )
 
 type instanceAuthorityReader interface {
 	ReadInstance(ctx context.Context, instanceID string) (key string, value []byte, err error)
 }
 
+type revisionedInstanceAuthorityReader interface {
+	ReadInstanceWithRevision(context.Context, string) (instanceReadResult, error)
+}
+
 type etcdInstanceAuthorityReader struct{}
+
+type instanceReadResult struct {
+	key      string
+	value    []byte
+	revision int64
+}
 
 type readThroughResult struct {
 	Val interface{}
@@ -122,9 +134,20 @@ type authoritativeRouteInfo struct {
 	InstanceStatus   route.InstanceStatus `json:"instanceStatus"`
 }
 
-func (etcdInstanceAuthorityReader) ReadInstance(
-	ctx context.Context, requestedID string,
-) (string, []byte, error) {
+func (e etcdInstanceAuthorityReader) ReadInstance(ctx context.Context, requestedID string) (string, []byte, error) {
+	return e.readInstance(ctx, requestedID, nil)
+}
+
+func (e etcdInstanceAuthorityReader) ReadInstanceWithRevision(
+	ctx context.Context, id string) (instanceReadResult, error) {
+	var result instanceReadResult
+	var err error
+	result.key, result.value, err = e.readInstance(ctx, id, &result.revision)
+	return result, err
+}
+
+func (etcdInstanceAuthorityReader) readInstance(
+	ctx context.Context, requestedID string, revision *int64) (string, []byte, error) {
 	client := etcd3.GetRouterEtcdClient()
 	if client == nil {
 		return "", nil, errNoEtcdClient
@@ -135,6 +158,9 @@ func (etcdInstanceAuthorityReader) ReadInstance(
 		routeKey, clientv3.WithSerializable())
 	if err != nil {
 		return "", nil, fmt.Errorf("read authoritative route %s: %w", requestedID, err)
+	}
+	if revision != nil && routeResponse != nil && routeResponse.Header != nil {
+		*revision = routeResponse.Header.Revision
 	}
 	if routeResponse == nil || len(routeResponse.Kvs) == 0 {
 		return "", nil, ErrAuthoritativeInstanceNotFound
@@ -218,10 +244,16 @@ func ReadAuthoritativeInstance(ctx context.Context, instanceID string) (*route.I
 // existing etcd watch infrastructure and is fully decoupled from the Traefik
 // etcd-KV registry / HTTP provider.
 type InstanceInfoWatchResolver struct {
-	cache       *route.Cache
-	reader      instanceAuthorityReader
-	readTimeout time.Duration
-	reads       readThroughGroup
+	cache        *route.Cache
+	reader       instanceAuthorityReader
+	readTimeout  time.Duration
+	reads        readThroughGroup
+	mu           sync.RWMutex
+	observations map[string]map[string]*instanceObservation
+	now          func() time.Time
+	retention    time.Duration
+	maxRetained  int
+	nextPrune    time.Time
 }
 
 // NewInstanceInfoWatchResolver returns a resolver with an empty cache.
@@ -244,6 +276,8 @@ func NewInstanceInfoWatchResolverWithTimeout(timeout time.Duration) *InstanceInf
 func newInstanceInfoWatchResolverWithReader(reader instanceAuthorityReader) *InstanceInfoWatchResolver {
 	return &InstanceInfoWatchResolver{
 		cache: route.NewCache(), reader: reader, readTimeout: defaultReadThroughTimeout,
+		observations: make(map[string]map[string]*instanceObservation),
+		now:          time.Now, retention: defaultFailureRetention, maxRetained: defaultMaxRetainedFailures,
 	}
 }
 
@@ -257,6 +291,20 @@ func (r *InstanceInfoWatchResolver) Start(stopCh <-chan struct{}) error {
 	}
 	watcher := etcd3.NewEtcdWatcher(constant.InstancePathPrefix, sandboxInstanceFilter, r.applyEvent, stopCh, client)
 	watcher.StartWatch()
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				r.mu.Lock()
+				r.pruneLocked()
+				r.mu.Unlock()
+			}
+		}
+	}()
 	log.GetLogger().Infof("sandboxrouter: watching instance info under %s", constant.InstancePathPrefix)
 	return nil
 }
@@ -265,10 +313,8 @@ func (r *InstanceInfoWatchResolver) Start(stopCh <-chan struct{}) error {
 // locally cached PAUSED state, performs one bounded authoritative ETCD
 // read-through. Concurrent misses for the same instance are coalesced.
 func (r *InstanceInfoWatchResolver) Resolve(ctx context.Context, key route.Key) (*route.Target, error) {
-	if !execendpoint.Default().IsPaused(key.SafeInstanceID) {
-		if target, err := r.cache.Get(key); err == nil {
-			return target, nil
-		}
+	if target, err := r.cachedTarget(key); target != nil || err != nil {
+		return target, err
 	}
 	if r.reader == nil {
 		return nil, fmt.Errorf("sandboxrouter authority reader is unavailable")
@@ -276,13 +322,8 @@ func (r *InstanceInfoWatchResolver) Resolve(ctx context.Context, key route.Key) 
 	readCtx, cancel := context.WithTimeout(ctx, r.readTimeout)
 	defer cancel()
 	result := r.reads.DoChan(key.SafeInstanceID, func() (interface{}, error) {
-		// A caller may observe a miss before another read-through populates
-		// the cache, but enter the group after that call has completed. Recheck
-		// inside the shared operation to avoid a redundant authoritative read.
-		if !execendpoint.Default().IsPaused(key.SafeInstanceID) {
-			if _, err := r.cache.Get(key); err == nil {
-				return nil, nil
-			}
+		if target, err := r.cachedTarget(key); target != nil || err != nil {
+			return nil, err
 		}
 		return r.refreshInstance(readCtx, key.SafeInstanceID)
 	})
@@ -294,42 +335,67 @@ func (r *InstanceInfoWatchResolver) Resolve(ctx context.Context, key route.Key) 
 			return nil, outcome.Err
 		}
 	}
-	if execendpoint.Default().IsPaused(key.SafeInstanceID) {
-		return nil, route.ErrInstancePaused
-	}
-	return r.cache.Get(key)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneLocked()
+	return r.resultLocked(key)
 }
 
 func (r *InstanceInfoWatchResolver) refreshInstance(
 	ctx context.Context, safeID string,
 ) (*route.InstanceInfo, error) {
-	key, value, err := r.reader.ReadInstance(ctx, safeID)
-	if err != nil {
-		if errors.Is(err, ErrAuthoritativeInstanceNotFound) {
+	r.mu.Lock()
+	before := r.observations[safeID]
+	// Copy the observation pointers: every update replaces its pointer. A
+	// concurrent watch update must win over this potentially older etcd read.
+	snapshot := copyObservations(before)
+	r.mu.Unlock()
+	var key string
+	var value []byte
+	var revision int64
+	var err error
+	if reader, ok := r.reader.(revisionedInstanceAuthorityReader); ok {
+		result, readErr := reader.ReadInstanceWithRevision(ctx, safeID)
+		if readErr != nil {
+			if !errors.Is(readErr, ErrAuthoritativeInstanceNotFound) {
+				return nil, fmt.Errorf("authoritative route read failed: %w", readErr)
+			}
+		}
+		key, value, revision = result.key, result.value, result.revision
+		err = readErr
+	} else {
+		key, value, err = r.reader.ReadInstance(ctx, safeID)
+		if err != nil {
+			if !errors.Is(err, ErrAuthoritativeInstanceNotFound) {
+				return nil, fmt.Errorf("authoritative route read failed: %w", err)
+			}
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !sameObservations(snapshot, r.observations[safeID]) {
+		return nil, nil
+	}
+	if errors.Is(err, ErrAuthoritativeInstanceNotFound) {
+		for _, observed := range r.observations[safeID] {
+			r.deleteLocked(observed.key, nil, revision)
+		}
+		// Clear an unobserved legacy cache entry, but do not remove a newer
+		// RUNNING route when deleteLocked rejected an older etcd snapshot.
+		if len(r.observations[safeID]) == 0 {
 			r.cache.DeleteInstance(safeID)
 			execendpoint.Default().Delete(safeID)
-			log.GetLogger().Infof(
-				"sandboxrouter: authoritative route absent, cache cleared instanceID=%s", safeID)
-			return nil, route.ErrRouteNotFound
 		}
-		log.GetLogger().Warnf(
-			"sandboxrouter: authoritative read-through failed instanceID=%s err=%s", safeID, err.Error())
-		return nil, fmt.Errorf("authoritative route read failed: %w", err)
+		return nil, nil
 	}
 	var info route.InstanceInfo
 	if err := json.Unmarshal(value, &info); err != nil {
 		return nil, fmt.Errorf("decode read-through InstanceInfo: %w", err)
 	}
-	r.applyPut(key, value)
-	if execendpoint.Default().IsPaused(safeID) {
-		log.GetLogger().Infof(
-			"sandboxrouter: authoritative PAUSED installed instanceID=%s version=%d owner=%s",
-			safeID, info.Version, info.FunctionProxyID)
-		return &info, route.ErrInstancePaused
+	if route.SanitizeID(info.InstanceID) != safeID {
+		return nil, fmt.Errorf("authoritative instance identity mismatch for %s", safeID)
 	}
-	log.GetLogger().Infof(
-		"sandboxrouter: authoritative RUNNING winner installed instanceID=%s version=%d owner=%s route=%s",
-		safeID, info.Version, info.FunctionProxyID, info.ProxyGrpcAddress)
+	r.putLocked(key, value, revision)
 	return &info, nil
 }
 
@@ -339,18 +405,19 @@ func (r *InstanceInfoWatchResolver) refreshInstance(
 // terminal / file-copy exec path can resolve an instance's proxyGrpcAddress
 // locally instead of querying the master, reusing this one watch.
 func (r *InstanceInfoWatchResolver) applyEvent(event *etcd3.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneLocked()
 	switch event.Type {
 	case etcd3.PUT:
-		r.applyPut(event.Key, event.Value)
+		r.putLocked(event.Key, event.Value, event.Rev)
 	case etcd3.DELETE:
-		route.ApplyInstanceEvent(r.cache, route.EventDelete, event.Key, event.PrevValue)
-		execendpoint.ApplyInstanceEvent(execendpoint.Default(), execendpoint.EventDelete, event.Key, event.PrevValue)
+		r.deleteLocked(event.Key, event.PrevValue, event.Rev)
 	}
 }
 
 func (r *InstanceInfoWatchResolver) applyPut(key string, value []byte) {
-	route.ApplyInstanceEvent(r.cache, route.EventPut, key, value)
-	execendpoint.ApplyInstanceEvent(execendpoint.Default(), execendpoint.EventPut, key, value)
+	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: key, Value: value})
 }
 
 // sandboxInstanceFilter returns true to SKIP an event. It keeps only full

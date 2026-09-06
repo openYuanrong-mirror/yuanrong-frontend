@@ -41,6 +41,8 @@ const (
 	StatusFailed int32 = 4
 	// StatusFatal mirrors FunctionSystem's FATAL InstanceState.
 	StatusFatal int32 = 6
+	// StatusScheduleFailed mirrors FunctionSystem's SCHEDULE_FAILED InstanceState.
+	StatusScheduleFailed int32 = 7
 	// StatusPaused mirrors FunctionSystem's PAUSED InstanceState.
 	StatusPaused int32 = 13
 

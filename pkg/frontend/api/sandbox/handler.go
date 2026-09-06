@@ -1463,8 +1463,11 @@ func sandboxCreateRequestDigest(
 }
 
 func sandboxInstanceExists(instanceID string) bool {
-	_, ok := execendpoint.Default().GetSummary(instanceID)
-	return ok
+	summary, ok := execendpoint.Default().GetSummary(instanceID)
+	// Terminal summaries can outlive their instance records for diagnostics.
+	// Let the authoritative create reject any remaining name conflict.
+	return ok && summary.StatusCode != execendpoint.StatusFatal &&
+		summary.StatusCode != execendpoint.StatusScheduleFailed
 }
 
 func isSandboxInstanceDuplicated(err error) bool {

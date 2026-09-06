@@ -85,9 +85,8 @@ type instanceExecInfo struct {
 // ApplyInstanceEvent updates the cache for one /sn/instance watch event:
 //   - DELETE removes the instance's endpoint and summary (instanceID recovered from the key).
 //   - PUT of a cacheable state adds/replaces its summary. If it also has a
-//     non-empty proxyGrpcAddress, it adds/replaces its exec endpoint. PAUSED is
-//     cacheable but never carries a routable endpoint, so it keeps its summary
-//     while its exec endpoint is dropped.
+//     non-empty proxyGrpcAddress, it adds/replaces its exec endpoint. PAUSED and
+//     failed states retain their summary but drop their exec endpoint.
 //   - PUT of a non-cacheable state or unparseable value removes cached data.
 //
 // It never panics on bad input; malformed data results in the instance having
@@ -148,7 +147,9 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 		CreateOptions:  copyStringMap(info.CreateOptions),
 	})
 
-	if info.ProxyGrpcAddress == "" {
+	if info.ProxyGrpcAddress == "" || info.InstanceStatus.Code == StatusPaused ||
+		info.InstanceStatus.Code == StatusFatal || info.InstanceStatus.Code == StatusFailed ||
+		info.InstanceStatus.Code == StatusScheduleFailed {
 		s.DeleteEndpoint(id)
 		return
 	}

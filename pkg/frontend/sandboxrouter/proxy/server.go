@@ -47,6 +47,7 @@ type Resolver interface {
 type reqInfo struct {
 	parsed                *route.ParsedRequest
 	target                *route.Target
+	payload               *jwtauth.JWTPayload
 	frontendProxied       bool
 	frontendAuthenticated bool
 }
@@ -180,7 +181,7 @@ func New(r Resolver) *Server {
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite:      s.rewrite,
 		Transport:    roundTripperFunc(s.roundTrip),
-		ErrorHandler: errorHandler,
+		ErrorHandler: s.handleProxyError,
 	}
 	return s
 }
@@ -270,6 +271,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, targetForLog 
 	}
 
 	target, err := s.resolver.Resolve(r.Context(), parsed.Key)
+	if failure := instanceFailure(err); failure != nil {
+		s.writeInstanceFailure(w, r, parsed.Key, failure, jwtPayload)
+		return
+	}
 	if errors.Is(err, route.ErrInstancePaused) {
 		http.Error(w, "instance paused", http.StatusConflict)
 		return
@@ -304,6 +309,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, targetForLog 
 	ctx := context.WithValue(r.Context(), reqInfoKey, &reqInfo{
 		parsed:                parsed,
 		target:                target,
+		payload:               jwtPayload,
 		frontendProxied:       frontendProxied,
 		frontendAuthenticated: frontendAuthenticated,
 	})
