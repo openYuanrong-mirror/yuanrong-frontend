@@ -21,13 +21,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"frontend/pkg/common/faas_common/etcd3"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"frontend/pkg/common/faas_common/etcd3"
 	"github.com/stretchr/testify/require"
 
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"

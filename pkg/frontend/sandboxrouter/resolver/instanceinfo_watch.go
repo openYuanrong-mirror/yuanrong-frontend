@@ -59,6 +59,10 @@ type instanceAuthorityReader interface {
 	ReadInstance(ctx context.Context, instanceID string) (key string, value []byte, err error)
 }
 
+type revisionedInstanceAuthorityReader interface {
+	ReadInstanceWithRevision(context.Context, string) (instanceReadResult, error)
+}
+
 type etcdInstanceAuthorityReader struct{}
 
 type instanceReadResult struct {
@@ -350,19 +354,21 @@ func (r *InstanceInfoWatchResolver) refreshInstance(
 	var value []byte
 	var revision int64
 	var err error
-	if reader, ok := r.reader.(interface {
-		ReadInstanceWithRevision(context.Context, string) (instanceReadResult, error)
-	}); ok {
-		var result instanceReadResult
-		result, err = reader.ReadInstanceWithRevision(ctx, safeID)
-		if err != nil && !errors.Is(err, ErrAuthoritativeInstanceNotFound) {
-			return nil, fmt.Errorf("authoritative route read failed: %w", err)
+	if reader, ok := r.reader.(revisionedInstanceAuthorityReader); ok {
+		result, readErr := reader.ReadInstanceWithRevision(ctx, safeID)
+		if readErr != nil {
+			if !errors.Is(readErr, ErrAuthoritativeInstanceNotFound) {
+				return nil, fmt.Errorf("authoritative route read failed: %w", readErr)
+			}
 		}
 		key, value, revision = result.key, result.value, result.revision
+		err = readErr
 	} else {
 		key, value, err = r.reader.ReadInstance(ctx, safeID)
-		if err != nil && !errors.Is(err, ErrAuthoritativeInstanceNotFound) {
-			return nil, fmt.Errorf("authoritative route read failed: %w", err)
+		if err != nil {
+			if !errors.Is(err, ErrAuthoritativeInstanceNotFound) {
+				return nil, fmt.Errorf("authoritative route read failed: %w", err)
+			}
 		}
 	}
 	r.mu.Lock()
