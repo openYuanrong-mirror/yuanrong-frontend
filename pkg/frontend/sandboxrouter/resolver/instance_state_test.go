@@ -27,9 +27,9 @@ import (
 	"testing"
 	"time"
 
+	"frontend/pkg/common/faas_common/etcd3"
 	"github.com/stretchr/testify/require"
 
-	"frontend/pkg/common/faas_common/etcd3"
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 	"frontend/pkg/frontend/sandboxrouter/proxy"
 	"frontend/pkg/frontend/sandboxrouter/route"

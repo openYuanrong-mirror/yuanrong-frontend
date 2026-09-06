@@ -355,12 +355,15 @@ func (r *InstanceInfoWatchResolver) refreshInstance(
 	}); ok {
 		var result instanceReadResult
 		result, err = reader.ReadInstanceWithRevision(ctx, safeID)
+		if err != nil && !errors.Is(err, ErrAuthoritativeInstanceNotFound) {
+			return nil, fmt.Errorf("authoritative route read failed: %w", err)
+		}
 		key, value, revision = result.key, result.value, result.revision
 	} else {
 		key, value, err = r.reader.ReadInstance(ctx, safeID)
-	}
-	if err != nil && !errors.Is(err, ErrAuthoritativeInstanceNotFound) {
-		return nil, fmt.Errorf("authoritative route read failed: %w", err)
+		if err != nil && !errors.Is(err, ErrAuthoritativeInstanceNotFound) {
+			return nil, fmt.Errorf("authoritative route read failed: %w", err)
+		}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
