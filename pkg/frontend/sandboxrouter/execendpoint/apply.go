@@ -148,7 +148,8 @@ func ApplyInstanceEvent(s *Store, kind EventKind, key string, value []byte) {
 	})
 
 	if info.ProxyGrpcAddress == "" || info.InstanceStatus.Code == StatusPaused ||
-		info.InstanceStatus.Code == StatusFatal || info.InstanceStatus.Code == StatusFailed || info.InstanceStatus.Code == StatusScheduleFailed {
+		info.InstanceStatus.Code == StatusFatal || info.InstanceStatus.Code == StatusFailed ||
+		info.InstanceStatus.Code == StatusScheduleFailed {
 		s.DeleteEndpoint(id)
 		return
 	}

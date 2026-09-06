@@ -21,7 +21,9 @@ import (
 	"errors"
 	"net/http"
 
+	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/frontend/common/jwtauth"
+	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 	"frontend/pkg/frontend/sandboxrouter/route"
 )
 
@@ -52,23 +54,29 @@ func (s *Server) writeInstanceFailure(w http.ResponseWriter, r *http.Request, ke
 	response := failureResponse{Code: "SANDBOX_EXITED", State: "FATAL", Message: "sandbox has exited"}
 	status := http.StatusGone
 	switch failure.Status.Code {
-	case 4:
+	case execendpoint.StatusFailed:
 		status = http.StatusServiceUnavailable
-		response.Code, response.State, response.Message, response.Retryable = "SANDBOX_RECOVERING", "FAILED", "sandbox is recovering", true
-	case 7:
+		response.Code, response.State = "SANDBOX_RECOVERING", "FAILED"
+		response.Message, response.Retryable = "sandbox is recovering", true
+	case execendpoint.StatusScheduleFailed:
 		status = http.StatusConflict
-		response.Code, response.State, response.Message = "SANDBOX_SCHEDULE_FAILED", "SCHEDULE_FAILED", "sandbox scheduling failed"
+		response.Code, response.State = "SANDBOX_SCHEDULE_FAILED", "SCHEDULE_FAILED"
+		response.Message = "sandbox scheduling failed"
 	}
 	if detailed {
 		response.InstanceID = failure.InstanceID
 		if failure.Status.Msg != "" {
 			response.Message = failure.Status.Msg
 		}
-		response.ExitCode, response.ExitType, response.ErrCode = &failure.Status.ExitCode, &failure.Status.Type, &failure.Status.ErrCode
+		response.ExitCode = &failure.Status.ExitCode
+		response.ExitType = &failure.Status.Type
+		response.ErrCode = &failure.Status.ErrCode
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.GetLogger().Warnf("failed to write sandbox failure response: %v", err)
+	}
 }
 
 type runtimeFailureLookup interface {
@@ -79,7 +87,8 @@ func (s *Server) handleProxyError(w http.ResponseWriter, r *http.Request, err er
 	lookup, ok := s.resolver.(runtimeFailureLookup)
 	info, _ := r.Context().Value(reqInfoKey).(*reqInfo)
 	if ok && info != nil {
-		if failure := lookup.FailureForRuntime(info.parsed.Key, info.target.InstanceID, info.target.RuntimeID); failure != nil && failure.Tenant == info.target.Tenant {
+		failure := lookup.FailureForRuntime(info.parsed.Key, info.target.InstanceID, info.target.RuntimeID)
+		if failure != nil && failure.Tenant == info.target.Tenant {
 			s.writeInstanceFailure(w, r, info.parsed.Key, failure, info.payload)
 			return
 		}

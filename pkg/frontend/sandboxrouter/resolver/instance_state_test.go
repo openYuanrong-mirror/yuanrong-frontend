@@ -27,20 +27,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"frontend/pkg/common/faas_common/etcd3"
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 	"frontend/pkg/frontend/sandboxrouter/proxy"
 	"frontend/pkg/frontend/sandboxrouter/route"
 )
 
-func failureJSON(id, runtime string, state int, version int) []byte {
-	return []byte(fmt.Sprintf(`{"instanceID":%q,"tenantID":"tenant-a","runtimeID":%q,"version":%d,"proxyGrpcAddress":"10.0.0.1:22772","instanceStatus":{"code":%d,"exitCode":137,"type":5,"errCode":100,"msg":"sandbox was oom-killed"}}`, id, runtime, version, state))
+const (
+	testFailureVersion        = 4
+	testOldGenerationVersion  = 40
+	testReadGenerationVersion = 50
+	testFailureControlPort    = 8765
+	testFailureExitCode       = 137
+	testEpochSeconds          = 1000
+	testExpiryGrace           = 2 * time.Minute
+)
+
+func failureJSON(id, runtime string, state int32, version int) []byte {
+	return []byte(fmt.Sprintf(`{"instanceID":%q,"tenantID":"tenant-a","runtimeID":%q,"version":%d,`+
+		`"proxyGrpcAddress":"10.0.0.1:22772","instanceStatus":{"code":%d,"exitCode":%d,"type":5,`+
+		`"errCode":100,"msg":"sandbox was oom-killed"}}`, id, runtime, version, state, testFailureExitCode))
 }
 
-func requireFailure(t *testing.T, err error, state int) *route.InstanceFailure {
+func requireFailure(t *testing.T, err error, state int32) *route.InstanceFailure {
 	t.Helper()
 	var failure *route.InstanceFailure
-	if !errors.As(err, &failure) || failure.Status.Code != int32(state) {
+	if !errors.As(err, &failure) || failure.Status.Code != state {
 		t.Fatalf("failure = %v, want state %d", err, state)
 	}
 	return failure
@@ -48,26 +62,34 @@ func requireFailure(t *testing.T, err error, state int) *route.InstanceFailure {
 
 func TestFailureReachesHTTPWithoutUpstream(t *testing.T) {
 	for _, tc := range []struct {
-		state, status int
-		code          string
-	}{{6, 410, "SANDBOX_EXITED"}, {4, 503, "SANDBOX_RECOVERING"}, {7, 409, "SANDBOX_SCHEDULE_FAILED"}} {
+		state  int32
+		status int
+		code   string
+	}{
+		{execendpoint.StatusFatal, http.StatusGone, "SANDBOX_EXITED"},
+		{execendpoint.StatusFailed, http.StatusServiceUnavailable, "SANDBOX_RECOVERING"},
+		{execendpoint.StatusScheduleFailed, http.StatusConflict, "SANDBOX_SCHEDULE_FAILED"},
+	} {
 		t.Run(tc.code, func(t *testing.T) {
-			reader := &fakeAuthorityReader{key: instanceKey, value: failureJSON("inst-abc", "runtime-old", tc.state, 4)}
+			reader := &fakeAuthorityReader{key: instanceKey,
+				value: failureJSON("inst-abc", "runtime-old", tc.state, testFailureVersion)}
 			r := newInstanceInfoWatchResolverWithReader(reader)
 			server := proxy.New(r)
-			server.SetAuth(false, false, 8765, 0)
+			server.SetAuth(false, false, testFailureControlPort, 0)
 			response := httptest.NewRecorder()
 			server.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/inst-abc/8765/invoke", nil))
 			if response.Code != tc.status {
 				t.Fatalf("HTTP %d: %s", response.Code, response.Body.String())
 			}
-			var body map[string]interface{}
-			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
-				t.Fatal(err)
+			var body struct {
+				Code     string `json:"code"`
+				Message  string `json:"message"`
+				ExitCode int32  `json:"exit_code"`
 			}
-			if body["code"] != tc.code || body["message"] != "sandbox was oom-killed" || body["exit_code"] != float64(137) {
-				t.Fatalf("body = %v", body)
-			}
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			require.Equal(t, tc.code, body.Code)
+			require.Equal(t, "sandbox was oom-killed", body.Message)
+			require.EqualValues(t, testFailureExitCode, body.ExitCode)
 			if response.Header().Get("Cache-Control") != "no-store" {
 				t.Fatal("failure response must not be cached")
 			}
@@ -79,17 +101,18 @@ func TestFailureReachesHTTPWithoutUpstream(t *testing.T) {
 }
 
 func TestFailureRetentionExpiryAndRecovery(t *testing.T) {
-	now := time.Unix(1000, 0)
+	now := time.Unix(testEpochSeconds, 0)
 	reader := &fakeAuthorityReader{err: ErrAuthoritativeInstanceNotFound}
 	r := newInstanceInfoWatchResolverWithReader(reader)
 	r.now = func() time.Time { return now }
-	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: instanceKey, Value: failureJSON("inst-abc", "old", 6, 4), Rev: 10})
+	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: instanceKey,
+		Value: failureJSON("inst-abc", "old", execendpoint.StatusFatal, testFailureVersion), Rev: 10})
 	r.applyEvent(&etcd3.Event{Type: etcd3.DELETE, Key: instanceKey, Rev: 11})
 	_, err := resolve(r)
-	requireFailure(t, err, 6)
-	now = now.Add(9 * time.Minute)
+	requireFailure(t, err, execendpoint.StatusFatal)
+	now = now.Add(r.retention - time.Minute)
 	r.applyEvent(&etcd3.Event{Type: etcd3.DELETE, Key: instanceKey, Rev: 12})
-	now = now.Add(2 * time.Minute)
+	now = now.Add(testExpiryGrace)
 	_, err = resolve(r)
 	if !errors.Is(err, route.ErrRouteNotFound) {
 		t.Fatalf("expired failure: %v", err)
@@ -98,7 +121,8 @@ func TestFailureRetentionExpiryAndRecovery(t *testing.T) {
 		t.Fatal("expired summary retained")
 	}
 	// A new RUNNING winner replaces a retained failure immediately.
-	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: instanceKey, Value: failureJSON("inst-abc", "old", 4, 4), Rev: 20})
+	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: instanceKey,
+		Value: failureJSON("inst-abc", "old", execendpoint.StatusFailed, testFailureVersion), Rev: 20})
 	reader.err = nil
 	reader.key = instanceKey
 	reader.value = []byte(strings.Replace(resumedJSON, `"instanceID"`, `"version":5,"instanceID"`, 1))
@@ -110,7 +134,7 @@ func TestFailureRetentionExpiryAndRecovery(t *testing.T) {
 
 func TestFailureDoesNotHideAuthorityError(t *testing.T) {
 	r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{err: errors.New("etcd unavailable")})
-	r.applyPut(instanceKey, failureJSON("inst-abc", "old", 6, 4))
+	r.applyPut(instanceKey, failureJSON("inst-abc", "old", execendpoint.StatusFatal, testFailureVersion))
 	_, err := resolve(r)
 	var failure *route.InstanceFailure
 	if err == nil || errors.As(err, &failure) || errors.Is(err, route.ErrRouteNotFound) {
@@ -121,9 +145,11 @@ func TestFailureDoesNotHideAuthorityError(t *testing.T) {
 func TestStaleExitAndDeleteCannotReplaceNewGeneration(t *testing.T) {
 	r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{err: ErrAuthoritativeInstanceNotFound})
 	oldKey := strings.Replace(instanceKey, "req0", "old-request", 1)
-	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: oldKey, Value: failureJSON("inst-abc", "old", 6, 40), Rev: 10})
+	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: oldKey,
+		Value: failureJSON("inst-abc", "old", execendpoint.StatusFatal, testOldGenerationVersion), Rev: 10})
 	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: instanceKey, Value: []byte(resumedJSON), Rev: 20})
-	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: oldKey, Value: failureJSON("inst-abc", "old", 6, 40), Rev: 15})
+	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: oldKey,
+		Value: failureJSON("inst-abc", "old", execendpoint.StatusFatal, testOldGenerationVersion), Rev: 15})
 	r.applyEvent(&etcd3.Event{Type: etcd3.DELETE, Key: oldKey, Rev: 21})
 	target, err := resolve(r)
 	if err != nil || target == nil {
@@ -136,7 +162,9 @@ func TestStaleExitAndDeleteCannotReplaceNewGeneration(t *testing.T) {
 
 func TestConcurrentWatchWinsOverReadThrough(t *testing.T) {
 	gate := make(chan struct{})
-	reader := &fakeAuthorityReader{key: instanceKey, value: failureJSON("inst-abc", "old", 6, 4), gate: gate, started: make(chan struct{})}
+	reader := &fakeAuthorityReader{key: instanceKey,
+		value: failureJSON("inst-abc", "old", execendpoint.StatusFatal, testFailureVersion),
+		gate:  gate, started: make(chan struct{})}
 	r := newInstanceInfoWatchResolverWithReader(reader)
 	done := make(chan error, 1)
 	go func() { _, err := resolve(r); done <- err }()
@@ -151,13 +179,15 @@ func TestConcurrentWatchWinsOverReadThrough(t *testing.T) {
 func TestSanitizedFailureIdentityAndCollision(t *testing.T) {
 	raw := "inst_abc"
 	key := strings.Replace(instanceKey, "inst-abc", raw, 1)
-	r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{key: key, value: failureJSON(raw, "old", 6, 4)})
-	r.applyPut(key, failureJSON(raw, "old", 6, 4))
+	r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{
+		key: key, value: failureJSON(raw, "old", execendpoint.StatusFatal, testFailureVersion),
+	})
+	r.applyPut(key, failureJSON(raw, "old", execendpoint.StatusFatal, testFailureVersion))
 	_, err := resolve(r)
-	if got := requireFailure(t, err, 6).InstanceID; got != raw {
+	if got := requireFailure(t, err, execendpoint.StatusFatal).InstanceID; got != raw {
 		t.Fatalf("raw identity = %s", got)
 	}
-	r.applyPut(instanceKey, failureJSON("inst-abc", "other", 6, 4))
+	r.applyPut(instanceKey, failureJSON("inst-abc", "other", execendpoint.StatusFatal, testFailureVersion))
 	_, err = resolve(r)
 	var failure *route.InstanceFailure
 	if err == nil || errors.As(err, &failure) {
@@ -168,12 +198,12 @@ func TestSanitizedFailureIdentityAndCollision(t *testing.T) {
 func TestDeletedFailureCacheIsBounded(t *testing.T) {
 	r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{err: ErrAuthoritativeInstanceNotFound})
 	r.maxRetained = 2
-	now := time.Unix(1000, 0)
+	now := time.Unix(testEpochSeconds, 0)
 	r.now = func() time.Time { return now }
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("bounded-%d", i)
 		key := strings.Replace(instanceKey, "inst-abc", id, 1)
-		r.applyPut(key, failureJSON(id, "old", 6, 4))
+		r.applyPut(key, failureJSON(id, "old", execendpoint.StatusFatal, testFailureVersion))
 		r.applyEvent(&etcd3.Event{Type: etcd3.DELETE, Key: key})
 		now = now.Add(time.Second)
 	}
@@ -188,13 +218,16 @@ type revisionedReader struct {
 	revision int64
 }
 
-func (f revisionedReader) ReadInstanceWithRevision(ctx context.Context, id string) (string, []byte, int64, error) {
+func (f revisionedReader) ReadInstanceWithRevision(ctx context.Context, id string) (instanceReadResult, error) {
 	key, value, err := f.ReadInstance(ctx, id)
-	return key, value, f.revision, err
+	return instanceReadResult{key: key, value: value, revision: f.revision}, err
 }
 
 func TestOldAbsentReadCannotRemoveNewerRunningRoute(t *testing.T) {
-	r := newInstanceInfoWatchResolverWithReader(revisionedReader{&fakeAuthorityReader{err: ErrAuthoritativeInstanceNotFound}, 10})
+	r := newInstanceInfoWatchResolverWithReader(revisionedReader{
+		fakeAuthorityReader: &fakeAuthorityReader{err: ErrAuthoritativeInstanceNotFound},
+		revision:            10,
+	})
 	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: instanceKey, Value: []byte(resumedJSON), Rev: 20})
 	if _, err := r.refreshInstance(context.Background(), "inst-abc"); err != nil {
 		t.Fatal(err)
@@ -206,7 +239,12 @@ func TestOldAbsentReadCannotRemoveNewerRunningRoute(t *testing.T) {
 
 func TestOldReadCannotReplaceNewGeneration(t *testing.T) {
 	oldKey := strings.Replace(instanceKey, "req0", "old-request", 1)
-	r := newInstanceInfoWatchResolverWithReader(revisionedReader{&fakeAuthorityReader{key: oldKey, value: failureJSON("inst-abc", "old", 6, 50)}, 10})
+	r := newInstanceInfoWatchResolverWithReader(revisionedReader{
+		fakeAuthorityReader: &fakeAuthorityReader{
+			key: oldKey, value: failureJSON("inst-abc", "old", execendpoint.StatusFatal, testReadGenerationVersion),
+		},
+		revision: 10,
+	})
 	r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: instanceKey, Value: []byte(resumedJSON), Rev: 20})
 	if _, err := r.refreshInstance(context.Background(), "inst-abc"); err != nil {
 		t.Fatal(err)
@@ -217,10 +255,11 @@ func TestOldReadCannotReplaceNewGeneration(t *testing.T) {
 }
 
 func TestNormalExitPreservesZeroCodeAndReturnType(t *testing.T) {
-	value := []byte(`{"instanceID":"inst-abc","tenantID":"tenant-a","runtimeID":"old","instanceStatus":{"code":6,"exitCode":0,"type":1}}`)
+	value := []byte(`{"instanceID":"inst-abc","tenantID":"tenant-a","runtimeID":"old",` +
+		`"instanceStatus":{"code":6,"exitCode":0,"type":1}}`)
 	r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{key: instanceKey, value: value})
 	_, err := resolve(r)
-	failure := requireFailure(t, err, 6)
+	failure := requireFailure(t, err, execendpoint.StatusFatal)
 	if failure.Status.ExitCode != 0 || failure.Status.Type != 1 {
 		t.Fatalf("normal exit lost: %+v", failure.Status)
 	}
@@ -231,7 +270,8 @@ func TestRecreationWithinOneEtcdTransaction(t *testing.T) {
 		t.Run(fmt.Sprint(deleteFirst), func(t *testing.T) {
 			oldKey := strings.Replace(instanceKey, "req0", "old-request", 1)
 			r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{err: ErrAuthoritativeInstanceNotFound})
-			r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: oldKey, Value: failureJSON("inst-abc", "old", 6, 4), Rev: 10})
+			r.applyEvent(&etcd3.Event{Type: etcd3.PUT, Key: oldKey,
+				Value: failureJSON("inst-abc", "old", execendpoint.StatusFatal, testFailureVersion), Rev: 10})
 			deleted := &etcd3.Event{Type: etcd3.DELETE, Key: oldKey, Rev: 20}
 			created := &etcd3.Event{Type: etcd3.PUT, Key: instanceKey, Value: []byte(resumedJSON), Rev: 20}
 			if deleteFirst {
@@ -246,4 +286,15 @@ func TestRecreationWithinOneEtcdTransaction(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeleteRejectsPartiallyDecodedPreviousValue(t *testing.T) {
+	r := newInstanceInfoWatchResolverWithReader(&fakeAuthorityReader{err: ErrAuthoritativeInstanceNotFound})
+	// A type error can leave valid fields populated even though Unmarshal fails.
+	previous := []byte(`{"instanceID":"inst-abc","runtimeID":"old",` +
+		`"instanceStatus":{"code":6,"exitCode":137},"version":{}}`)
+	r.applyEvent(&etcd3.Event{Type: etcd3.DELETE, Key: instanceKey, PrevValue: previous})
+	_, err := resolve(r)
+	require.True(t, errors.Is(err, route.ErrRouteNotFound), "unexpected route error: %v", err)
+	require.Nil(t, r.FailureForRuntime(route.Key{SafeInstanceID: "inst-abc"}, "inst-abc", "old"))
 }

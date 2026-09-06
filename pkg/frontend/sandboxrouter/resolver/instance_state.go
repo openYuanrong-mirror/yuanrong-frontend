@@ -82,7 +82,8 @@ func (r *InstanceInfoWatchResolver) cachedTarget(key route.Key) (*route.Target, 
 	if err != nil {
 		return nil, err
 	}
-	if observed != nil && (observed.info.InstanceStatus.Code != execendpoint.StatusRunning || !observed.deletedAt.IsZero()) {
+	if observed != nil &&
+		(observed.info.InstanceStatus.Code != execendpoint.StatusRunning || !observed.deletedAt.IsZero()) {
 		return nil, nil // Refresh a non-running observation before rejecting a request.
 	}
 	target, err := r.cache.Get(key)
@@ -113,14 +114,16 @@ func (r *InstanceInfoWatchResolver) resultLocked(key route.Key) (*route.Target, 
 
 // FailureForRuntime is a read-only transport-error fallback. An exit from a
 // replacement runtime cannot be used to explain the failed upstream request.
-func (r *InstanceInfoWatchResolver) FailureForRuntime(key route.Key, instanceID, runtimeID string) *route.InstanceFailure {
+func (r *InstanceInfoWatchResolver) FailureForRuntime(
+	key route.Key, instanceID, runtimeID string) *route.InstanceFailure {
 	if runtimeID == "" || instanceID == "" {
 		return nil
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	observed, err := r.observationLocked(key.SafeInstanceID)
-	if err != nil || observed == nil || observed.info.InstanceID != instanceID || observed.info.RuntimeID != runtimeID {
+	if err != nil || observed == nil ||
+		observed.info.InstanceID != instanceID || observed.info.RuntimeID != runtimeID {
 		return nil
 	}
 	return route.FailureFor(observed.info)
@@ -175,9 +178,8 @@ func (r *InstanceInfoWatchResolver) deleteLocked(key string, previous []byte, re
 	}
 	if old == nil {
 		var info route.InstanceInfo
-		_ = json.Unmarshal(previous, &info)
-		// PrevValue is only trusted when it belongs to this exact key identity.
-		if info.InstanceID != id {
+		// PrevValue is only trusted when fully decoded and tied to this exact key identity.
+		if err := json.Unmarshal(previous, &info); err != nil || info.InstanceID != id {
 			info = route.InstanceInfo{InstanceID: id}
 		}
 		old = &instanceObservation{info: info, key: key}

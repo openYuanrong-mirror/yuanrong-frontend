@@ -27,6 +27,11 @@ import (
 	"frontend/pkg/frontend/sandboxrouter/route"
 )
 
+const (
+	failureControlPort = 50090
+	failureTunnelPort  = 8765
+)
+
 type failureResolver struct {
 	failure *route.InstanceFailure
 	target  *route.Target
@@ -62,7 +67,7 @@ func TestFailureAuthorizationAndPublicDetails(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New(failureResolver{failure: oomFailure()})
-			s.SetAuth(true, false, 50090, 8765)
+			s.SetAuth(true, false, failureControlPort, failureTunnelPort)
 			rec := doAuth(s, http.MethodPost, tc.path, tc.token)
 			if rec.Code != tc.status {
 				t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
@@ -85,8 +90,10 @@ func TestTransportFailureUsesOnlyMatchingRuntime(t *testing.T) {
 			target.RuntimeID = runtime
 			target.Tenant = "tenant-a"
 			s := New(failureResolver{failure: oomFailure(), target: target})
-			s.SetAuth(true, false, 50090, 8765)
-			s.proxy.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("connection reset") })
+			s.SetAuth(true, false, failureControlPort, failureTunnelPort)
+			s.proxy.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("connection reset")
+			})
 			rec := doAuth(s, http.MethodPost, "/inst-abc/50090/invoke", mintJWT(t, "tenant-a", farFuture))
 			want := 502
 			if runtime == "runtime-old" {
@@ -101,7 +108,7 @@ func TestTransportFailureUsesOnlyMatchingRuntime(t *testing.T) {
 
 func TestFrontendAuthenticatedFailureStillChecksTenant(t *testing.T) {
 	s := New(failureResolver{failure: oomFailure()})
-	s.SetAuth(true, false, 50090, 8765)
+	s.SetAuth(true, false, failureControlPort, failureTunnelPort)
 	for _, tenant := range []string{"tenant-a", "tenant-b"} {
 		req := httptest.NewRequest(http.MethodPost, "/inst-abc/50090/invoke", nil)
 		req.RemoteAddr = "127.0.0.1:12345"

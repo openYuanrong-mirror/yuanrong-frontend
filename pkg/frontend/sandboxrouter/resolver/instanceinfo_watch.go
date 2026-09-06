@@ -48,9 +48,11 @@ var errNoEtcdClient = errors.New("sandboxrouter: router etcd client not initiali
 var ErrAuthoritativeInstanceNotFound = errors.New("authoritative instance not found")
 
 const (
-	instanceRoutePathPrefix   = "/yr/route/business/yrk"
-	defaultReadThroughTimeout = 500 * time.Millisecond
-	functionKeyParts          = 3
+	instanceRoutePathPrefix    = "/yr/route/business/yrk"
+	defaultReadThroughTimeout  = 500 * time.Millisecond
+	defaultFailureRetention    = 10 * time.Minute
+	defaultMaxRetainedFailures = 4096
+	functionKeyParts           = 3
 )
 
 type instanceAuthorityReader interface {
@@ -58,6 +60,12 @@ type instanceAuthorityReader interface {
 }
 
 type etcdInstanceAuthorityReader struct{}
+
+type instanceReadResult struct {
+	key      string
+	value    []byte
+	revision int64
+}
 
 type readThroughResult struct {
 	Val interface{}
@@ -126,13 +134,16 @@ func (e etcdInstanceAuthorityReader) ReadInstance(ctx context.Context, requested
 	return e.readInstance(ctx, requestedID, nil)
 }
 
-func (e etcdInstanceAuthorityReader) ReadInstanceWithRevision(ctx context.Context, id string) (string, []byte, int64, error) {
-	var revision int64
-	key, value, err := e.readInstance(ctx, id, &revision)
-	return key, value, revision, err
+func (e etcdInstanceAuthorityReader) ReadInstanceWithRevision(
+	ctx context.Context, id string) (instanceReadResult, error) {
+	var result instanceReadResult
+	var err error
+	result.key, result.value, err = e.readInstance(ctx, id, &result.revision)
+	return result, err
 }
 
-func (etcdInstanceAuthorityReader) readInstance(ctx context.Context, requestedID string, revision *int64) (string, []byte, error) {
+func (etcdInstanceAuthorityReader) readInstance(
+	ctx context.Context, requestedID string, revision *int64) (string, []byte, error) {
 	client := etcd3.GetRouterEtcdClient()
 	if client == nil {
 		return "", nil, errNoEtcdClient
@@ -262,7 +273,7 @@ func newInstanceInfoWatchResolverWithReader(reader instanceAuthorityReader) *Ins
 	return &InstanceInfoWatchResolver{
 		cache: route.NewCache(), reader: reader, readTimeout: defaultReadThroughTimeout,
 		observations: make(map[string]map[string]*instanceObservation),
-		now:          time.Now, retention: 10 * time.Minute, maxRetained: 4096,
+		now:          time.Now, retention: defaultFailureRetention, maxRetained: defaultMaxRetainedFailures,
 	}
 }
 
@@ -340,9 +351,11 @@ func (r *InstanceInfoWatchResolver) refreshInstance(
 	var revision int64
 	var err error
 	if reader, ok := r.reader.(interface {
-		ReadInstanceWithRevision(context.Context, string) (string, []byte, int64, error)
+		ReadInstanceWithRevision(context.Context, string) (instanceReadResult, error)
 	}); ok {
-		key, value, revision, err = reader.ReadInstanceWithRevision(ctx, safeID)
+		var result instanceReadResult
+		result, err = reader.ReadInstanceWithRevision(ctx, safeID)
+		key, value, revision = result.key, result.value, result.revision
 	} else {
 		key, value, err = r.reader.ReadInstance(ctx, safeID)
 	}

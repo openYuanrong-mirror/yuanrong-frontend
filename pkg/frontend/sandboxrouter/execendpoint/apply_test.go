@@ -177,14 +177,15 @@ func TestApplyEventNonRunningRemoved(t *testing.T) {
 // cached, not just RUNNING.
 func TestApplyEventCacheableStates(t *testing.T) {
 	cacheable := map[int32]string{
-		2: "CREATING", 11: "SUB_HEALTH", 4: "FAILED", 6: "FATAL", 7: "SCHEDULE_FAILED", 1: "SCHEDULING",
+		2: "CREATING", 11: "SUB_HEALTH", 1: "SCHEDULING",
+		StatusFailed: "FAILED", StatusFatal: "FATAL", StatusScheduleFailed: "SCHEDULE_FAILED",
 	}
 	for code, name := range cacheable {
 		s := NewStore()
 		json := `{"instanceID":"inst-abc","proxyGrpcAddress":"10.0.0.1:22774",` +
 			`"instanceStatus":{"code":` + strconv.Itoa(int(code)) + `,"msg":"` + name + `"}}`
 		ApplyInstanceEvent(s, EventPut, instanceKey, []byte(json))
-		wantEndpoint := code != 4 && code != 6 && code != 7
+		wantEndpoint := code != StatusFailed && code != StatusFatal && code != StatusScheduleFailed
 		if _, ok := s.Get("inst-abc"); ok != wantEndpoint {
 			t.Errorf("code %d (%s) endpoint presence = %v, want %v", code, name, ok, wantEndpoint)
 		}
