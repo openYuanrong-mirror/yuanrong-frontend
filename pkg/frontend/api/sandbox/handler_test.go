@@ -57,6 +57,12 @@ const (
 	testCPULimit               = 2000
 	testInvokeFailureCode      = 2002
 	testMemoryLimit            = 4096
+	replayTestBaseUnixSeconds  = 100
+	replayTestSmallCapacity    = 2
+	replayTestCapacity         = 10
+	replayTestCleanupLimit     = 2
+	replayTestExpiration       = 2 * time.Second
+	replayBenchmarkCapacity    = 10000
 )
 
 type eofTrackingBody struct {
@@ -1275,9 +1281,9 @@ func TestCreateV1HandlerDefaultsAndReturnsSandboxID(t *testing.T) {
 	body, err := json.Marshal(CreateV1Request{
 		Image:              "ubuntu:22.04",
 		IdleTimeoutSeconds: 123,
-		DataPlane: &SandboxDataPlanePolicy{
-			TunnelSecurityMode:      SandboxDataPlaneSecurityTLSToken,
-			PortForwardSecurityMode: SandboxDataPlaneSecurityTLS,
+		DataPlane: &DataPlanePolicy{
+			TunnelSecurityMode:      DataPlaneSecurityTLSToken,
+			PortForwardSecurityMode: DataPlaneSecurityTLS,
 		},
 	})
 	require.NoError(t, err)
@@ -2429,8 +2435,8 @@ func TestSandboxCreateReplayStoreReplaysCompletedError(t *testing.T) {
 }
 
 func TestSandboxCreateReplayStoreEvictsOldestCompletedResult(t *testing.T) {
-	now := time.Unix(100, 0)
-	store := newSandboxCreateReplayStore(time.Minute, 2)
+	now := time.Unix(replayTestBaseUnixSeconds, 0)
+	store := newSandboxCreateReplayStore(time.Minute, replayTestSmallCapacity)
 	store.now = func() time.Time { return now }
 	createCalls := make(map[string]int)
 	create := func(key string) func() (sandboxCreateResult, error) {
@@ -2461,14 +2467,14 @@ func TestSandboxCreateReplayStoreEvictsOldestCompletedResult(t *testing.T) {
 }
 
 func TestSandboxCreateReplayStoreBackgroundCleanupExpiresCompletedResults(t *testing.T) {
-	now := time.Unix(100, 0)
-	store := newSandboxCreateReplayStore(time.Second, 10)
+	now := time.Unix(replayTestBaseUnixSeconds, 0)
+	store := newSandboxCreateReplayStore(time.Second, replayTestCapacity)
 	store.now = func() time.Time { return now }
 	_, _, _ = store.do("expired", "expired", [32]byte{1}, func() (sandboxCreateResult, error) {
 		return sandboxCreateResult{instanceID: "sandbox-expired"}, nil
 	})
 
-	now = now.Add(2 * time.Second)
+	now = now.Add(replayTestExpiration)
 	store.cleanup(now, sandboxCreateReplayCleanupBatch)
 
 	store.mu.Lock()
@@ -2478,8 +2484,8 @@ func TestSandboxCreateReplayStoreBackgroundCleanupExpiresCompletedResults(t *tes
 }
 
 func TestSandboxCreateReplayStoreCleanupIsBounded(t *testing.T) {
-	now := time.Unix(100, 0)
-	store := newSandboxCreateReplayStore(time.Second, 10)
+	now := time.Unix(replayTestBaseUnixSeconds, 0)
+	store := newSandboxCreateReplayStore(time.Second, replayTestCapacity)
 	store.now = func() time.Time { return now }
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("expired-%d", i)
@@ -2488,20 +2494,20 @@ func TestSandboxCreateReplayStoreCleanupIsBounded(t *testing.T) {
 		})
 	}
 
-	now = now.Add(2 * time.Second)
-	store.cleanup(now, 2)
+	now = now.Add(replayTestExpiration)
+	store.cleanup(now, replayTestCleanupLimit)
 
 	store.mu.Lock()
 	require.Len(t, store.entries, 1)
 	store.mu.Unlock()
-	store.cleanup(now, 2)
+	store.cleanup(now, replayTestCleanupLimit)
 	store.mu.Lock()
 	require.Empty(t, store.entries)
 	store.mu.Unlock()
 }
 
 func TestSandboxCreateReplayStoreCoalescesConcurrentRequest(t *testing.T) {
-	store := newSandboxCreateReplayStore(time.Minute, 10)
+	store := newSandboxCreateReplayStore(time.Minute, replayTestCapacity)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var createCalls atomic.Int32
@@ -2547,7 +2553,7 @@ func TestSandboxCreateReplayStoreCoalescesConcurrentRequest(t *testing.T) {
 }
 
 func BenchmarkSandboxCreateReplayStoreAtCapacity(b *testing.B) {
-	store := newSandboxCreateReplayStore(time.Hour, 10000)
+	store := newSandboxCreateReplayStore(time.Hour, replayBenchmarkCapacity)
 	digest := [32]byte{1}
 	for i := 0; i < store.maxEntries; i++ {
 		key := fmt.Sprintf("seed-%d", i)
@@ -2566,7 +2572,7 @@ func BenchmarkSandboxCreateReplayStoreAtCapacity(b *testing.B) {
 }
 
 func BenchmarkSandboxCreateReplayStoreAtCapacityParallel(b *testing.B) {
-	store := newSandboxCreateReplayStore(time.Hour, 10000)
+	store := newSandboxCreateReplayStore(time.Hour, replayBenchmarkCapacity)
 	digest := [32]byte{1}
 	for i := 0; i < store.maxEntries; i++ {
 		key := fmt.Sprintf("parallel-seed-%d", i)
@@ -3203,7 +3209,9 @@ func TestUpdateNetworkV1HandlerUsesSignal26AndCanonicalPolicy(t *testing.T) {
 		killReq *core.KillRequest,
 		_ api.RawRequestOption,
 	) ([]byte, error) {
-		captured = proto.Clone(killReq).(*core.KillRequest)
+		cloned, ok := proto.Clone(killReq).(*core.KillRequest)
+		require.True(t, ok)
+		captured = cloned
 		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
 	}})
 	body := `{
@@ -3254,7 +3262,9 @@ func TestUpdateNetworkV1HandlerClearsWithEmptyPolicy(t *testing.T) {
 		killReq *core.KillRequest,
 		_ api.RawRequestOption,
 	) ([]byte, error) {
-		captured = proto.Clone(killReq).(*core.KillRequest)
+		cloned, ok := proto.Clone(killReq).(*core.KillRequest)
+		require.True(t, ok)
+		captured = cloned
 		return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
 	}})
 	recorder := httptest.NewRecorder()
@@ -3516,7 +3526,9 @@ func TestDeleteHandlerForwardsClientRequestID(t *testing.T) {
 	var captured *core.KillRequest
 	setAPIClientsForTest(t, &runtimeStub{
 		killRaw: func(request *core.KillRequest, _ api.RawRequestOption) ([]byte, error) {
-			captured = proto.Clone(request).(*core.KillRequest)
+			cloned, ok := proto.Clone(request).(*core.KillRequest)
+			require.True(t, ok)
+			captured = cloned
 			return proto.Marshal(&core.KillResponse{Code: common.ErrorCode_ERR_NONE})
 		},
 	})

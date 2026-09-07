@@ -18,33 +18,16 @@ package watcher
 
 import (
 	"strings"
-	"sync"
 
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/etcd3"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/frontend/instancemanager"
-	"frontend/pkg/frontend/metrics"
 )
 
 const (
-	instanceEtcdKeyLen            = 14
-	instanceWatchEventsMetricName = "frontend_instance_watch_events_total"
+	instanceEtcdKeyLen = 14
 )
-
-var instanceWatchMetricsOnce sync.Once
-
-func initInstanceWatchMetrics() {
-	instanceWatchMetricsOnce.Do(func() {
-		if err := metrics.RegisterCounter(
-			instanceWatchEventsMetricName,
-			"Total number of instance watch events processed by event type",
-			[]string{"event_type"},
-		); err != nil {
-			log.GetLogger().Warnf("failed to register %s metric: %v", instanceWatchEventsMetricName, err)
-		}
-	})
-}
 
 func instanceWatchEventLabel(eventType int) string {
 	switch eventType {
@@ -62,13 +45,6 @@ func instanceWatchEventLabel(eventType int) string {
 		return "error"
 	default:
 		return "unknown"
-	}
-}
-
-func recordInstanceWatchEvent(eventType int) {
-	initInstanceWatchMetrics()
-	if err := metrics.IncrementCounter(instanceWatchEventsMetricName, instanceWatchEventLabel(eventType)); err != nil {
-		log.GetLogger().Debugf("failed to report %s metric: %v", instanceWatchEventsMetricName, err)
 	}
 }
 

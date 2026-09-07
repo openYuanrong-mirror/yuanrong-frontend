@@ -58,6 +58,7 @@ const (
 	testCorrelationCount       = 2
 	testTypedKillSignal        = 15
 	testRouteResolutionTimeout = 20 * time.Millisecond
+	testUUIDStringLength       = 36
 )
 
 type fakeFrontendProxyServiceClient struct {
@@ -449,8 +450,8 @@ func TestKillRequestIDsUniqueAcrossIsolatedFrontendProcesses(t *testing.T) {
 	const prefix = "frontend-proxy-kill-"
 	require.True(t, strings.HasPrefix(first, prefix))
 	require.True(t, strings.HasPrefix(second, prefix))
-	require.Len(t, strings.TrimPrefix(first, prefix), 36)
-	require.Len(t, strings.TrimPrefix(second, prefix), 36)
+	require.Len(t, strings.TrimPrefix(first, prefix), testUUIDStringLength)
+	require.Len(t, strings.TrimPrefix(second, prefix), testUUIDStringLength)
 	require.NotEqual(t, first, second)
 }
 

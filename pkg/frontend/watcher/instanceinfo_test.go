@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	"frontend/pkg/common/faas_common/etcd3"
@@ -120,12 +121,19 @@ func instanceWatchMetricValue(t *testing.T, eventType string) float64 {
 			continue
 		}
 		for _, metric := range family.GetMetric() {
-			for _, label := range metric.GetLabel() {
-				if label.GetName() == "event_type" && label.GetValue() == eventType {
-					return metric.GetCounter().GetValue()
-				}
+			if instanceWatchMetricMatchesEvent(metric.GetLabel(), eventType) {
+				return metric.GetCounter().GetValue()
 			}
 		}
 	}
 	return 0
+}
+
+func instanceWatchMetricMatchesEvent(labels []*io_prometheus_client.LabelPair, eventType string) bool {
+	for _, label := range labels {
+		if label.GetName() == "event_type" && label.GetValue() == eventType {
+			return true
+		}
+	}
+	return false
 }

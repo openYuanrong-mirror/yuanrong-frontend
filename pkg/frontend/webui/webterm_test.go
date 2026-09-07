@@ -593,7 +593,10 @@ func TestHandleInstancesExactCacheMissFallsBackToMaster(t *testing.T) {
 			queryParams["fields"] != "summary" {
 			t.Fatalf("unexpected master query %+v", queryParams)
 		}
-		response := result.(*InstanceListResponse)
+		response, ok := result.(*InstanceListResponse)
+		if !ok {
+			return fmt.Errorf("unexpected master result type %T", result)
+		}
 		response.Instances = []InstanceInfo{{
 			InstanceID: "instance-new",
 			TenantID:   "tenant-a",

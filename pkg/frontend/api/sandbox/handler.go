@@ -115,6 +115,7 @@ const (
 	sandboxCreateReplayCleanupEvery = time.Second
 	sandboxCreateReplayCleanupBatch = 64
 	sandboxCreateReplayCompactAt    = 1024
+	sandboxCreateReplayCompactRatio = 2
 	sandboxCreateRequestBodyLimit   = 1 << 20
 	sandboxRawRequestIDLength       = 18
 	sandboxRawRequestSequence       = "00"
@@ -250,7 +251,7 @@ type CreateRequest struct {
 	SnapshotID        string                   `json:"snapshotId,omitempty"`
 	Failover          bool                     `json:"failover"`
 	InheritEntrypoint bool                     `json:"inheritEntrypoint,omitempty"`
-	DataPlane         *SandboxDataPlanePolicy  `json:"dataPlane,omitempty"`
+	DataPlane         *DataPlanePolicy         `json:"dataPlane,omitempty"`
 	// ScheduleAffinities exposes the native scheduler semantics instead of
 	// adding resource-specific shortcut fields such as nodeId.
 	ScheduleAffinities []api.Affinity `json:"scheduleAffinities,omitempty"`
@@ -357,19 +358,23 @@ func (policy *SandboxNetworkPolicy) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type SandboxDataPlaneSecurityMode string
+// DataPlaneSecurityMode identifies the minimum transport security required by
+// a sandbox data-plane endpoint.
+type DataPlaneSecurityMode string
 
 const (
-	SandboxDataPlaneSecurityTLS      SandboxDataPlaneSecurityMode = "tls"
-	SandboxDataPlaneSecurityTLSToken SandboxDataPlaneSecurityMode = "tls-token"
+	// DataPlaneSecurityTLS requires an authenticated TLS transport.
+	DataPlaneSecurityTLS DataPlaneSecurityMode = "tls"
+	// DataPlaneSecurityTLSToken additionally requires a validated user token.
+	DataPlaneSecurityTLSToken DataPlaneSecurityMode = "tls-token"
 )
 
-// SandboxDataPlanePolicy selects the minimum client-side security for this
+// DataPlanePolicy selects the minimum client-side security for this
 // sandbox. Both modes require TLS; tls-token additionally requires a validated
 // user token. Direct access is fixed to tls-token and has no override.
-type SandboxDataPlanePolicy struct {
-	TunnelSecurityMode      SandboxDataPlaneSecurityMode `json:"tunnelSecurityMode,omitempty"`
-	PortForwardSecurityMode SandboxDataPlaneSecurityMode `json:"portForwardSecurityMode,omitempty"`
+type DataPlanePolicy struct {
+	TunnelSecurityMode      DataPlaneSecurityMode `json:"tunnelSecurityMode,omitempty"`
+	PortForwardSecurityMode DataPlaneSecurityMode `json:"portForwardSecurityMode,omitempty"`
 }
 
 // CreateV1Request holds POST /api/sandbox/v1/sandboxes parameters.
@@ -400,7 +405,7 @@ type CreateV1Request struct {
 	SnapshotID             string                   `json:"snapshotId,omitempty"`
 	Failover               bool                     `json:"failover"`
 	InheritEntrypoint      bool                     `json:"inheritEntrypoint,omitempty"`
-	DataPlane              *SandboxDataPlanePolicy  `json:"dataPlane,omitempty"`
+	DataPlane              *DataPlanePolicy         `json:"dataPlane,omitempty"`
 	CreateTimeoutSeconds   int                      `json:"createTimeoutSeconds"`
 	ScheduleTimeoutSeconds int                      `json:"scheduleTimeoutSeconds"`
 	InitCallTimeoutSeconds int                      `json:"initCallTimeoutSeconds,omitempty"`
@@ -681,7 +686,7 @@ func (store *sandboxCreateReplayStore) compactCompletionQueueLocked() {
 		return
 	}
 	if store.completionHead < sandboxCreateReplayCompactAt ||
-		store.completionHead*2 < len(store.completionQueue) {
+		store.completionHead*sandboxCreateReplayCompactRatio < len(store.completionQueue) {
 		return
 	}
 	remaining := copy(store.completionQueue, store.completionQueue[store.completionHead:])
@@ -823,15 +828,15 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	return rootfs, prepareSandboxTunnel(req), nil
 }
 
-func validateSandboxDataPlanePolicy(policy *SandboxDataPlanePolicy) error {
+func validateSandboxDataPlanePolicy(policy *DataPlanePolicy) error {
 	if policy == nil {
 		return nil
 	}
-	for name, mode := range map[string]SandboxDataPlaneSecurityMode{
+	for name, mode := range map[string]DataPlaneSecurityMode{
 		"tunnelSecurityMode":      policy.TunnelSecurityMode,
 		"portForwardSecurityMode": policy.PortForwardSecurityMode,
 	} {
-		if mode != "" && mode != SandboxDataPlaneSecurityTLS && mode != SandboxDataPlaneSecurityTLSToken {
+		if mode != "" && mode != DataPlaneSecurityTLS && mode != DataPlaneSecurityTLSToken {
 			return fmt.Errorf("dataPlane.%s must be tls or tls-token", name)
 		}
 	}
