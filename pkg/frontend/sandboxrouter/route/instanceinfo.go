@@ -28,6 +28,7 @@ type InstanceInfo struct {
 	FunctionProxyID  string            `json:"functionProxyID"`
 	ProxyGrpcAddress string            `json:"proxyGrpcAddress"`
 	RuntimeAddress   string            `json:"runtimeAddress"`
+	RuntimeID        string            `json:"runtimeID"`
 	ContainerID      string            `json:"containerID"`
 	ContainerIP      string            `json:"containerIP"`
 	RequestID        string            `json:"requestID"`
@@ -36,9 +37,11 @@ type InstanceInfo struct {
 	Extensions       map[string]string `json:"extensions"`
 }
 
-// InstanceStatus mirrors the kernel-controlled status code; only Code is used
-// by the resolver to decide RUNNING vs exited.
+// InstanceStatus preserves the kernel's lifecycle and runtime exit information.
 type InstanceStatus struct {
-	Code int32  `json:"code"`
-	Msg  string `json:"msg"`
+	Code     int32  `json:"code"`
+	Msg      string `json:"msg"`
+	ExitCode int32  `json:"exitCode"`
+	Type     int32  `json:"type"`
+	ErrCode  int32  `json:"errCode"`
 }

@@ -2317,6 +2317,54 @@ func TestCreateV1HandlerRejectsExplicitNameAlreadyInSandboxRouterCache(t *testin
 	require.Contains(t, recorder.Body.String(), "requestId=create-existing")
 }
 
+func TestCreateV1HandlerRetainedFailureAllowsAuthoritativeRecreate(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		state            int32
+		backendDuplicate bool
+		wantCalls        int32
+		wantHTTP         int
+	}{
+		{"fatal", execendpoint.StatusFatal, false, 1, http.StatusOK},
+		{"schedule-failed", execendpoint.StatusScheduleFailed, false, 1, http.StatusOK},
+		{"authoritative-conflict", execendpoint.StatusFatal, true, 1, http.StatusConflict},
+		{"recovering", execendpoint.StatusFailed, false, 0, http.StatusConflict},
+		{"paused", execendpoint.StatusPaused, false, 0, http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "retained-" + tc.name
+			instance := "default-" + name
+			execendpoint.Default().PutSummary(execendpoint.Summary{
+				InstanceID: instance, TenantID: "tenant-recreate", StatusCode: tc.state,
+			})
+			defer execendpoint.Default().Delete(instance)
+			var calls atomic.Int32
+			setAPIClientsForTest(t, &runtimeStub{
+				createInstanceRaw: func(_ *core.CreateRequest, _ api.RawRequestOption) ([]byte, error) {
+					calls.Add(1)
+					if tc.backendDuplicate {
+						return rawCreateNotify(sandboxInstanceDuplicatedCode, "instance still exists"), nil
+					}
+					return rawCreateNotify(0, ""), nil
+				},
+			})
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			body, err := json.Marshal(CreateV1Request{Name: name, Namespace: "default", Tenant: "tenant-recreate"})
+			require.NoError(t, err)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/sandbox/v1/sandboxes", bytes.NewReader(body))
+			ctx.Request.Header.Set(constant.HeaderRequestID, "create-"+name)
+			CreateV1Handler(ctx)
+			require.Equal(t, tc.wantCalls, calls.Load())
+			require.Equal(t, tc.wantHTTP, recorder.Code, recorder.Body.String())
+			// The failed-runtime diagnostic remains available until a newer observation.
+			summary, ok := execendpoint.Default().GetSummary(instance)
+			require.True(t, ok)
+			require.Equal(t, tc.state, summary.StatusCode)
+		})
+	}
+}
+
 func TestCreateV1HandlerReplaysUnnamedCreateByRequestID(t *testing.T) {
 	var createCalls atomic.Int32
 	var createdInstanceID string

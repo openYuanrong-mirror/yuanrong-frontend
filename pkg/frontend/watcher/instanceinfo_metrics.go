@@ -17,9 +17,9 @@
 package watcher
 
 import (
+	"frontend/pkg/common/faas_common/logger/log"
 	"sync"
 
-	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/frontend/metrics"
 )
 

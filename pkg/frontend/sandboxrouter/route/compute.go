@@ -97,9 +97,11 @@ func ComputeRoutes(info *InstanceInfo) ([]*Target, error) {
 		}
 		u := &url.URL{Scheme: scheme, Host: hostIP + ":" + strconv.FormatUint(hport, portBase)}
 		routes = append(routes, &Target{
-			Key:       Key{SafeInstanceID: safeID, Port: uint16(cport)},
-			TargetURL: u,
-			Scheme:    scheme,
+			InstanceID: info.InstanceID,
+			RuntimeID:  info.RuntimeID,
+			Key:        Key{SafeInstanceID: safeID, Port: uint16(cport)},
+			TargetURL:  u,
+			Scheme:     scheme,
 		})
 	}
 	return routes, nil

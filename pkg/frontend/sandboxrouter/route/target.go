@@ -24,9 +24,11 @@ import "net/url"
 // from instance metadata and used for router-side authorization (the request's
 // JWT tenant must match); "" when unknown.
 type Target struct {
-	Key       Key
-	TargetURL *url.URL
-	Scheme    string
-	Source    string
-	Tenant    string
+	InstanceID string
+	RuntimeID  string
+	Key        Key
+	TargetURL  *url.URL
+	Scheme     string
+	Source     string
+	Tenant     string
 }
