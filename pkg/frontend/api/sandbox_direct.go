@@ -59,13 +59,41 @@ func registerSandboxDirectRoute(r *gin.Engine) {
 	r.Any(sandboxTunnelPrefix+"/*proxyPath", sandboxDirectProxyHandler(sandboxTunnelRouterPath, false))
 }
 
-func sandboxTraceHandler(handler gin.HandlerFunc) gin.HandlerFunc {
+// agentTraceMiddleware resolves the request trace-id via InitTraceID (external
+// X-Trace-Id / X-Request-Id header if present, otherwise a freshly minted UUID) and
+// echoes it back on the response header so the caller always observes the value.
+// Used both as the /api/agent group middleware and inside traceHandler, so every
+// agent handler can assume X-Trace-Id is non-empty. As a group middleware it must
+// NOT call c.Next() explicitly — returning lets the chain continue.
+func agentTraceMiddleware(c *gin.Context) {
+	traceID := frontendhttputil.InitTraceID(c)
+	c.Header(constant.HeaderTraceID, traceID)
+}
+
+// traceHandler wraps a gin handler with the trace middleware plus the tracer span.
+func traceHandler(handler gin.HandlerFunc) gin.HandlerFunc {
 	wrapped := tracer.WrapGinHandler(handler)
 	return func(c *gin.Context) {
 		traceID := frontendhttputil.InitTraceID(c)
 		c.Header(constant.HeaderTraceID, traceID)
 		wrapped(c)
 	}
+}
+
+// traceHTTPHandler adapts a plain net/http handler (e.g. a gorilla/websocket
+// upgrade handler wrapped by gin.WrapF) to the same trace wiring.
+func traceHTTPHandler(handler http.HandlerFunc) gin.HandlerFunc {
+	wrapped := tracer.WrapGinHandler(gin.WrapF(handler))
+	return func(c *gin.Context) {
+		traceID := frontendhttputil.InitTraceID(c)
+		c.Header(constant.HeaderTraceID, traceID)
+		wrapped(c)
+	}
+}
+
+// sandboxTraceHandler is a thin alias of traceHandler, kept for the sandbox routes.
+func sandboxTraceHandler(handler gin.HandlerFunc) gin.HandlerFunc {
+	return traceHandler(handler)
 }
 
 func sandboxDirectRouterPath(path string, cfg *routerconfig.SandboxRouterConfig) string {
