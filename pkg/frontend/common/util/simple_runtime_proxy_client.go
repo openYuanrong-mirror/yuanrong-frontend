@@ -27,7 +27,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,8 +53,6 @@ import (
 	"frontend/pkg/frontend/proxyrouting"
 	"frontend/pkg/frontend/sandboxrouter/execendpoint"
 )
-
-var frontendProxyRequestSeq atomic.Uint64
 
 const (
 	frontendPauseSnapshotSignal  = 18
@@ -454,8 +451,7 @@ func (c *grpcFrontendProxyLifecycleClient) KillInstanceWithResponse(
 	if c.client == nil {
 		return nil, fmt.Errorf("frontend proxy grpc client is nil")
 	}
-	requestID := firstNonEmpty(req.requestID,
-		fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1)))
+	requestID := firstNonEmpty(req.requestID, newFrontendProxyKillRequestID())
 	ctx, cancel := simpleRuntimeInvokeContextWithParent(req.ctx, req.options, 0)
 	defer cancel()
 	resp, err := c.client.KillInstance(ctx, &frontend_proxy.KillInstanceRequest{
@@ -730,7 +726,7 @@ func (c *routingFrontendProxyLifecycleClient) KillInstanceWithResponse(
 		return nil, fmt.Errorf("frontend proxy lifecycle routing client is not initialized")
 	}
 	if req.requestID == "" {
-		req.requestID = fmt.Sprintf("frontend-proxy-kill-%d", frontendProxyRequestSeq.Add(1))
+		req.requestID = newFrontendProxyKillRequestID()
 	}
 	tried := make(map[string]struct{})
 	for attempt := 0; attempt < frontendProxyKillMaxAttempts; attempt++ {
@@ -1036,6 +1032,10 @@ func rawSimpleRuntimeContext(parent context.Context, _ api.RawRequestOption) (co
 
 func newFrontendProxyRuntimeRequestID() string {
 	return strings.ReplaceAll(uuid.NewString(), "-", "")[:runtimeRequestIDLength]
+}
+
+func newFrontendProxyKillRequestID() string {
+	return "frontend-proxy-kill-" + uuid.NewString()
 }
 
 func frontendRequestContextFromInvokeOptions(frontendClientID, tenantID, requestID string,

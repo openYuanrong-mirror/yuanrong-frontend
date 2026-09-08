@@ -29,6 +29,25 @@ const (
 	instanceEtcdKeyLen = 14
 )
 
+func instanceWatchEventLabel(eventType int) string {
+	switch eventType {
+	case etcd3.PUT:
+		return "put"
+	case etcd3.DELETE:
+		return "delete"
+	case etcd3.HISTORYDELETE:
+		return "history_delete"
+	case etcd3.HISTORYUPDATE:
+		return "history_update"
+	case etcd3.SYNCED:
+		return "synced"
+	case etcd3.ERROR:
+		return "error"
+	default:
+		return "unknown"
+	}
+}
+
 func startWatchInstanceInfo(stopCh <-chan struct{}) {
 	etcdClient := etcd3.GetRouterEtcdClient()
 	watcher := etcd3.NewEtcdWatcher(constant.InstancePathPrefix, instanceInfoFilter,
@@ -37,13 +56,16 @@ func startWatchInstanceInfo(stopCh <-chan struct{}) {
 }
 
 func instanceInfoHandler(event *etcd3.Event) {
-	log.GetLogger().Infof("handling instance info event type %d, key:%s", event.Type, event.Key)
+	recordInstanceWatchEvent(event.Type)
 	switch event.Type {
 	case etcd3.PUT:
+		log.GetLogger().Debugf("handling instance info PUT event, key:%s", event.Key)
 		instancemanager.ProcessInstanceUpdate(event)
 	case etcd3.DELETE:
+		log.GetLogger().Debugf("handling instance info DELETE event, key:%s", event.Key)
 		instancemanager.ProcessInstanceDelete(event)
 	case etcd3.SYNCED:
+		log.GetLogger().Debugf("handling instance info SYNCED event")
 		instancemanager.ProcessInstanceSync(event)
 	case etcd3.ERROR:
 		log.GetLogger().Warnf("etcd error event: %s", event.Value)

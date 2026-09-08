@@ -20,8 +20,12 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/require"
+
 	"frontend/pkg/common/faas_common/etcd3"
 	"frontend/pkg/common/faas_common/types"
+	"frontend/pkg/frontend/metrics"
 )
 
 func Test_handler(t *testing.T) {
@@ -76,4 +80,60 @@ func Test_InstanceInfoFilter(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInstanceWatchEventLabel(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType int
+		want      string
+	}{
+		{name: "put", eventType: etcd3.PUT, want: "put"},
+		{name: "delete", eventType: etcd3.DELETE, want: "delete"},
+		{name: "history delete", eventType: etcd3.HISTORYDELETE, want: "history_delete"},
+		{name: "history update", eventType: etcd3.HISTORYUPDATE, want: "history_update"},
+		{name: "synced", eventType: etcd3.SYNCED, want: "synced"},
+		{name: "error", eventType: etcd3.ERROR, want: "error"},
+		{name: "unknown", eventType: -1, want: "unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := instanceWatchEventLabel(tt.eventType); got != tt.want {
+				t.Fatalf("instanceWatchEventLabel(%d) = %q, want %q", tt.eventType, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRecordInstanceWatchEventIncrementsMetric(t *testing.T) {
+	before := instanceWatchMetricValue(t, "put")
+	recordInstanceWatchEvent(etcd3.PUT)
+	require.Equal(t, before+1, instanceWatchMetricValue(t, "put"))
+}
+
+func instanceWatchMetricValue(t *testing.T, eventType string) float64 {
+	t.Helper()
+	families, err := metrics.GetRegistry().Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != instanceWatchEventsMetricName {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if instanceWatchMetricMatchesEvent(metric.GetLabel(), eventType) {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func instanceWatchMetricMatchesEvent(labels []*io_prometheus_client.LabelPair, eventType string) bool {
+	for _, label := range labels {
+		if label.GetName() == "event_type" && label.GetValue() == eventType {
+			return true
+		}
+	}
+	return false
 }

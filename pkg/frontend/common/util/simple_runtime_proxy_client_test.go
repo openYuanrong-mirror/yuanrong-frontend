@@ -58,6 +58,7 @@ const (
 	testCorrelationCount       = 2
 	testTypedKillSignal        = 15
 	testRouteResolutionTimeout = 20 * time.Millisecond
+	testUUIDStringLength       = 36
 )
 
 type fakeFrontendProxyServiceClient struct {
@@ -398,6 +399,13 @@ func TestFrontendProxyRuntimeRequestIDProcessHelper(t *testing.T) {
 	fmt.Printf("RUNTIME_ID=%s\n", newFrontendProxyRuntimeRequestID())
 }
 
+func TestFrontendProxyKillRequestIDProcessHelper(t *testing.T) {
+	if os.Getenv("FRONTEND_PROXY_KILL_ID_HELPER") != "1" {
+		return
+	}
+	fmt.Printf("KILL_ID=%s\n", newFrontendProxyKillRequestID())
+}
+
 func TestRequestIDsUniqueAcrossIsolatedFrontendProcesses(t *testing.T) {
 	generate := func() string {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestFrontendProxyRuntimeRequestIDProcessHelper$")
@@ -420,6 +428,30 @@ func TestRequestIDsUniqueAcrossIsolatedFrontendProcesses(t *testing.T) {
 	require.NoError(t, err)
 	_, err = hex.DecodeString(second)
 	require.NoError(t, err)
+	require.NotEqual(t, first, second)
+}
+
+func TestKillRequestIDsUniqueAcrossIsolatedFrontendProcesses(t *testing.T) {
+	generate := func() string {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestFrontendProxyKillRequestIDProcessHelper$")
+		cmd.Env = append(os.Environ(), "FRONTEND_PROXY_KILL_ID_HELPER=1")
+		output, err := cmd.Output()
+		require.NoError(t, err)
+		const marker = "KILL_ID="
+		markerAt := strings.Index(string(output), marker)
+		require.NotEqual(t, -1, markerAt)
+		fields := strings.Fields(string(output)[markerAt+len(marker):])
+		require.NotEmpty(t, fields)
+		return fields[0]
+	}
+
+	first := generate()
+	second := generate()
+	const prefix = "frontend-proxy-kill-"
+	require.True(t, strings.HasPrefix(first, prefix))
+	require.True(t, strings.HasPrefix(second, prefix))
+	require.Len(t, strings.TrimPrefix(first, prefix), testUUIDStringLength)
+	require.Len(t, strings.TrimPrefix(second, prefix), testUUIDStringLength)
 	require.NotEqual(t, first, second)
 }
 

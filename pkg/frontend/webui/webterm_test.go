@@ -571,6 +571,79 @@ func TestHandleInstancesUsesLocalCacheWithPagination(t *testing.T) {
 	}
 }
 
+func TestHandleInstancesExactCacheMissFallsBackToMaster(t *testing.T) {
+	originalLookupSummaries := lookupLocalInstanceSummaries
+	originalQueryMaster := queryMasterFunc
+	defer func() {
+		lookupLocalInstanceSummaries = originalLookupSummaries
+		queryMasterFunc = originalQueryMaster
+	}()
+
+	lookupLocalInstanceSummaries = func(tenantID, instanceID string) []execendpoint.Summary {
+		if tenantID != "tenant-a" || instanceID != "instance-new" {
+			t.Fatalf("unexpected local filters tenant=%q instance=%q", tenantID, instanceID)
+		}
+		return nil
+	}
+	queryMasterFunc = func(apiPath string, queryParams map[string]string, result interface{}) error {
+		if apiPath != "/instance-manager/query-tenant-instances" {
+			t.Fatalf("unexpected master path %q", apiPath)
+		}
+		if queryParams["tenant_id"] != "tenant-a" || queryParams["instance_id"] != "instance-new" ||
+			queryParams["fields"] != "summary" {
+			t.Fatalf("unexpected master query %+v", queryParams)
+		}
+		response, ok := result.(*InstanceListResponse)
+		if !ok {
+			return fmt.Errorf("unexpected master result type %T", result)
+		}
+		response.Instances = []InstanceInfo{{
+			InstanceID: "instance-new",
+			TenantID:   "tenant-a",
+			InstanceStatus: InstanceStatus{
+				Code: int(constant.KernelInstanceStatusRunning),
+				Msg:  "running",
+			},
+		}}
+		return nil
+	}
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/instances?tenant_id=tenant-a&instance_id=instance-new", nil)
+	recorder := httptest.NewRecorder()
+	HandleInstances(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	body := decodeInstanceBodyForTest(t, recorder)
+	if len(body) != 1 || body[0]["id"] != "instance-new" || body[0]["status"] != "running" {
+		t.Fatalf("unexpected fallback response: %+v", body)
+	}
+}
+
+func TestHandleInstancesExactCacheMissSurfacesMasterFailure(t *testing.T) {
+	originalLookupSummaries := lookupLocalInstanceSummaries
+	originalQueryMaster := queryMasterFunc
+	defer func() {
+		lookupLocalInstanceSummaries = originalLookupSummaries
+		queryMasterFunc = originalQueryMaster
+	}()
+
+	lookupLocalInstanceSummaries = func(string, string) []execendpoint.Summary { return nil }
+	queryMasterFunc = func(string, map[string]string, interface{}) error {
+		return errors.New("master unavailable")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/instances?instance_id=instance-new", nil)
+	recorder := httptest.NewRecorder()
+	HandleInstances(recorder, req)
+
+	if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "master unavailable") {
+		t.Fatalf("expected explicit master failure, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestHandleInstancesSystemTenantListsAllTenants(t *testing.T) {
 	originalLookupSummaries := lookupLocalInstanceSummaries
 	defer func() {

@@ -42,3 +42,23 @@ func TestEffectiveConfigRespectsExplicitDisabled(t *testing.T) {
 		t.Fatal("explicit sandboxrouter enabled=false should remain disabled")
 	}
 }
+
+func TestStartIfEnabledDelegatesListenerToExternalProcess(t *testing.T) {
+	t.Setenv("SANDBOX_ROUTER_EXTERNAL", "true")
+	originalStartWatch := startExternalInstanceCacheWatch
+	t.Cleanup(func() { startExternalInstanceCacheWatch = originalStartWatch })
+	called := false
+	startExternalInstanceCacheWatch = func(stopCh <-chan struct{}) error {
+		if stopCh == nil {
+			t.Fatal("instance cache watcher requires the frontend stop channel")
+		}
+		called = true
+		return nil
+	}
+	if err := StartIfEnabled(&config.SandboxRouterConfig{Enabled: true}, make(chan struct{})); err != nil {
+		t.Fatalf("external sandbox router delegation failed: %v", err)
+	}
+	if !called {
+		t.Fatal("external sandbox router must keep the frontend instance cache watcher active")
+	}
+}

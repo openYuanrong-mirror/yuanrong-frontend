@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"frontend/pkg/common/faas_common/logger/log"
@@ -36,6 +37,10 @@ import (
 )
 
 const shutdownTimeout = 10 * time.Second
+
+var startExternalInstanceCacheWatch = func(stopCh <-chan struct{}) error {
+	return resolver.NewInstanceInfoWatchResolver().Start(stopCh)
+}
 
 // Router owns the resolver and the HTTP server for the sandbox data plane.
 type Router struct {
@@ -53,6 +58,20 @@ type Router struct {
 func StartIfEnabled(cfg *config.SandboxRouterConfig, stopCh <-chan struct{}) error {
 	cfg = effectiveConfig(cfg)
 	if !cfg.Enabled {
+		return nil
+	}
+	// In the standalone data-plane deployment, Frontend serves control APIs
+	// only. Clients reach the Edge listener directly through its own Service;
+	// skip the legacy in-process listener so the two processes never race for
+	// the data-plane port. Keep the instance-info watcher running: Frontend's
+	// instance list, exec and file-copy APIs consume the cache populated by it.
+	if strings.EqualFold(os.Getenv("SANDBOX_ROUTER_EXTERNAL"), "true") {
+		if err := startExternalInstanceCacheWatch(stopCh); err != nil {
+			return fmt.Errorf("sandboxrouter: start frontend instance cache: %w", err)
+		}
+		log.GetLogger().Infof(
+			"sandbox router listener delegated to external process on %s:%d; frontend instance cache watcher remains active",
+			cfg.ListenIP, cfg.ListenPort)
 		return nil
 	}
 	router, err := New(cfg)
