@@ -143,7 +143,7 @@ const (
 	agentStorageBytesPerMiB      = 1024 * 1024
 	sshEnableEnv                 = "YR_FRONTEND_SSH_ENABLE"
 	sshPublicKeyDirectoryEnv     = "YR_SSH_BACKEND_PUBLIC_KEY_DIR"
-	sshContainerMountDirectory   = "/run/openyuanrong/ssh"
+	sshContainerMountDirectory   = "/home/sn/ssh"
 )
 
 // getAgentExecutorFuncKey maps the requested runtime to the faas system executor function
