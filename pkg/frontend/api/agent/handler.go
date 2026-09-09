@@ -305,10 +305,12 @@ type ExtendedTimeout struct {
 
 // RootfsSpec carries the inline container rootfs config. ImageURL is optional here: it is
 // validated per sandbox type in buildAgentInvokeOptions (required unless the sandbox_type is
-// supervisor, which runs without a container image).
+// supervisor, which runs without a container image). Workdir is the container-side working
+// directory (docker WorkingDir); when empty the container keeps the image's default WORKDIR.
 type RootfsSpec struct {
 	ImageURL string   `json:"imageurl,omitempty"`
 	User     string   `json:"user,omitempty"`
+	Workdir  string   `json:"workdir,omitempty"`
 	Ports    []string `json:"ports,omitempty"`
 }
 
@@ -988,9 +990,13 @@ func applyAgentInlineMeta(invokeOpts *api.InvokeOptions, req CreateAgentRequest)
 	}
 	replaceAgentUserPlaceholder(invokeOpts, c.Rootfs.User)
 	if c.Rootfs.ImageURL != "" {
-		rootfsJSON, err := json.Marshal(map[string]interface{}{
+		rootfsImage := map[string]interface{}{
 			"type": "image", "imageurl": c.Rootfs.ImageURL, "mounts": []interface{}{},
-		})
+		}
+		if c.Rootfs.Workdir != "" {
+			rootfsImage["workdir"] = c.Rootfs.Workdir
+		}
+		rootfsJSON, err := json.Marshal(rootfsImage)
 		if err != nil {
 			log.GetLogger().Warnf("failed to marshal agent rootfs imageurl: %v", err)
 		} else if existing, exists := invokeOpts.CreateOpt["rootfs"]; exists && existing != "" {
@@ -1246,7 +1252,8 @@ func applyAgentRootfsMounts(invokeOpts *api.InvokeOptions, req CreateAgentReques
 	if len(rootfsMounts) == 0 {
 		return nil
 	}
-	rootfsJSON, err := json.Marshal(map[string]interface{}{"mounts": rootfsMounts})
+	rootfsOpt := map[string]interface{}{"mounts": rootfsMounts}
+	rootfsJSON, err := json.Marshal(rootfsOpt)
 	if err != nil {
 		return fmt.Errorf("failed to marshal rootfs mounts: %v", err)
 	}
@@ -1597,6 +1604,7 @@ type RootfsInfo struct {
 	ImageURL  string      `json:"imageurl,omitempty"`
 	User      string      `json:"user,omitempty"`
 	Workspace string      `json:"workspace,omitempty"`
+	Workdir   string      `json:"workdir,omitempty"`
 	Mounts    []MountInfo `json:"mounts,omitempty"`
 }
 
@@ -1611,6 +1619,7 @@ type MountInfo struct {
 type rootfsJSON struct {
 	Type     string            `json:"type"`
 	ImageURL string            `json:"imageurl"`
+	Workdir  string            `json:"workdir"`
 	Mounts   []json.RawMessage `json:"mounts"`
 }
 
@@ -1712,6 +1721,7 @@ func parseRootfs(rootfsStr, hostUser, workspace, instanceID string) *RootfsInfo 
 		} else {
 			info.Type = rf.Type
 			info.ImageURL = rf.ImageURL
+			info.Workdir = rf.Workdir
 			info.Mounts = parseRootfsMounts(rf.Mounts)
 		}
 	}
