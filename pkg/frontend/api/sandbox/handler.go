@@ -153,6 +153,8 @@ var waitForSandboxInstanceRunning = func(instanceID, functionID, resourceSpecNot
 
 var readAuthoritativeSandboxInstance = resolver.ReadAuthoritativeInstance
 
+var confirmSandboxInstanceDeleted = resolver.ConfirmInstanceDeleted
+
 var (
 	sandboxXPUTypePattern           = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 	sandboxXPUCountPattern          = regexp.MustCompile(`^[0-9]+$`)
@@ -2832,7 +2834,7 @@ func isSandboxInstanceRunning(instanceID, functionID, resourceSpecNote string) b
 }
 
 // DeleteHandler handles DELETE /api/sandbox/:instanceId.
-// It sends a kill signal directly to the sandbox instance via the libruntime API.
+// It confirms deletion of failed instances or sends a kill signal to the owner.
 func DeleteHandler(ctx *gin.Context) {
 	traceID := ensureSandboxTrace(ctx)
 	requestID := ensureSandboxRequestID(ctx, traceID)
@@ -2854,6 +2856,22 @@ func DeleteHandler(ctx *gin.Context) {
 		if errCode, err := authorizeSandboxDelete(ctx, instanceID); err != nil {
 			log.GetLogger().Warnf("reject sandbox delete instanceID=%s: %v", instanceID, err)
 			app.SetCtxResponse(ctx, nil, errCode, err)
+			return
+		}
+	}
+
+	// Keep the failure history for diagnostics; only authority can establish
+	// idempotent success. Authorization above still applies to that history.
+	if summary, ok := execendpoint.Default().GetSummary(instanceID); ok &&
+		(summary.StatusCode == execendpoint.StatusFatal || summary.StatusCode == execendpoint.StatusFailed) {
+		deleted, err := confirmSandboxInstanceDeleted(ctx.Request.Context(), instanceID)
+		if err != nil {
+			app.SetCtxResponse(ctx, nil, http.StatusServiceUnavailable,
+				fmt.Errorf("failed to confirm sandbox deletion: %w", err))
+			return
+		}
+		if deleted {
+			app.SetCtxResponse(ctx, map[string]string{"status": "deleted"}, http.StatusOK, nil)
 			return
 		}
 	}
