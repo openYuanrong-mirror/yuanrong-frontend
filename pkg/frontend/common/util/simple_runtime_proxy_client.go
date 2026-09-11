@@ -862,6 +862,10 @@ func (defaultFrontendProxyRouteResolver) ResolveFrontendProxyAddress(req simpleR
 	if err != nil {
 		return "", err
 	}
+	log.GetLogger().Debugf("frontend proxy invoke route resolved: traceID(%s), instance(%s), function(%s), "+
+		"requestTenant(%s), ownerProxyID(%s), address(%s)",
+		req.options.TraceID, req.instanceID, req.funcMeta.FuncID, firstArgTenantID(req.args),
+		route.OwnerProxyID, route.Address)
 	return route.Address, nil
 }
 
