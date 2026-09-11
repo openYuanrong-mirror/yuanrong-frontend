@@ -1799,6 +1799,69 @@ func TestFileMkdirHandlerRejectsMissingPath(t *testing.T) {
 	require.Contains(t, recorder.Body.String(), "path query parameter is required")
 }
 
+func TestExecHandlerForwardsCommand(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "exec-instance").Reset()
+	captured := stubExecutorTunnel(t, http.StatusOK, http.Header{},
+		`{"returncode":0,"stdout":"hello\n","stderr":""}`)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/agent/exec-instance/exec",
+		strings.NewReader(`{"command":"echo hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.POST("/api/agent/:instanceId/exec", ExecHandler)
+	router.ServeHTTP(recorder, request)
+
+	forwarded := <-captured
+	require.NoError(t, forwarded.err)
+	require.Equal(t, http.MethodPost, forwarded.request.Method)
+	require.Equal(t, "/v1/exec", forwarded.request.URL.Path)
+	require.Equal(t, `{"command":"echo hello"}`, string(forwarded.body))
+	require.Equal(t, "application/json", forwarded.request.Header.Get("Content-Type"))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"returncode":0,"stdout":"hello\n","stderr":""}`, recorder.Body.String())
+}
+
+func TestExecHandlerRejectsMissingInstance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	request := httptest.NewRequest(http.MethodPost, "/api/agent/missing-exec-instance/exec",
+		strings.NewReader(`{"command":"echo hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.POST("/api/agent/:instanceId/exec", ExecHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusNotFound, recorder.Code)
+	var response struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Equal(t, http.StatusNotFound, response.Code)
+	require.Contains(t, response.Message, "not found")
+}
+
+func TestExecHandlerPreservesErrorEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer stubInstanceFound(t, "exec-instance-error").Reset()
+	stubExecutorTunnel(t, http.StatusBadRequest, http.Header{},
+		`{"message":"command is required"}`)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/agent/exec-instance-error/exec",
+		strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.POST("/api/agent/:instanceId/exec", ExecHandler)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.JSONEq(t, `{"code":400,"message":"command is required"}`, recorder.Body.String())
+}
+
 func TestCountingReader(t *testing.T) {
 	convey.Convey("countingReader should count bytes", t, func() {
 		data := bytes.Repeat([]byte("A"), 100)
