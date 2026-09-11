@@ -1104,6 +1104,49 @@ func TestCreateHandlerInlineSupervisorToleratesEmptyImageURL(t *testing.T) {
 	require.NotContains(t, capturedInvokeOpt.CreateOpt["rootfs"], "imageurl")
 }
 
+// TestCreateHandlerInlineWorkdirPassthrough: rootfs.workdir is transparently passed into
+// the rootfs JSON (docker executor parses it into docker WorkingDir). It is a container-side
+// path, independent of the host-side workspace.
+func TestCreateHandlerInlineWorkdirPassthrough(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "instance-inline-wd", nil
+		},
+	})
+
+	req := inlineRootfsReq()
+	req.RuntimeSpec.Rootfs.Workdir = "/workspace"
+	recorder, ctx := newAgentCreateRecorder(t, req)
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t,
+		`{"mounts":[{"source":"/home/snuser/workspaceA","target":"/home/agentos","readonly":false}],
+		  "type":"image","imageurl":"yr-docker-runtime:v0","workdir":"/workspace"}`,
+		capturedInvokeOpt.CreateOpt["rootfs"])
+}
+
+// TestCreateHandlerInlineNoWorkdirKeepsImageDefault: without rootfs.workdir the rootfs JSON
+// carries no workdir key and the container keeps the image's default WORKDIR.
+func TestCreateHandlerInlineNoWorkdirKeepsImageDefault(t *testing.T) {
+	var capturedInvokeOpt api.InvokeOptions
+	setAPIClientsForTest(t, &runtimeStub{
+		createInstance: func(funcMeta api.FunctionMeta, args []api.Arg, invokeOpt api.InvokeOptions) (string, error) {
+			capturedInvokeOpt = invokeOpt
+			return "instance-inline-nowd", nil
+		},
+	})
+
+	req := inlineRootfsReq()
+	recorder, ctx := newAgentCreateRecorder(t, req)
+	CreateHandler(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.NotContains(t, capturedInvokeOpt.CreateOpt["rootfs"], "workdir")
+}
+
 // TestCreateHandlerInlineUserCodeSinksStorageType covers applyAgentInlineCode: codePath+
 // storageType are sunk into DELEGATE_DOWNLOAD, handler/extendedHandler into CodePaths.
 // storageType is passed through verbatim (mirroring the faas path). validateAgentCodeDescriptor
@@ -1458,7 +1501,7 @@ func sampleAgentSummaries() []execendpoint.Summary {
 				"host_user":        "agentos",
 				"workspace":        "/home/snuser/workspaceA",
 				"DELEGATE_ENV_VAR": `{"FOO":"bar"}`,
-				"rootfs": `{"type":"image","imageurl":"yr-docker-runtime:v0","mounts":[` +
+				"rootfs": `{"type":"image","imageurl":"yr-docker-runtime:v0","workdir":"/home/agentos","mounts":[` +
 					`{"source":"/data","target":"/data","readonly":false}]}`,
 				"network": `{"portForwardings":[{"port":22,"protocol":"TCP"}]}`,
 			},
@@ -1576,6 +1619,7 @@ func TestGetHandlerReturnsSingleInstance(t *testing.T) {
 	require.Equal(t, "yr-docker-runtime:v0", d.Rootfs.ImageURL)
 	require.Equal(t, "agentos", d.Rootfs.User)
 	require.Equal(t, "/home/snuser/workspaceA", d.Rootfs.Workspace)
+	require.Equal(t, "/home/agentos", d.Rootfs.Workdir)
 	require.Len(t, d.Rootfs.Mounts, 1)
 	require.Equal(t, "/data", d.Rootfs.Mounts[0].Source)
 	require.False(t, d.Rootfs.Mounts[0].ReadOnly)
