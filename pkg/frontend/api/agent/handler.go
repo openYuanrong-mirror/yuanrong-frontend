@@ -20,6 +20,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2081,6 +2082,52 @@ func FileMkdirHandler(ctx *gin.Context) {
 	request := agentExecutorHTTPRequest{
 		method: http.MethodPost, path: "/v1/files/mkdir", query: query,
 		headers: http.Header{"Accept": []string{"application/json"}},
+	}
+	if err := forwardAgentExecutorHTTP(ctx, instanceID, tenantID, request); err != nil {
+		writeFileTransferError(ctx, err)
+	}
+}
+
+// ExecHandler handles POST /api/agent/:instanceId/exec. It forwards the JSON
+// body through the existing TCP tunnel to the Executor's POST /v1/exec so the
+// command runs inside the agent instance's own container.
+func ExecHandler(ctx *gin.Context) {
+	instanceID := ctx.Param("instanceId")
+	if instanceID == "" {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("instanceId is required"))
+		return
+	}
+	exitLog := traceEnter(ctx, "exec", instanceID)
+	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
+	tenantID := httputil.GetCompatibleGinHeader(ctx.Request, constant.HeaderTenantID, "tenantId")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	if _, err := waitForAgentInstanceExist(instanceID); err != nil {
+		log.GetLogger().Warnf("exec instance not found %s: %v", instanceID, err)
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"code":    http.StatusNotFound,
+			"message": fmt.Sprintf("instance %s not found", instanceID),
+		})
+		return
+	}
+	body, err := io.ReadAll(ctx.Request.Body)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"message": fmt.Sprintf("failed to read request body: %v", err),
+		})
+		return
+	}
+	request := agentExecutorHTTPRequest{
+		method:        http.MethodPost,
+		path:          "/v1/exec",
+		body:          bytes.NewReader(body),
+		contentLength: int64(len(body)),
+		headers: http.Header{
+			"Content-Type": []string{"application/json"},
+			"Accept":       []string{"application/json"},
+		},
 	}
 	if err := forwardAgentExecutorHTTP(ctx, instanceID, tenantID, request); err != nil {
 		writeFileTransferError(ctx, err)
