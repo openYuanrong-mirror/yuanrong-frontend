@@ -3076,3 +3076,57 @@ func canceledContextForTest() context.Context {
 	cancel()
 	return ctx
 }
+
+func TestRoutingFrontendProxyOfflineDeleteUsesHealthyControlGateway(t *testing.T) {
+	for _, owner := range []string{execendpoint.InstanceManagerOwner, "removed-worker", ""} {
+		t.Run("owner-"+owner, func(t *testing.T) {
+			const instanceID = "offline-delete-control-gateway"
+			discovery := newMemoryFrontendProxyDiscovery()
+			discovery.ReplaceSnapshot([]frontendProxyEndpoint{{NodeID: "healthy-gateway", Address: "10.0.0.12:22769",
+				Capabilities: map[string]bool{frontendProxyCapabilityKill: true}}})
+			restore := setFrontendProxyDiscoveryForTest(discovery)
+			defer restore()
+			if owner != "" {
+				execendpoint.Default().PutSummary(execendpoint.Summary{InstanceID: instanceID,
+					Function: "tenant/function/$latest", NodeID: owner, StatusCode: 6})
+				defer execendpoint.Default().Delete(instanceID)
+			}
+			service := &fakeFrontendProxyServiceClient{killResp: &frontend_proxy.KillInstanceResponse{
+				Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_NONE},
+				Kill:   &core.KillResponse{Code: common.ErrorCode_ERR_NONE}}}
+			factory := &fakeFrontendProxyClientFactory{client: service}
+			client := &routingFrontendProxyLifecycleClient{clientFactory: factory, frontendClientID: "frontend-test"}
+			err := client.KillInstance(simpleRuntimeKillRequest{ctx: context.Background(), instanceID: instanceID,
+				tenantID: "tenant", signal: 1})
+			require.NoError(t, err)
+			require.Equal(t, "10.0.0.12:22769", factory.address)
+			require.Equal(t, "tenant", service.killReq.Context.TenantID)
+			require.Equal(t, instanceID, service.killReq.Kill.InstanceID)
+		})
+	}
+}
+
+func TestRoutingFrontendProxyOfflineDeleteDoesNotHideAuthoritativeFailure(t *testing.T) {
+	discovery := newMemoryFrontendProxyDiscovery()
+	discovery.ReplaceSnapshot([]frontendProxyEndpoint{{NodeID: "gateway", Address: "10.0.0.12:22769",
+		Capabilities: map[string]bool{frontendProxyCapabilityKill: true}}})
+	restore := setFrontendProxyDiscoveryForTest(discovery)
+	defer restore()
+	service := &fakeFrontendProxyServiceClient{killResp: &frontend_proxy.KillInstanceResponse{
+		Status: &frontend_proxy.FrontendProxyStatus{Code: common.ErrorCode_ERR_INNER_SYSTEM_ERROR,
+			Message: "failed to verify instance deletion"}}}
+	client := &routingFrontendProxyLifecycleClient{clientFactory: &fakeFrontendProxyClientFactory{client: service},
+		frontendClientID: "frontend-test"}
+	err := client.KillInstance(simpleRuntimeKillRequest{ctx: context.Background(), instanceID: "unverified-absence",
+		tenantID: "tenant", signal: 1})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to verify instance deletion")
+}
+
+func TestRoutingFrontendProxyCustomSignalDoesNotUseShutdownGateway(t *testing.T) {
+	client := &routingFrontendProxyLifecycleClient{}
+	_, err := client.resolveKillAddress(simpleRuntimeKillRequest{ctx: context.Background(),
+		instanceID: "missing-custom-signal", signal: 64}, false, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not present in frontend route cache")
+}

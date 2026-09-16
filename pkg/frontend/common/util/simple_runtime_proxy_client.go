@@ -793,6 +793,18 @@ func (c *routingFrontendProxyLifecycleClient) KillInstanceWithResponse(
 func (c *routingFrontendProxyLifecycleClient) resolveKillAddress(
 	req simpleRuntimeKillRequest, paused bool, excluded map[string]struct{},
 ) (string, error) {
+	controlGateway := func() (string, error) {
+		endpoint, err := proxyrouting.Select(req.ctx, proxyrouting.CapabilityKill, excluded)
+		if err != nil {
+			return "", fmt.Errorf("select instance %s shutdown gateway: %w", req.instanceID, err)
+		}
+		if !proxyrouting.IsRoutableAddress(endpoint.GRPCAddress) {
+			return "", fmt.Errorf("selected shutdown gateway has no routable address")
+		}
+		return endpoint.GRPCAddress, nil
+	}
+	shutdown := req.signal == 1 || req.signal == 3
+
 	if paused {
 		endpoint, err := proxyrouting.Select(req.ctx, proxyrouting.CapabilityKill, excluded)
 		if err != nil {
@@ -812,10 +824,16 @@ func (c *routingFrontendProxyLifecycleClient) resolveKillAddress(
 	// deleted by the watcher, so it remains available while a kill is in flight.
 	summary, ok := execendpoint.Default().GetSummary(req.instanceID)
 	if !ok || summary.NodeID == "" {
+		if shutdown {
+			return controlGateway()
+		}
 		return "", fmt.Errorf("instance %s is not present in frontend route cache", req.instanceID)
 	}
 	endpoint, ok := proxyrouting.Lookup(summary.NodeID, proxyrouting.CapabilityKill)
 	if !ok {
+		if shutdown {
+			return controlGateway()
+		}
 		return "", fmt.Errorf("owner proxy %s for instance %s does not publish healthy capability %s",
 			summary.NodeID, req.instanceID, proxyrouting.CapabilityKill)
 	}
