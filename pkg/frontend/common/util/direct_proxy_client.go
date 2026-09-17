@@ -59,9 +59,10 @@ type DirectInvokeRequest struct {
 
 // DirectCreateRequest carries a validated direct FunctionProxy create request.
 type DirectCreateRequest struct {
-	functionMeta api.FunctionMeta
-	args         []api.Arg
-	options      api.InvokeOptions
+	functionMeta         api.FunctionMeta
+	designatedInstanceID string
+	args                 []api.Arg
+	options              api.InvokeOptions
 }
 
 // DirectRawRequest carries a raw FunctionSystem request and its trace context.
@@ -108,18 +109,25 @@ func NewDirectInvokeRequest(req InvokeRequest) (DirectInvokeRequest, error) {
 // Actor direct creation must use a separate constructor because its create wire
 // contract must not inherit the FaaS argument encoding performed by this path.
 func NewDirectCreateRequest(
-	funcMeta api.FunctionMeta, args []api.Arg, options api.InvokeOptions,
+	funcMeta api.FunctionMeta, designatedInstanceID string, args []api.Arg, options api.InvokeOptions,
 ) (DirectCreateRequest, error) {
 	if err := validateDirectProxyArgs(args); err != nil {
 		return DirectCreateRequest{}, err
 	}
-	return DirectCreateRequest{functionMeta: funcMeta, args: args, options: options}, nil
+	return DirectCreateRequest{
+		functionMeta: funcMeta, designatedInstanceID: designatedInstanceID, args: args, options: options,
+	}, nil
 }
 
 // AdaptedCreateValues is used by entry adapters and test doubles while typed
 // handler construction is being moved away from libruntime-owned option types.
 func (r DirectCreateRequest) AdaptedCreateValues() (api.FunctionMeta, []api.Arg, api.InvokeOptions) {
 	return r.functionMeta, r.args, r.options
+}
+
+// DesignatedInstanceID returns the caller-selected logical instance identity.
+func (r DirectCreateRequest) DesignatedInstanceID() string {
+	return r.designatedInstanceID
 }
 
 // NewDirectRawRequest builds a raw request without changing its payload.
@@ -280,10 +288,11 @@ func (c *directProxyClient) CreateInstance(req DirectCreateRequest) (string, err
 		tenantID = req.options.CreateOpt["tenantId"]
 	}
 	return c.lifecycleClient.CreateInstance(simpleRuntimeCreateRequest{
-		funcMeta: req.functionMeta,
-		tenantID: tenantID,
-		args:     req.args,
-		options:  req.options,
+		funcMeta:             req.functionMeta,
+		tenantID:             tenantID,
+		designatedInstanceID: req.designatedInstanceID,
+		args:                 req.args,
+		options:              req.options,
 	})
 }
 

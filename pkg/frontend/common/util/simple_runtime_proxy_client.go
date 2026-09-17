@@ -333,12 +333,13 @@ func (c *grpcFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreat
 			TraceID:          req.options.TraceID,
 		},
 		Create: &core.CreateRequest{
-			Function:      req.funcMeta.FuncID,
-			Args:          convertSimpleRuntimeCreateArgs(req.funcMeta, req.args, req.options.CodePaths),
-			RequestID:     requestID,
-			TraceID:       req.options.TraceID,
-			CreateOptions: convertSimpleRuntimeCreateOptions(req.options),
-			SchedulingOps: convertSimpleRuntimeSchedulingOps(req.options),
+			Function:             req.funcMeta.FuncID,
+			Args:                 convertSimpleRuntimeCreateArgs(req.funcMeta, req.args, req.options.CodePaths),
+			RequestID:            requestID,
+			TraceID:              req.options.TraceID,
+			CreateOptions:        convertSimpleRuntimeCreateOptions(req.options),
+			SchedulingOps:        convertSimpleRuntimeSchedulingOps(req.options),
+			DesignatedInstanceID: req.designatedInstanceID,
 		},
 	})
 	if err != nil {
