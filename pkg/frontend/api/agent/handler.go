@@ -1390,6 +1390,10 @@ func createAgentInstance(
 
 // DeleteHandler handles DELETE /api/agent/:instanceId.
 // Input is the instance_id returned by create; kills the agent instance directly.
+//
+// Asynchronous: 200 means the delete was accepted, not completed — the kill
+// RPC runs in the background. Callers poll GET /api/agent/:instanceId for the
+// terminal state (EXITING during the delete window, 404 once it clears).
 func DeleteHandler(ctx *gin.Context) {
 	instanceID := ctx.Param("instanceId")
 	if instanceID == "" {
@@ -1402,97 +1406,43 @@ func DeleteHandler(ctx *gin.Context) {
 	if tenantID == "" {
 		tenantID = "default"
 	}
+	// Same cache pair the kill client resolves through; missing from both means
+	// unknown or already deleted.
+	if instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID) == nil &&
+		!lookupAgentInstanceSummaryExists(instanceID) {
+		ctx.JSON(http.StatusNotFound,
+			gin.H{"code": 404, "message": fmt.Sprintf("instance not found: %s", instanceID)})
+		return
+	}
 	invokeOpts := api.InvokeOptions{
 		TraceID: ctx.GetHeader(constant.HeaderTraceID),
 	}
-	// KillInstance resolves the owning proxy from the routable table first, then
-	// falls back to the execendpoint summary for non-routable states (FATAL/EXITED/
-	// FAILED) that self-clear from the table. A missing instance (absent from both
-	// the table and the summary cache) returns a not-found error mapped to 404, so
-	// already-deleted instances stay idempotent without leaking FATAL zombies.
-	if err := util.GetDirectProxyClient().KillInstance(util.NewDirectKillRequest(
-		ctx.Request.Context(), instanceID, agentKillInstanceSignal, []byte("agent deleted"), tenantID, invokeOpts,
-	)); err != nil {
-		if isAgentInstanceNotFound(err) {
-			ctx.JSON(http.StatusNotFound,
-				gin.H{"code": 404, "message": fmt.Sprintf("instance not found: %s", instanceID)})
-			return
-		}
-		// A non-routable terminal state (FATAL/FAILED) reaches the owning proxy only
-		// via the summary fallback, and the proxy answers route-stale/owner-unknown
-		// because the backend already cleared the instance. The etcd key is gone but
-		// the summary cache is retained (so GET-before-DELETE still reports the final
-		// failure state); drop the residual cache and treat the delete as complete.
-		if lookupAgentInstanceSummaryExists(instanceID) {
-			execendpoint.Default().Delete(instanceID)
-			log.GetLogger().Infof("agent instance %s kill failed (%v) but summary remained; cleared residual cache",
-				instanceID, err)
-			ctx.JSON(http.StatusOK, gin.H{"code": 200, "status": "deleted"})
-			return
-		}
-		log.GetLogger().Errorf("failed to kill agent instance %s: %v", instanceID, err)
-		ctx.JSON(http.StatusInternalServerError,
-			gin.H{"code": 500, "message": fmt.Sprintf("failed to delete agent: %v", err)})
-		return
-	}
-	// The kill RPC returned; the backend asynchronously runs the exit handler to
-	// delete the etcd key and stop the sandbox. Poll the in-process caches (driven
-	// by the etcd watcher) until both clear, so a 200 guarantees the frontend side is
-	// consistent rather than merely acknowledging the kill request.
-	if !waitForAgentInstanceDeleted(ctx, instanceID) {
-		log.GetLogger().Warnf("agent instance %s kill sent but frontend caches not fully cleared", instanceID)
-		ctx.JSON(http.StatusInternalServerError,
-			gin.H{"code": 500, "message": fmt.Sprintf("instance %s kill accepted but not fully cleared", instanceID)})
-		return
-	}
+	// Detached context: a client disconnect must not cancel the in-flight
+	// deletion; the client applies its own default timeout.
+	go killAgentInstanceInBackground(instanceID, agentKillInstanceSignal, tenantID, invokeOpts)
 	ctx.JSON(http.StatusOK, gin.H{"code": 200, "status": "deleted"})
 }
 
-// isAgentInstanceNotFound reports whether err means the instance is absent from
-// both the routable table and the execendpoint summary cache — i.e. unknown or
-// already deleted — so DELETE maps it to an idempotent 404 instead of a 500.
-func isAgentInstanceNotFound(err error) bool {
+// killAgentInstanceInBackground runs the already-acknowledged kill RPC to
+// completion. Failures are logged, not surfaced: the backend exit handler and
+// master fault takeover own the eventual cleanup.
+func killAgentInstanceInBackground(instanceID string, signal int, tenantID string, invokeOpts api.InvokeOptions) {
+	err := util.GetDirectProxyClient().KillInstance(util.NewDirectKillRequest(
+		context.Background(), instanceID, signal, []byte("agent deleted"), tenantID, invokeOpts,
+	))
 	if err == nil {
-		return false
+		return
 	}
-	return strings.Contains(err.Error(), "not present in frontend route cache")
-}
-
-// waitForAgentInstanceDeleted polls until the instance is gone from both the
-// routable table and the execendpoint summary cache. The summary cache is
-// watcher-driven and clears only on the etcd DELETE event, so its absence
-// implies the backend has deleted the instance key. A terminal state
-// (FATAL/FAILED) is retained by the watcher's EventDelete branch so
-// GET-after-failure still reports the final state; once the routable table has
-// cleared, that retention is the only reason the summary lingers, so it is
-// dropped here instead of waiting out the full poll timeout.
-func waitForAgentInstanceDeleted(ctx *gin.Context, instanceID string) bool {
-	const (
-		pollInterval = 200 * time.Millisecond
-		pollTimeout  = 30 * time.Second
-	)
-	deadline := time.Now().Add(pollTimeout)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Request.Context().Done():
-			return false
-		default:
-		}
-		if instancemanager.GetGlobalInstanceScheduler().GetInstanceByIDAcrossFunctions(instanceID) == nil {
-			if !lookupAgentInstanceSummaryExists(instanceID) {
-				return true
-			}
-			// Backend deleted the instance; a lingering summary must be a terminal
-			// state retained by the watcher's EventDelete branch — clear and done.
-			if summary, ok := execendpoint.Default().GetSummary(instanceID); ok &&
-				(summary.StatusCode == execendpoint.StatusFatal || summary.StatusCode == execendpoint.StatusFailed) {
-				execendpoint.Default().Delete(instanceID)
-				return true
-			}
-		}
-		time.Sleep(pollInterval)
+	// The etcd key is gone but FATAL/FAILED summaries are retained by the
+	// watcher; a kill error here means the proxy answered route-stale, so drop
+	// the residual cache and treat the delete as complete.
+	if lookupAgentInstanceSummaryExists(instanceID) {
+		execendpoint.Default().Delete(instanceID)
+		log.GetLogger().Infof("agent instance %s kill failed (%v) but summary remained; cleared residual cache",
+			instanceID, err)
+		return
 	}
-	return false
+	log.GetLogger().Errorf("failed to kill agent instance %s: %v", instanceID, err)
 }
 
 func lookupAgentInstanceSummaryExists(instanceID string) bool {
