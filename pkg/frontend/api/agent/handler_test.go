@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/gin-gonic/gin"
@@ -304,6 +305,10 @@ const (
 	testAgentMemory          = 512
 	testAgentStorageMiB      = 200
 	testAgentStorageLimitMiB = 300
+
+	// testBackgroundKillWait bounds the wait for the delete handler's background
+	// kill goroutine to reach the stubbed client.
+	testBackgroundKillWait = 5 * time.Second
 )
 
 // newAgentCreateRecorder builds a gin test context with a JSON CreateAgentRequest body.
@@ -900,27 +905,27 @@ func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
 		capturedPayload    []byte
 		capturedInvokeOpt  api.InvokeOptions
 	)
-	// The instance is present until the kill RPC fires; the kill callback flips
-	// the cache to absent, mirroring the async etcd-delete the exit handler runs
-	// so waitForAgentInstanceDeleted observes the clear and the handler returns 200.
-	cleared := false
+	// The kill runs in a background goroutine after the handler has already
+	// responded; signal its completion so assertions stay deterministic.
+	killed := make(chan struct{})
+	// The instance is present in the routable table so the pre-check passes.
 	patches := gomonkey.ApplyMethod(
 		reflect.TypeOf(instancemanager.GetGlobalInstanceScheduler()),
 		"GetInstanceByIDAcrossFunctions",
 		func(_ *instancemanager.FunctionInstancesMap, id string) *types.InstanceSpecification {
-			if id == instanceID && !cleared {
+			if id == instanceID {
 				return &types.InstanceSpecification{}
 			}
 			return nil
 		})
 	defer patches.Reset()
 	setAPIClientsForTest(t, &runtimeStub{
-		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
-			capturedInstanceID = instanceID
+		kill: func(killInstanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
+			capturedInstanceID = killInstanceID
 			capturedSignal = signal
 			capturedPayload = append([]byte(nil), payload...)
 			capturedInvokeOpt = invokeOpt
-			cleared = true
+			close(killed)
 			return nil
 		},
 	})
@@ -935,20 +940,29 @@ func TestDeleteHandlerDeletesAgentInstance(t *testing.T) {
 	DeleteHandler(ctx)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"code":200,"status":"deleted"}`, recorder.Body.String())
+	select {
+	case <-killed:
+	case <-time.After(testBackgroundKillWait):
+		t.Fatal("background kill was not invoked")
+	}
 	require.Equal(t, instanceID, capturedInstanceID)
 	require.Equal(t, agentKillInstanceSignal, capturedSignal)
 	require.Equal(t, []byte("agent deleted"), capturedPayload)
 	// KillByLibRt always passes an empty InvokeOptions to the libruntime client.
 	require.Equal(t, api.InvokeOptions{}, capturedInvokeOpt)
-	require.JSONEq(t, `{"code":200,"status":"deleted"}`, recorder.Body.String())
 }
 
-func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
+func TestDeleteHandlerReturns200WhenKillFailsInBackground(t *testing.T) {
 	const instanceID = "agent-delete-fail"
 	defer stubInstanceFound(t, instanceID).Reset()
 
+	// A kill failure after acknowledgement is owned by the background path,
+	// never surfaced to the caller.
+	killed := make(chan struct{})
 	setAPIClientsForTest(t, &runtimeStub{
-		kill: func(instanceID string, signal int, payload []byte, invokeOpt api.InvokeOptions) error {
+		kill: func(string, int, []byte, api.InvokeOptions) error {
+			close(killed)
 			return fmt.Errorf("kill failed")
 		},
 	})
@@ -962,8 +976,13 @@ func TestDeleteHandlerReturns500WhenKillFails(t *testing.T) {
 
 	DeleteHandler(ctx)
 
-	require.Equal(t, http.StatusInternalServerError, recorder.Code)
-	require.Contains(t, recorder.Body.String(), "failed to delete agent")
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.JSONEq(t, `{"code":200,"status":"deleted"}`, recorder.Body.String())
+	select {
+	case <-killed:
+	case <-time.After(testBackgroundKillWait):
+		t.Fatal("background kill was not invoked")
+	}
 }
 
 func TestDeleteHandlerReturns404ForNonExistentInstance(t *testing.T) {
