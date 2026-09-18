@@ -42,11 +42,13 @@ import (
 
 	"frontend/pkg/common/constants"
 	"frontend/pkg/common/faas_common/constant"
+	"frontend/pkg/common/faas_common/grpc/pb/common"
 	"frontend/pkg/common/faas_common/grpc/pb/runtime"
 	"frontend/pkg/common/faas_common/logger/log"
 	"frontend/pkg/common/faas_common/resspeckey"
 	"frontend/pkg/common/faas_common/types"
 	"frontend/pkg/common/faas_common/urnutils"
+	"frontend/pkg/common/uuid"
 	"frontend/pkg/frontend/api/app"
 	"frontend/pkg/frontend/common/httputil"
 	"frontend/pkg/frontend/common/util"
@@ -70,6 +72,8 @@ const (
 	agentExecutorInitEntry      = "yr.agentexecutor.handler.initialize"
 	agentExecutorCallEntry      = "yr.agentexecutor.handler.handle"
 	agentExecutorPreStopEntry   = "yr.agentexecutor.handler.pre_stop"
+	agentReuseExistingInstance  = "AGENT_REUSE_EXISTING_INSTANCE"
+	agentIdentityCanonicalScope = "yuanrong-agent-instance:v1|"
 	// Keep this container-internal tunnel target aligned with DEFAULT_EXECUTOR_PORT
 	// in yuanrong-agentruntime's agentexecutor runtime. It must not be added to
 	// rootfs portForwardings: the owner proxy reaches it through containerIP:port.
@@ -110,6 +114,13 @@ type agentCreateConfig struct {
 	preStopTimeout   int
 	runtime          string
 	runtimeSpec      *RuntimeSpec
+}
+
+type agentCreateCall struct {
+	designatedInstanceID string
+	funcMeta             api.FunctionMeta
+	invokeOpts           api.InvokeOptions
+	args                 []api.Arg
 }
 
 type agentExecutorHTTPRequest struct {
@@ -331,6 +342,11 @@ func CreateHandler(ctx *gin.Context) {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err))
 		return
 	}
+	if err := validateAgentIdentity(req.Namespace, req.Name); err != nil {
+		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
+		return
+	}
+	instanceID := generateAgentInstanceID(req.Namespace, req.Name)
 	exitLog := traceEnter(ctx, "create", "", kv("name", req.Name), kv("ns", req.Namespace))
 	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
 
@@ -409,7 +425,28 @@ func CreateHandler(ctx *gin.Context) {
 		InvokeLabel: "",
 	}
 	args := buildAgentCreateArgs(createConfig, resKey)
-	createAgentInstance(ctx, req, funcMeta, invokeOpts, args)
+	createAgentInstance(ctx, req, agentCreateCall{
+		designatedInstanceID: instanceID,
+		funcMeta:             funcMeta,
+		invokeOpts:           invokeOpts,
+		args:                 args,
+	})
+}
+
+func validateAgentIdentity(namespace, name string) error {
+	if namespace == "" {
+		return fmt.Errorf("namespace is required")
+	}
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	return nil
+}
+
+func generateAgentInstanceID(namespace, name string) string {
+	canonicalKey := fmt.Sprintf("%s%d:%s%d:%s", agentIdentityCanonicalScope,
+		len([]byte(namespace)), namespace, len([]byte(name)), name)
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(canonicalKey)).String()
 }
 
 func isSupportedAgentPythonRuntime(runtime string) bool {
@@ -1324,6 +1361,7 @@ func applyAgentCreateOpts(invokeOpts *api.InvokeOptions, ctx *gin.Context, req C
 	}
 	invokeOpts.CreateOpt[constant.InstanceTypeNote] = agentInstanceType
 	invokeOpts.CreateOpt[constant.SchedulerManagedNote] = strconv.FormatBool(false)
+	invokeOpts.CreateOpt[agentReuseExistingInstance] = strconv.FormatBool(true)
 	invokeOpts.CreateOpt["call_timeout"] = strconv.Itoa(agentCreateBusinessTimeoutSeconds)
 	invokeOpts.CreateOpt["init_call_timeout"] = strconv.Itoa(agentInitTimeoutSeconds)
 	gracefulShutdownSeconds := agentGracefulShutdownSeconds
@@ -1355,18 +1393,32 @@ func validateBindSource(path, label string) error {
 }
 
 func createAgentInstance(
-	ctx *gin.Context, req CreateAgentRequest, funcMeta api.FunctionMeta, invokeOpts api.InvokeOptions,
-	args []api.Arg,
+	ctx *gin.Context, req CreateAgentRequest, call agentCreateCall,
 ) {
 	exitLog := traceEnter(ctx, "create", "", kv("name", req.Name), kv("ns", req.Namespace))
 	defer func() { exitLog(resultHTTP(ctx.Writer.Status())) }()
-	directReq, err := util.NewDirectCreateRequest(funcMeta, args, invokeOpts)
+	directReq, err := util.NewDirectCreateRequest(
+		call.funcMeta, call.designatedInstanceID, call.args, call.invokeOpts)
 	if err != nil {
 		app.SetCtxResponse(ctx, nil, http.StatusBadRequest, err)
 		return
 	}
 	instanceID, err := util.GetDirectProxyClient().CreateInstance(directReq)
+	handleAgentCreateResult(ctx, req, directReq, instanceID, err)
+}
+
+func handleAgentCreateResult(
+	ctx *gin.Context, req CreateAgentRequest, directReq util.DirectCreateRequest, instanceID string, err error,
+) {
 	if err != nil {
+		if metadata, ok := util.GetDirectProxyErrorMetadata(err); ok &&
+			metadata.Code == int(common.ErrorCode_ERR_INSTANCE_DUPLICATED) {
+			log.GetLogger().Infof("agent instance reused: instanceID=%s name=%s ns=%s",
+				directReq.DesignatedInstanceID(), req.Name, req.Namespace)
+			ctx.JSON(http.StatusOK, gin.H{"code": 200, "instance_id": directReq.DesignatedInstanceID()})
+			return
+		}
+		funcMeta, _, invokeOpts := directReq.AdaptedCreateValues()
 		if shouldTreatCreateTimeoutAsSuccess(instanceID, err) {
 			if waitForAgentInstanceRunning(instanceID, funcMeta.FuncID,
 				invokeOpts.CreateOpt[constant.ResourceSpecNote]) {

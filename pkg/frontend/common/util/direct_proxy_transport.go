@@ -47,10 +47,11 @@ type simpleRuntimeRawCreateRequest struct {
 }
 
 type simpleRuntimeCreateRequest struct {
-	funcMeta api.FunctionMeta
-	tenantID string
-	args     []api.Arg
-	options  api.InvokeOptions
+	funcMeta             api.FunctionMeta
+	tenantID             string
+	designatedInstanceID string
+	args                 []api.Arg
+	options              api.InvokeOptions
 }
 
 type simpleRuntimeKillRequest struct {
