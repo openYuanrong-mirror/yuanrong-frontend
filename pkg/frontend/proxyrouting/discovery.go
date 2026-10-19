@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -196,6 +197,7 @@ type MemoryDiscovery struct {
 	next         uint64
 	suspectUntil map[string]time.Time
 	revisions    map[string]int64
+	ipIndex      map[string]string
 }
 
 // NewMemoryDiscovery creates an empty in-memory discovery cache.
@@ -204,6 +206,7 @@ func NewMemoryDiscovery() *MemoryDiscovery {
 		endpoints:    make(map[string]Endpoint),
 		suspectUntil: make(map[string]time.Time),
 		revisions:    make(map[string]int64),
+		ipIndex:      make(map[string]string),
 	}
 }
 
@@ -238,6 +241,7 @@ func (d *MemoryDiscovery) ReplaceSnapshot(endpoints []Endpoint) {
 	addresses := make(map[string]struct{}, len(endpoints)*endpointAddressCapacityFactor)
 	order := make([]string, 0, len(endpoints))
 	revisions := make(map[string]int64, len(endpoints))
+	ipIndex := make(map[string]string, len(endpoints))
 	for _, endpoint := range endpoints {
 		if !isHealthyEndpoint(endpoint) {
 			continue
@@ -249,8 +253,11 @@ func (d *MemoryDiscovery) ReplaceSnapshot(endpoints []Endpoint) {
 		addresses[endpoint.GRPCAddress] = struct{}{}
 		addresses[endpoint.TCPTunnelAddress] = struct{}{}
 		revisions[endpoint.NodeID] = endpoint.Revision
+		if host := hostFromAddress(endpoint.GRPCAddress); host != "" {
+			ipIndex[host] = endpoint.NodeID
+		}
 	}
-	d.endpoints, d.order, d.revisions, d.next = next, order, revisions, 0
+	d.endpoints, d.order, d.revisions, d.next, d.ipIndex = next, order, revisions, 0, ipIndex
 	for address := range d.suspectUntil {
 		if _, ok := addresses[address]; !ok {
 			delete(d.suspectUntil, address)
@@ -274,6 +281,9 @@ func (d *MemoryDiscovery) Upsert(endpoint Endpoint) {
 	d.endpoints[endpoint.NodeID] = endpoint
 	if endpoint.Revision > 0 {
 		d.revisions[endpoint.NodeID] = endpoint.Revision
+	}
+	if host := hostFromAddress(endpoint.GRPCAddress); host != "" {
+		d.ipIndex[host] = endpoint.NodeID
 	}
 }
 
@@ -302,6 +312,11 @@ func (d *MemoryDiscovery) Delete(nodeID string, revision int64) {
 	delete(d.endpoints, nodeID)
 	delete(d.suspectUntil, endpoint.GRPCAddress)
 	delete(d.suspectUntil, endpoint.TCPTunnelAddress)
+	if host := hostFromAddress(endpoint.GRPCAddress); host != "" {
+		if existing, ok := d.ipIndex[host]; ok && existing == nodeID {
+			delete(d.ipIndex, host)
+		}
+	}
 	for i, current := range d.order {
 		if current == nodeID {
 			d.order = append(d.order[:i], d.order[i+1:]...)
@@ -390,4 +405,82 @@ func (d *MemoryDiscovery) isSuspectAddressLocked(address string, now time.Time) 
 	}
 	delete(d.suspectUntil, address)
 	return false
+}
+
+// hostFromAddress extracts the host portion of a host:port address.
+func hostFromAddress(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(host)
+}
+
+// ipDiscovery is an optional interface that Discovery implementations can
+// satisfy to provide IP-based lookups.
+type ipDiscovery interface {
+	NodeIPs(capability Capability) []string
+	GetByIP(ip string, capability Capability) (Endpoint, bool)
+}
+
+// NodeIPs returns the sorted unique host IPs of healthy endpoints that
+// advertise the given capability.
+func NodeIPs(capability Capability) []string {
+	d, ok := currentDiscovery().(ipDiscovery)
+	if !ok || d == nil {
+		return nil
+	}
+	return d.NodeIPs(capability)
+}
+
+// NodeIPs returns the sorted unique host IPs of healthy endpoints that
+// advertise the given capability.
+func (d *MemoryDiscovery) NodeIPs(capability Capability) []string {
+	if d == nil {
+		return nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	seen := make(map[string]struct{})
+	for _, endpoint := range d.endpoints {
+		if !endpoint.Capabilities[capability] {
+			continue
+		}
+		host := hostFromAddress(endpoint.GRPCAddress)
+		if host == "" {
+			continue
+		}
+		seen[host] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for ip := range seen {
+		result = append(result, ip)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// GetByIP returns a healthy endpoint whose GRPCAddress host matches ip and
+// that advertises the given capability.
+func GetByIP(ip string, capability Capability) (Endpoint, bool) {
+	d, ok := currentDiscovery().(ipDiscovery)
+	if !ok || d == nil {
+		return Endpoint{}, false
+	}
+	return d.GetByIP(ip, capability)
+}
+
+// GetByIP returns a healthy endpoint whose GRPCAddress host matches ip and
+// that advertises the given capability.
+func (d *MemoryDiscovery) GetByIP(ip string, capability Capability) (Endpoint, bool) {
+	if d == nil || ip == "" {
+		return Endpoint{}, false
+	}
+	d.mu.RLock()
+	nodeID, ok := d.ipIndex[ip]
+	d.mu.RUnlock()
+	if !ok {
+		return Endpoint{}, false
+	}
+	return d.GetByNode(nodeID, capability)
 }

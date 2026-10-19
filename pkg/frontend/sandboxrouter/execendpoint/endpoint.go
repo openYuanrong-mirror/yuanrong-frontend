@@ -197,3 +197,11 @@ var defaultStore = NewStore()
 func Default() *Store {
 	return defaultStore
 }
+
+// SetDefaultForTest replaces the package-level Store for testing and returns
+// the previous store so callers can restore it.
+func SetDefaultForTest(store *Store) *Store {
+	previous := defaultStore
+	defaultStore = store
+	return previous
+}

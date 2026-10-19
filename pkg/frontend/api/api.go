@@ -39,6 +39,7 @@ import (
 	"frontend/pkg/frontend/api/resources"
 	"frontend/pkg/frontend/api/sandbox"
 	v1 "frontend/pkg/frontend/api/v1"
+	"frontend/pkg/frontend/api/workspace"
 	"frontend/pkg/frontend/common"
 	"frontend/pkg/frontend/config"
 	"frontend/pkg/frontend/frontendsdkadapter/handler"
@@ -230,6 +231,14 @@ func InitRoute(r *gin.Engine) {
 		agentGroup.GET("/:instanceId/files/list", agent.FileListHandler)
 		agentGroup.POST("/:instanceId/files/mkdir", agent.FileMkdirHandler)
 		agentGroup.POST("/:instanceId/exec", agent.ExecHandler)
+	}
+
+	// workspace management (create/delete per-owner workspace directory on the
+	// owning function_proxy node; affinity decided by frontend and persisted in etcd)
+	workspaceGroup := r.Group("/api/workspace")
+	{
+		workspaceGroup.POST("", workspace.CreateHandler)
+		workspaceGroup.DELETE("", workspace.DeleteHandler)
 	}
 
 	// web terminal

@@ -152,6 +152,12 @@ type Config struct {
 	LeaseBypass             bool             `json:"leaseBypass" valid:"optional"`
 	// Async invocation config
 	AsyncInvocation *AsyncInvocationConfig `json:"asyncInvocation" valid:"optional"`
+	// WorkspaceAccessRoot is the host-side root directory for per-user workspace
+	// bind mounts. Defaults to /home/agentos/users when empty.
+	WorkspaceAccessRoot string `json:"workspaceAccessRoot" valid:"optional"`
+	// WorkspaceOwnershipResolver selects the ownership resolver backend
+	// (default "etcd") for querying workspace affinity during agent creation.
+	WorkspaceOwnershipResolver string `json:"workspaceOwnershipResolver" valid:"optional"`
 }
 
 // IamConfig -

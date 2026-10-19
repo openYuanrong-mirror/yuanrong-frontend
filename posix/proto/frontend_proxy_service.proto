@@ -36,6 +36,8 @@ service FrontendProxyService {
   rpc InvokeInstanceStream (InvokeInstanceRequest) returns (stream InvokeInstanceStreamResponse) {}
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceResponse) {}
   rpc KillInstance (KillInstanceRequest) returns (KillInstanceResponse) {}
+  rpc PrepareWorkspace (PrepareWorkspaceRequest) returns (PrepareWorkspaceResponse) {}
+  rpc RemoveWorkspace (RemoveWorkspaceRequest) returns (RemoveWorkspaceResponse) {}
 }
 
 message FrontendRequestContext {
@@ -116,4 +118,24 @@ message KillInstanceRequest {
 message KillInstanceResponse {
   FrontendProxyStatus status = 1;
   core_service.KillResponse kill = 2;
+}
+
+message PrepareWorkspaceRequest {
+  FrontendRequestContext context = 1;
+  string owner = 2;
+  string mode = 3;
+}
+
+message PrepareWorkspaceResponse {
+  FrontendProxyStatus status = 1;
+  string path = 2;
+}
+
+message RemoveWorkspaceRequest {
+  FrontendRequestContext context = 1;
+  string owner = 2;
+}
+
+message RemoveWorkspaceResponse {
+  FrontendProxyStatus status = 1;
 }

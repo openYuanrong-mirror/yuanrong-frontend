@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -98,6 +99,9 @@ const (
 	functionMetaIDField              protowire.Number = 11
 	metaDataConfigField              protowire.Number = 3
 	metaConfigCodePathsField         protowire.Number = 2
+
+	workspaceCreateOptKey            = "workspace"
+	workspaceAffinityRetryReason     = "workspace-affinity"
 )
 
 type grpcFrontendProxyInvokeClient struct {
@@ -618,9 +622,141 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDStream(
 	return payload, nil
 }
 
+// workspaceAffinityErr is returned when workspace-affinity routing fails in a
+// retryable way (e.g. etcd record missing, owning node down). It implements
+// directProxyClassifiedError so the direct-proxy error metadata path can
+// classify it as retryable, pre-dispatch.
+type workspaceAffinityErr struct {
+	cause   error
+	owner   string
+	owningIP string
+}
+
+func (e *workspaceAffinityErr) Error() string {
+	if e == nil {
+		return "workspace affinity error"
+	}
+	if e.cause != nil {
+		return e.cause.Error()
+	}
+	return fmt.Sprintf("workspace affinity error for owner %q", e.owner)
+}
+
+func (e *workspaceAffinityErr) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *workspaceAffinityErr) directProxyErrorMetadata() DirectProxyErrorMetadata {
+	return DirectProxyErrorMetadata{
+		Code:        int(common.ErrorCode_ERR_INNER_COMMUNICATION),
+		Retryable:   true,
+		RetryReason: workspaceAffinityRetryReason,
+	}
+}
+
+// resolveOwningEndpoint looks up the owning proxy endpoint for a workspace by
+// querying the OwnershipResolver for the workspace owner. The owner is derived
+// from the workspace path via filepath.Base. If no ownership record exists or
+// the owning node is not registered, a retryable workspaceAffinityErr is
+// returned so the caller can surface a retryable error.
+func resolveOwningEndpoint(ctx context.Context, workspace string) (proxyrouting.Endpoint, error) {
+	owner := filepath.Base(workspace)
+	if owner == "" || owner == "." || owner == "/" {
+		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
+			cause: fmt.Errorf("cannot derive owner from workspace path %q", workspace),
+			owner: owner,
+		}
+	}
+	resolver := proxyrouting.GetGlobalOwnershipResolver()
+	if resolver == nil {
+		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
+			cause: fmt.Errorf("ownership resolver not available"),
+			owner: owner,
+		}
+	}
+	owningIP, err := resolver.Resolve(ctx, owner)
+	if err != nil {
+		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
+			cause: fmt.Errorf("failed to read workspace affinity: %w", err),
+			owner: owner,
+		}
+	}
+	if owningIP == "" {
+		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
+			cause: fmt.Errorf("workspace not prepared for owner %q, create workspace first", owner),
+			owner: owner,
+		}
+	}
+	endpoint, ok := proxyrouting.GetByIP(owningIP, proxyrouting.CapabilityCreate)
+	if !ok {
+		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
+			cause:    fmt.Errorf("owning node %s unavailable for owner %q", owningIP, owner),
+			owner:    owner,
+			owningIP: owningIP,
+		}
+	}
+	return endpoint, nil
+}
+
+// workspaceFromRawCreate unmarshals a raw create request and extracts the
+// workspace path from its CreateOptions map. Returns "" when the request does
+// not carry a workspace (non-agentos create path).
+func workspaceFromRawCreate(create []byte) string {
+	createReq := &core.CreateRequest{}
+	if err := proto.Unmarshal(create, createReq); err != nil {
+		return ""
+	}
+	return createReq.GetCreateOptions()[workspaceCreateOptKey]
+}
+
+// createInstanceWithAffinity resolves the owning endpoint via etcd and
+// dispatches the create to that single node. Since the endpoint is directed
+// (not round-robin), the retry loop is replaced by a single attempt. The
+// workspaceAffinityErr returned by resolveOwningEndpoint is retryable and
+// classified so the direct-proxy error path surfaces it correctly.
+func (c *routingFrontendProxyLifecycleClient) createInstanceWithAffinity(
+	options api.InvokeOptions, workspace string,
+	dispatch func(proxyrouting.Endpoint) (string, error),
+) (string, error) {
+	ctx, cancel := simpleRuntimeInvokeContext(options)
+	defer cancel()
+	endpoint, err := resolveOwningEndpoint(ctx, workspace)
+	if err != nil {
+		return "", err
+	}
+	return dispatch(endpoint)
+}
+
+// createInstanceRawWithAffinity is the raw-create counterpart of
+// createInstanceWithAffinity. It uses the caller-supplied context instead of
+// deriving one from InvokeOptions.
+func (c *routingFrontendProxyLifecycleClient) createInstanceRawWithAffinity(
+	ctx context.Context, workspace string,
+	dispatch func(proxyrouting.Endpoint) ([]byte, error),
+) ([]byte, error) {
+	endpoint, err := resolveOwningEndpoint(ctx, workspace)
+	if err != nil {
+		return nil, err
+	}
+	return dispatch(endpoint)
+}
+
 func (c *routingFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCreateRequest) (string, error) {
 	if c == nil || c.clientFactory == nil {
 		return "", fmt.Errorf("frontend proxy lifecycle routing client is not initialized")
+	}
+	if workspace := req.options.CreateOpt[workspaceCreateOptKey]; workspace != "" {
+		return c.createInstanceWithAffinity(req.options, workspace, func(endpoint proxyrouting.Endpoint) (string, error) {
+			serviceClient, err := c.clientFactory.ClientForAddress(endpoint.GRPCAddress)
+			if err != nil {
+				evictFrontendProxyClientOnError(c.clientFactory, endpoint.GRPCAddress, err)
+				return "", err
+			}
+			return newGRPCFrontendProxyLifecycleClient(serviceClient, c.frontendClientID).CreateInstance(req)
+		})
 	}
 	tried := make(map[string]struct{})
 	var lastErr error
@@ -657,6 +793,16 @@ func (c *routingFrontendProxyLifecycleClient) CreateInstance(req simpleRuntimeCr
 func (c *routingFrontendProxyLifecycleClient) CreateInstanceRaw(req simpleRuntimeRawCreateRequest) ([]byte, error) {
 	if c == nil || c.clientFactory == nil {
 		return nil, fmt.Errorf("frontend proxy lifecycle routing client is not initialized")
+	}
+	if workspace := workspaceFromRawCreate(req.create); workspace != "" {
+		return c.createInstanceRawWithAffinity(req.ctx, workspace, func(endpoint proxyrouting.Endpoint) ([]byte, error) {
+			serviceClient, err := c.clientFactory.ClientForAddress(endpoint.GRPCAddress)
+			if err != nil {
+				evictFrontendProxyClientOnError(c.clientFactory, endpoint.GRPCAddress, err)
+				return nil, err
+			}
+			return newGRPCFrontendProxyLifecycleClient(serviceClient, c.frontendClientID).CreateInstanceRaw(req)
+		})
 	}
 	tried := make(map[string]struct{})
 	var lastErr error
