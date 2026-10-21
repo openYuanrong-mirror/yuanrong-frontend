@@ -658,6 +658,16 @@ func buildAgentInvokeOptions(ctx *gin.Context, req CreateAgentRequest,
 		CreateOpt:        map[string]string{"create_error_policy": "last_failure_on_timeout"},
 		CustomExtensions: map[string]string{"lifecycle": "detached", "Concurrency": agentConcurrency},
 	}
+	// Propagate the wrapper-injected W3C traceparent (present when tracing is
+	// enabled on the /api/agent routes) so the proxy-side yr.create span
+	// parents to this request's entry span; without it the C++ side
+	// synthesizes a same-trace parent from the trace id alone
+	// (trace_manager.cpp BuildOptWithParent). convertSimpleRuntimeCreateOptions
+	// merges the key into CreateRequest.createOptions, which the C++ side reads
+	// back via TraceManager::GetTraceParentFromOptions.
+	if tp := ctx.GetHeader(constant.HeaderTraceParent); tp != "" {
+		invokeOpts.CustomExtensions[util.TraceParentExtensionKey] = tp
+	}
 
 	if err := validateRootfsImageURL(req, config.funcKey, config.inline); err != nil {
 		return api.InvokeOptions{}, err

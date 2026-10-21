@@ -29,6 +29,9 @@ import (
 	"strings"
 	"sync"
 
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"frontend/pkg/common/faas_common/constant"
 	"frontend/pkg/common/faas_common/logger/log"
 	fronttls "frontend/pkg/common/faas_common/tls"
@@ -63,6 +66,19 @@ type tunnelContext struct {
 	instanceID string
 	port       int
 	requestID  string
+	traceID    string
+}
+
+// recordTunnelSpanError marks the /serverless/v1/{ws,http} entry span (created
+// by tracer.WrapGinHandler when tracing is enabled) with a connection
+// establishment failure (resolve/dial/negotiate/upgrade-write). No-op when
+// tracing is disabled: SpanFromContext returns a noop span that is not
+// recording.
+func recordTunnelSpanError(r *http.Request, err error) {
+	if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 }
 
 // dialSandboxTunnel authenticates, resolves the instance, authorizes the
@@ -119,6 +135,7 @@ func resolveAndAuthorize(w http.ResponseWriter, r *http.Request, tenantID, insta
 	instance, tunnelAddress, err := resolveInstance(r.Context(), instanceID)
 	if err != nil {
 		log.GetLogger().Infof("wsproxy resolve instance %s failed: %v", instanceID, err)
+		recordTunnelSpanError(r, err)
 		http.Error(w, "failed to resolve instance", http.StatusBadGateway)
 		return "", false
 	}
@@ -138,6 +155,7 @@ func dialInstanceTunnel(w http.ResponseWriter, r *http.Request, instanceID strin
 	tunnelTLSConfig, terr := loadTunnelTLSConfig()
 	if terr != nil {
 		log.GetLogger().Errorf("wsproxy load tunnel TLS config failed: %v", terr)
+		recordTunnelSpanError(r, terr)
 		http.Error(w, "tunnel TLS config error", http.StatusInternalServerError)
 		return tunnelContext{}, false
 	}
@@ -156,16 +174,28 @@ func dialInstanceTunnel(w http.ResponseWriter, r *http.Request, instanceID strin
 		TargetPort:    port,
 		RequestID:     requestID,
 		TraceID:       traceID,
+		// TraceParent is the wrapper-injected W3C traceparent (present when
+		// tracing is enabled); the proxy side reads it out to correlate tunnel
+		// failures with the trace. Optional — omitted when tracing is off and
+		// ignored by proxies that predate the field.
+		TraceParent: r.Header.Get(constant.HeaderTraceParent),
 	})
 	if err != nil {
 		log.GetLogger().Infof("wsproxy dialTunnel instance=%s port=%d trace_id=%s failed: %v",
 			instanceID, port, traceID, err)
+		recordTunnelSpanError(r, err)
 		http.Error(w, "failed to dial sandbox", http.StatusBadGateway)
 		return tunnelContext{}, false
 	}
 	log.GetLogger().Infof("wsproxy tunnel established instance=%s port=%d requestID=%s trace_id=%s",
 		instanceID, port, requestID, traceID)
-	return tunnelContext{tunnelConn: tunnelConn, instanceID: instanceID, port: port, requestID: requestID}, true
+	return tunnelContext{
+		tunnelConn: tunnelConn,
+		instanceID: instanceID,
+		port:       port,
+		requestID:  requestID,
+		traceID:    traceID,
+	}, true
 }
 
 // HandleWebSocket is the wsproxy entry point: L4-passthrough a client WebSocket
@@ -183,12 +213,14 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// so every prior failure path returned above.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		recordTunnelSpanError(r, errors.New("websocket hijack unsupported"))
 		http.Error(w, "websocket hijack unsupported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
 		log.GetLogger().Warnf("wsproxy hijack failed: %v", err)
+		recordTunnelSpanError(r, err)
 		http.Error(w, "hijack failed", http.StatusInternalServerError)
 		return
 	}
@@ -199,9 +231,19 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// it to the tunnel or the AgentServer never answers 101.
 	if werr := r.Write(tc.tunnelConn); werr != nil {
 		log.GetLogger().Warnf("wsproxy write upgrade request to tunnel failed: %v", werr)
+		recordTunnelSpanError(r, werr)
 		return
 	}
 	flushPrefetch(clientBuf, tc.tunnelConn)
+
+	// Connection establishment is complete: auth, route resolution, tunnel
+	// negotiation (a proxy OK means the sandbox port is listening) and
+	// upgrade-request forwarding. End the entry span here — the 101 relay is
+	// loopback sub-millisecond and belongs to the first-message link, and the
+	// session bytes must not keep the span open for the whole connection
+	// lifetime. OTel End() is idempotent, so the wrapper's deferred End is
+	// unaffected; when tracing is disabled this is a noop span End.
+	trace.SpanFromContext(r.Context()).End()
 
 	// Bidirectional byte copy: two goroutines, the first to finish closes the
 	// peer. No WS frame parsing — the AgentServer and client reassemble frames
@@ -244,8 +286,8 @@ func pipe(ctx context.Context, cancel context.CancelFunc, client net.Conn, tc tu
 	closeBoth := func(dir string, err error) {
 		once.Do(func() {
 			if err != nil && !isClosedNetErr(err) {
-				log.GetLogger().Infof("wsproxy copy %s ended instance=%s requestID=%s: %v",
-					dir, tc.instanceID, tc.requestID, err)
+				log.GetLogger().Infof("wsproxy copy %s ended instance=%s requestID=%s trace_id=%s: %v",
+					dir, tc.instanceID, tc.requestID, tc.traceID, err)
 			}
 			closeWithLog(client, "wsproxy client")
 			closeWithLog(tunnel, "wsproxy tunnel")

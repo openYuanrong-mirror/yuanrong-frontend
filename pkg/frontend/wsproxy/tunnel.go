@@ -52,11 +52,13 @@ const (
 	maxPort = 65535
 )
 
-// tunnelHeader mirrors sshproxy.tunnelHeader (byte-for-byte): function_proxy's
-// tcp.tunnel server reads this framed JSON to learn which instance + port to
-// connect inside the sandbox. Protocol="tcp" is the generic L4 marker, not
-// SSH-specific — the same tunnel that sshproxy uses for SSH hops carries WS
-// bytes for wsproxy.
+// tunnelHeader mirrors sshproxy.tunnelHeader, plus the optional traceparent
+// correlation field (sshproxy's copy does not carry it — the proxy-side
+// parser accepts both shapes and ignores unknown/absent keys):
+// function_proxy's tcp.tunnel server reads this framed JSON to learn which
+// instance + port to connect inside the sandbox. Protocol="tcp" is the generic
+// L4 marker, not SSH-specific — the same tunnel that sshproxy uses for SSH
+// hops carries WS bytes for wsproxy.
 type tunnelHeader struct {
 	TunnelVersion int    `json:"tunnelVersion"`
 	InstanceID    string `json:"instanceID"`
@@ -64,6 +66,11 @@ type tunnelHeader struct {
 	TargetPort    int    `json:"targetPort"`
 	RequestID     string `json:"requestID"`
 	TraceID       string `json:"traceID,omitempty"`
+	// TraceParent carries the wrapper-injected W3C traceparent (present when
+	// tracing is enabled) so the proxy side can correlate tunnel faults with
+	// the trace. Optional: omitted when tracing is off; old proxies ignore
+	// unknown JSON keys.
+	TraceParent string `json:"traceparent,omitempty"`
 }
 
 type tunnelResponse struct {
