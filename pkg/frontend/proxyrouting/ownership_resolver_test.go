@@ -59,6 +59,27 @@ func TestOwnershipResolverResolveReturnsOwningIP(t *testing.T) {
 	require.Equal(t, "10.0.0.1", ip)
 }
 
+func TestOwnershipResolverPrefersInjectedClientOverGlobal(t *testing.T) {
+	// Even when the process-wide meta etcd client is unavailable, a resolver
+	// built with an injected client must keep working through that client.
+	patches := gomonkey.ApplyFunc(etcd3.GetMetaEtcdClient, func() *etcd3.EtcdClient {
+		return nil
+	})
+	patches.ApplyMethod(reflect.TypeOf(&etcd3.EtcdClient{}), "Get",
+		func(_ *etcd3.EtcdClient, _ etcd3.EtcdCtxInfo, key string,
+			_ ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+			return &clientv3.GetResponse{
+				Kvs: []*mvccpb.KeyValue{{Value: []byte("10.0.0.7")}},
+			}, nil
+		})
+	defer patches.Reset()
+
+	resolver := NewEtcdOwnershipResolver(&etcd3.EtcdClient{}, "/agent-runtime/workspace")
+	ip, err := resolver.Resolve(context.Background(), "user-frank")
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.7", ip)
+}
+
 func TestOwnershipResolverResolveReturnsEmptyWhenNoRecord(t *testing.T) {
 	etcdClient := &etcd3.EtcdClient{}
 	patches := gomonkey.ApplyMethod(reflect.TypeOf(&etcd3.EtcdClient{}), "Get",

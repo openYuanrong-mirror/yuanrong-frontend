@@ -278,11 +278,20 @@ func (d *MemoryDiscovery) Upsert(endpoint Endpoint) {
 	if _, exists := d.endpoints[endpoint.NodeID]; !exists {
 		d.order = append(d.order, endpoint.NodeID)
 	}
+	previous := d.endpoints[endpoint.NodeID]
 	d.endpoints[endpoint.NodeID] = endpoint
 	if endpoint.Revision > 0 {
 		d.revisions[endpoint.NodeID] = endpoint.Revision
 	}
-	if host := hostFromAddress(endpoint.GRPCAddress); host != "" {
+	host := hostFromAddress(endpoint.GRPCAddress)
+	if host != "" {
+		// When the node's address changed, drop the stale ipIndex entry so
+		// GetByIP no longer resolves the old IP to this node.
+		if oldHost := hostFromAddress(previous.GRPCAddress); oldHost != "" && oldHost != host {
+			if existing, ok := d.ipIndex[oldHost]; ok && existing == endpoint.NodeID {
+				delete(d.ipIndex, oldHost)
+			}
+		}
 		d.ipIndex[host] = endpoint.NodeID
 	}
 }

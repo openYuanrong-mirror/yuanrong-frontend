@@ -42,13 +42,14 @@ type EtcdOwnershipResolver struct {
 	timeout   time.Duration
 }
 
-// NewEtcdOwnershipResolver creates an EtcdOwnershipResolver using the process-wide
-// meta etcd client and the given key prefix.
+// NewEtcdOwnershipResolver creates an EtcdOwnershipResolver backed by the given
+// etcd client and key prefix. When client is nil, Resolve falls back to the
+// process-wide meta etcd client.
 func NewEtcdOwnershipResolver(client *etcd3.EtcdClient, keyPrefix string) *EtcdOwnershipResolver {
 	return &EtcdOwnershipResolver{
 		client:    client,
 		keyPrefix: keyPrefix,
-		timeout:   5 * time.Second,
+		timeout:   defaultOwnershipQueryTimeout,
 	}
 }
 
@@ -63,10 +64,15 @@ func (r *EtcdOwnershipResolver) Resolve(ctx context.Context, owner string) (stri
 	if r == nil {
 		return "", fmt.Errorf("etcd ownership resolver is nil")
 	}
-	// Always fetch the latest meta etcd client to avoid stale connections
-	client := etcd3.GetMetaEtcdClient()
+	// Prefer the injected client so callers (and tests) control the etcd
+	// connection; fall back to the process-wide meta client for resolvers
+	// registered without one (e.g. the default resolver from init).
+	client := r.client
 	if client == nil {
-		return "", fmt.Errorf("meta etcd client is not initialized")
+		client = etcd3.GetMetaEtcdClient()
+	}
+	if client == nil {
+		return "", fmt.Errorf("etcd client is not initialized")
 	}
 	ctxInfo := etcd3.CreateEtcdCtxInfoWithTimeout(ctx, r.timeout)
 	key := r.keyPrefix + "/" + owner
@@ -149,9 +155,14 @@ func InitGlobalOwnershipResolver(name string, etcdClient *etcd3.EtcdClient) {
 	SetGlobalOwnershipResolver(resolver)
 }
 
+// defaultWorkspaceOwnershipKeyPrefix 是 etcd 中 workspace 归属记录的默认 key 前缀。
 const defaultWorkspaceOwnershipKeyPrefix = "/agent-runtime/workspace"
+
+// defaultOwnershipQueryTimeout 是 etcd 归属查询的默认超时。
+const defaultOwnershipQueryTimeout = 5 * time.Second
 
 func init() {
 	RegisterOwnershipResolver(defaultOwnershipResolverName,
-		&EtcdOwnershipResolver{client: nil, keyPrefix: defaultWorkspaceOwnershipKeyPrefix, timeout: 5 * time.Second})
+		&EtcdOwnershipResolver{client: nil, keyPrefix: defaultWorkspaceOwnershipKeyPrefix,
+			timeout: defaultOwnershipQueryTimeout})
 }

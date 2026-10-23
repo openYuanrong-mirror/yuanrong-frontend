@@ -622,14 +622,16 @@ func (c *routingFrontendProxyInvokeClient) InvokeByInstanceIDStream(
 	return payload, nil
 }
 
-// workspaceAffinityErr is returned when workspace-affinity routing fails in a
-// retryable way (e.g. etcd record missing, owning node down). It implements
-// directProxyClassifiedError so the direct-proxy error metadata path can
-// classify it as retryable, pre-dispatch.
+// workspaceAffinityErr is returned when workspace-affinity routing fails.
+// Transient failures (etcd read errors, owning node temporarily down) are
+// retryable; deterministic failures (invalid workspace path, workspace not
+// created yet) are not. It implements directProxyClassifiedError so the
+// direct-proxy error metadata path can classify it accordingly, pre-dispatch.
 type workspaceAffinityErr struct {
-	cause   error
-	owner   string
-	owningIP string
+	cause     error
+	owner     string
+	owningIP  string
+	retryable bool
 }
 
 func (e *workspaceAffinityErr) Error() string {
@@ -652,50 +654,56 @@ func (e *workspaceAffinityErr) Unwrap() error {
 func (e *workspaceAffinityErr) directProxyErrorMetadata() DirectProxyErrorMetadata {
 	return DirectProxyErrorMetadata{
 		Code:        int(common.ErrorCode_ERR_INNER_COMMUNICATION),
-		Retryable:   true,
+		Retryable:   e.retryable,
 		RetryReason: workspaceAffinityRetryReason,
 	}
 }
 
 // resolveOwningEndpoint looks up the owning proxy endpoint for a workspace by
 // querying the OwnershipResolver for the workspace owner. The owner is derived
-// from the workspace path via filepath.Base. If no ownership record exists or
-// the owning node is not registered, a retryable workspaceAffinityErr is
-// returned so the caller can surface a retryable error.
+// from the workspace path via filepath.Base. Transient failures (etcd read
+// errors, owning node temporarily down) return a retryable workspaceAffinityErr;
+// deterministic failures (invalid workspace path, workspace not created yet)
+// return a non-retryable one so the direct-proxy path classifies them correctly.
 func resolveOwningEndpoint(ctx context.Context, workspace string) (proxyrouting.Endpoint, error) {
 	owner := filepath.Base(workspace)
 	if owner == "" || owner == "." || owner == "/" {
 		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
-			cause: fmt.Errorf("cannot derive owner from workspace path %q", workspace),
-			owner: owner,
+			cause:     fmt.Errorf("cannot derive owner from workspace path %q", workspace),
+			owner:     owner,
+			retryable: false,
 		}
 	}
 	resolver := proxyrouting.GetGlobalOwnershipResolver()
 	if resolver == nil {
 		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
-			cause: fmt.Errorf("ownership resolver not available"),
-			owner: owner,
+			cause:     fmt.Errorf("ownership resolver not available"),
+			owner:     owner,
+			retryable: false,
 		}
 	}
 	owningIP, err := resolver.Resolve(ctx, owner)
 	if err != nil {
 		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
-			cause: fmt.Errorf("failed to read workspace affinity: %w", err),
-			owner: owner,
+			cause:     fmt.Errorf("failed to read workspace affinity: %w", err),
+			owner:     owner,
+			retryable: true,
 		}
 	}
 	if owningIP == "" {
 		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
-			cause: fmt.Errorf("workspace not prepared for owner %q, create workspace first", owner),
-			owner: owner,
+			cause:     fmt.Errorf("workspace not prepared for owner %q, create workspace first", owner),
+			owner:     owner,
+			retryable: false,
 		}
 	}
 	endpoint, ok := proxyrouting.GetByIP(owningIP, proxyrouting.CapabilityCreate)
 	if !ok {
 		return proxyrouting.Endpoint{}, &workspaceAffinityErr{
-			cause:    fmt.Errorf("owning node %s unavailable for owner %q", owningIP, owner),
-			owner:    owner,
-			owningIP: owningIP,
+			cause:     fmt.Errorf("owning node %s unavailable for owner %q", owningIP, owner),
+			owner:     owner,
+			owningIP:  owningIP,
+			retryable: true,
 		}
 	}
 	return endpoint, nil
@@ -713,10 +721,11 @@ func workspaceFromRawCreate(create []byte) string {
 }
 
 // createInstanceWithAffinity resolves the owning endpoint via etcd and
-// dispatches the create to that single node. Since the endpoint is directed
+// dispatches the create to that single node. Since the workspace is directed
 // (not round-robin), the retry loop is replaced by a single attempt. The
-// workspaceAffinityErr returned by resolveOwningEndpoint is retryable and
-// classified so the direct-proxy error path surfaces it correctly.
+// workspaceAffinityErr returned by resolveOwningEndpoint carries its
+// retryable classification so the direct-proxy error path surfaces it
+// correctly.
 func (c *routingFrontendProxyLifecycleClient) createInstanceWithAffinity(
 	options api.InvokeOptions, workspace string,
 	dispatch func(proxyrouting.Endpoint) (string, error),

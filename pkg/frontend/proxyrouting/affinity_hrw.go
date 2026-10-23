@@ -54,9 +54,9 @@ func (HRWPolicy) Name() string {
 // hrwScore computes a stable 64-bit score for a (user, ip) pair using FNV-1a.
 func hrwScore(user, ip string) uint64 {
 	h := fnv.New64a()
-	h.Write([]byte(user))
-	h.Write([]byte("|"))
-	h.Write([]byte(ip))
+	_, _ = h.Write([]byte(user))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(ip))
 	return mix64(h.Sum64())
 }
 

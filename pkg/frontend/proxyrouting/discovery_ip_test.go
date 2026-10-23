@@ -121,6 +121,57 @@ func TestIPIndexSyncOnUpsert(t *testing.T) {
 	require.Equal(t, "node-b", endpoint.NodeID)
 }
 
+func TestIPIndexClearedWhenAddressChangesOnUpsert(t *testing.T) {
+	discovery := NewMemoryDiscovery()
+
+	discovery.Upsert(Endpoint{
+		NodeID: "node-a", GRPCAddress: "10.0.0.1:22769", Health: "healthy",
+		Capabilities: map[Capability]bool{CapabilityInvoke: true},
+	})
+	_, ok := discovery.GetByIP("10.0.0.1", CapabilityInvoke)
+	require.True(t, ok)
+
+	// node-a 地址变更为 10.0.0.2:旧 IP 索引应被清理,新 IP 生效
+	discovery.Upsert(Endpoint{
+		NodeID: "node-a", GRPCAddress: "10.0.0.2:22769", Health: "healthy",
+		Capabilities: map[Capability]bool{CapabilityInvoke: true},
+	})
+
+	_, ok = discovery.GetByIP("10.0.0.1", CapabilityInvoke)
+	require.False(t, ok, "stale ipIndex entry must be removed after address change")
+
+	endpoint, ok := discovery.GetByIP("10.0.0.2", CapabilityInvoke)
+	require.True(t, ok)
+	require.Equal(t, "node-a", endpoint.NodeID)
+}
+
+func TestIPIndexKeptWhenOldHostTakenOverByOtherNode(t *testing.T) {
+	discovery := NewMemoryDiscovery()
+
+	discovery.Upsert(Endpoint{
+		NodeID: "node-a", GRPCAddress: "10.0.0.1:22769", Health: "healthy",
+		Capabilities: map[Capability]bool{CapabilityInvoke: true},
+	})
+	// node-b 接管旧 IP(IP 复用场景)
+	discovery.Upsert(Endpoint{
+		NodeID: "node-b", GRPCAddress: "10.0.0.1:22769", Health: "healthy",
+		Capabilities: map[Capability]bool{CapabilityInvoke: true},
+	})
+	// node-a 迁移到 10.0.0.2;旧 IP 已归属 node-b,不应被 node-a 的迁移清理
+	discovery.Upsert(Endpoint{
+		NodeID: "node-a", GRPCAddress: "10.0.0.2:22769", Health: "healthy",
+		Capabilities: map[Capability]bool{CapabilityInvoke: true},
+	})
+
+	endpoint, ok := discovery.GetByIP("10.0.0.1", CapabilityInvoke)
+	require.True(t, ok)
+	require.Equal(t, "node-b", endpoint.NodeID)
+
+	endpoint, ok = discovery.GetByIP("10.0.0.2", CapabilityInvoke)
+	require.True(t, ok)
+	require.Equal(t, "node-a", endpoint.NodeID)
+}
+
 func TestIPIndexSyncOnDelete(t *testing.T) {
 	discovery := NewMemoryDiscovery()
 	discovery.ReplaceSnapshot([]Endpoint{

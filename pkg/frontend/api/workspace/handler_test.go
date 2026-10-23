@@ -87,13 +87,13 @@ func (s *fakeStore) Delete(_ context.Context, owner string) error {
 
 // fakeProxyClient 记录 PrepareWorkspace / RemoveWorkspace 调用
 type fakeProxyClient struct {
-	mu                sync.Mutex
-	prepareReq        *frontend_proxy.PrepareWorkspaceRequest
-	removeReq         *frontend_proxy.RemoveWorkspaceRequest
-	prepareResp       *frontend_proxy.PrepareWorkspaceResponse
-	prepareErr        error
-	removeResp        *frontend_proxy.RemoveWorkspaceResponse
-	removeErr         error
+	mu          sync.Mutex
+	prepareReq  *frontend_proxy.PrepareWorkspaceRequest
+	removeReq   *frontend_proxy.RemoveWorkspaceRequest
+	prepareResp *frontend_proxy.PrepareWorkspaceResponse
+	prepareErr  error
+	removeResp  *frontend_proxy.RemoveWorkspaceResponse
+	removeErr   error
 }
 
 func (c *fakeProxyClient) PrepareWorkspace(_ context.Context, in *frontend_proxy.PrepareWorkspaceRequest,
@@ -169,10 +169,8 @@ func setupTestDeps(t *testing.T, factory frontendProxyClientFactory, store etcdO
 				},
 			}, true
 		})
-	if nodeIPs != nil {
-		patches.ApplyFunc(proxyrouting.NodeIPs,
-			func(_ proxyrouting.Capability) []string { return nodeIPs })
-	}
+	patches.ApplyFunc(proxyrouting.NodeIPs,
+		func(_ proxyrouting.Capability) []string { return nodeIPs })
 	return func() {
 		patches.Reset()
 		restoreDeps()
@@ -243,7 +241,7 @@ func TestCreateHandlerReturnsOKOnFreshCreate(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	var resp struct {
-		Code int                    `json:"code"`
+		Code int                     `json:"code"`
 		Data CreateWorkspaceResponse `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
@@ -277,7 +275,7 @@ func TestCreateHandlerReusesExistingOwnership(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	var resp struct {
-		Code int                    `json:"code"`
+		Code int                     `json:"code"`
 		Data CreateWorkspaceResponse `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
@@ -387,6 +385,57 @@ func TestCreateHandlerReturns500WhenPrepareWorkspaceReturnsErrorStatus(t *testin
 	require.Equal(t, http.StatusInternalServerError, recorder.Code)
 }
 
+func TestCreateHandlerRollsBackFreshOwnershipOnPrepareFailure(t *testing.T) {
+	store := newFakeStore()
+	client := &fakeProxyClient{prepareErr: errors.New("rpc unavailable")}
+	factory := &fakeFactory{client: client}
+	restore := setupTestDeps(t, factory, store, "10.0.0.5", true, []string{"10.0.0.5"})
+	defer restore()
+
+	recorder, ctx := doPOST(`{"owner":"alice"}`)
+	CreateHandler(ctx)
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+
+	// 本次新决策的归属记录应被回滚,避免 owner 永久卡在故障节点
+	ownerIP, err := store.GetOwner(context.Background(), "alice")
+	require.NoError(t, err)
+	require.Empty(t, ownerIP)
+}
+
+func TestCreateHandlerKeepsExistingOwnershipOnPrepareFailure(t *testing.T) {
+	store := newFakeStore()
+	store.records["alice"] = "10.0.0.9" // 非本次决策的已有记录
+	client := &fakeProxyClient{prepareErr: errors.New("rpc unavailable")}
+	factory := &fakeFactory{client: client}
+	restore := setupTestDeps(t, factory, store, "10.0.0.9", true, []string{"10.0.0.9"})
+	defer restore()
+
+	recorder, ctx := doPOST(`{"owner":"alice"}`)
+	CreateHandler(ctx)
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+
+	// 已有归属记录不应被回滚
+	ownerIP, err := store.GetOwner(context.Background(), "alice")
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.9", ownerIP)
+}
+
+func TestCreateHandlerRollsBackFreshOwnershipWhenOwningNodeUnavailable(t *testing.T) {
+	store := newFakeStore()
+	factory := &fakeFactory{client: &fakeProxyClient{}}
+	// HRW 选中 10.0.0.5 并落盘,但 GetByIP 不命中(节点刚下线) → 应回滚
+	restore := setupTestDeps(t, factory, store, "10.0.0.5", false, []string{"10.0.0.5"})
+	defer restore()
+
+	recorder, ctx := doPOST(`{"owner":"alice"}`)
+	CreateHandler(ctx)
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+
+	ownerIP, err := store.GetOwner(context.Background(), "alice")
+	require.NoError(t, err)
+	require.Empty(t, ownerIP)
+}
+
 func TestCreateHandlerCASLosesRaceReturnsExistingIP(t *testing.T) {
 	// 模拟并发:PutIfAbsent 时发现 key 已被他人写入,返回已有值
 	store := newFakeStore()
@@ -443,7 +492,7 @@ func TestDeleteHandlerReturnsOKOnSuccess(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	var resp struct {
-		Code int                    `json:"code"`
+		Code int                     `json:"code"`
 		Data DeleteWorkspaceResponse `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
@@ -588,6 +637,8 @@ func TestCreateHandlerErrorMessageDoesNotLeakInternalDetails(t *testing.T) {
 	// message 字段包含 wrapper 文本,但不暴露 internal 细节
 	body := recorder.Body.String()
 	require.Contains(t, body, "failed to read workspace ownership")
+	require.NotContains(t, body, "10.0.0.1:2379")
+	require.NotContains(t, body, "internal:")
 }
 
 // --- 反射相关:确保 fakeProxyClient 实现 frontendProxyClient 接口 ---

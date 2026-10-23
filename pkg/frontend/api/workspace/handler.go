@@ -31,7 +31,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -57,9 +57,10 @@ const defaultWorkspaceAccessRoot = "/home/agentos/users"
 
 // 默认操作超时
 const (
-	defaultWorkspaceEtcdTimeout  = 5 * time.Second
-	defaultWorkspaceGRPCTimeout  = 30 * time.Second
-	defaultWorkspaceMode         = "0700"
+	defaultWorkspaceEtcdTimeout      = 5 * time.Second
+	defaultWorkspaceGRPCTimeout      = 30 * time.Second
+	defaultWorkspaceKeepaliveTimeout = 10 * time.Second
+	defaultWorkspaceMode             = "0700"
 )
 
 // CreateWorkspaceRequest 是 POST /workspace 的请求体
@@ -147,7 +148,7 @@ func (p *grpcClientPool) ClientForAddress(address string) (frontendProxyClient, 
 		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    time.Hour,
-			Timeout: 10 * time.Second,
+			Timeout: defaultWorkspaceKeepaliveTimeout,
 		}),
 	)
 	if err != nil {
@@ -349,7 +350,7 @@ func CreateHandler(ctx *gin.Context) {
 	if err != nil {
 		log.GetLogger().Errorf("failed to get workspace ownership owner=%s: %v", owner, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("failed to read workspace ownership: %v", err)})
+			"message": "failed to read workspace ownership"})
 		return
 	}
 	// ownerFreshlyDecided 标记本次是否新决策归属(用于响应中的 created 字段)
@@ -359,9 +360,9 @@ func CreateHandler(ctx *gin.Context) {
 		ip, err := selectOwningIP(parentCtx, owner)
 		if err != nil {
 			log.GetLogger().Errorf("failed to select owning ip owner=%s: %v", owner, err)
-			// 节点列表为空等场景视为归属节点不可用
+			// 节点列表为空等场景视为归属节点不可用;细节只记日志,不返回给客户端
 			ctx.JSON(http.StatusServiceUnavailable, gin.H{"code": http.StatusServiceUnavailable,
-				"message": fmt.Sprintf("no healthy workspace owning node: %v", err)})
+				"message": "no healthy workspace owning node"})
 			return
 		}
 		// 3. CAS 写入
@@ -369,22 +370,47 @@ func CreateHandler(ctx *gin.Context) {
 		if err != nil {
 			log.GetLogger().Errorf("failed to CAS put workspace ownership owner=%s: %v", owner, err)
 			ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-				"message": fmt.Sprintf("failed to persist workspace ownership: %v", err)})
+				"message": "failed to persist workspace ownership"})
 			return
 		}
 		owningIP = finalIP
 		ownerFreshlyDecided = finalIP == ip
 	}
 
+	// rollbackFreshOwnership 在本次请求新决策归属后失败时尽力回滚 etcd 记录,
+	// 避免归属节点不可用时 owner 永久指向故障节点。仅删除仍指向本次写入 IP
+	// 的记录,防止误删并发请求写入的记录;回滚失败仅记日志,不影响错误响应。
+	rollbackFreshOwnership := func() {
+		if !ownerFreshlyDecided {
+			return
+		}
+		current, err := store.GetOwner(parentCtx, owner)
+		if err != nil {
+			log.GetLogger().Errorf("failed to re-read workspace ownership before rollback owner=%s: %v", owner, err)
+			return
+		}
+		if current != owningIP {
+			return
+		}
+		if err := store.Delete(parentCtx, owner); err != nil {
+			log.GetLogger().Errorf("failed to rollback workspace ownership owner=%s ip=%s: %v", owner, owningIP, err)
+			return
+		}
+		log.GetLogger().Infof("rolled back freshly created workspace ownership owner=%s ip=%s after create failure",
+			owner, owningIP)
+	}
+
 	// 4. GetByIP 定向到归属节点
 	endpoint, ok := proxyrouting.GetByIP(owningIP, proxyrouting.CapabilityCreate)
 	if !ok {
 		log.GetLogger().Errorf("workspace owning node not healthy owner=%s ip=%s", owner, owningIP)
+		rollbackFreshOwnership()
 		ctx.JSON(http.StatusServiceUnavailable, gin.H{"code": http.StatusServiceUnavailable,
 			"message": fmt.Sprintf("workspace owning node %s is unavailable", owningIP)})
 		return
 	}
 	if !proxyrouting.IsRoutableAddress(endpoint.GRPCAddress) {
+		rollbackFreshOwnership()
 		ctx.JSON(http.StatusServiceUnavailable, gin.H{"code": http.StatusServiceUnavailable,
 			"message": fmt.Sprintf("workspace owning node %s has no routable address", owningIP)})
 		return
@@ -396,8 +422,9 @@ func CreateHandler(ctx *gin.Context) {
 	if err != nil {
 		log.GetLogger().Errorf("failed to get frontend proxy client owner=%s addr=%s: %v",
 			owner, endpoint.GRPCAddress, err)
+		rollbackFreshOwnership()
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("failed to connect owning node: %v", err)})
+			"message": "failed to connect owning node"})
 		return
 	}
 	rpcCtx, cancel := context.WithTimeout(parentCtx, defaultWorkspaceGRPCTimeout)
@@ -413,15 +440,17 @@ func CreateHandler(ctx *gin.Context) {
 	})
 	if err != nil {
 		log.GetLogger().Errorf("PrepareWorkspace RPC failed owner=%s ip=%s: %v", owner, owningIP, err)
+		rollbackFreshOwnership()
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("PrepareWorkspace failed: %v", err)})
+			"message": "PrepareWorkspace failed"})
 		return
 	}
 	if resp != nil && resp.Status != nil && !isFrontendProxyStatusOK(resp.Status) {
 		log.GetLogger().Errorf("PrepareWorkspace returned error owner=%s ip=%s code=%d message=%s",
 			owner, owningIP, resp.Status.GetCode(), resp.Status.GetMessage())
+		rollbackFreshOwnership()
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("PrepareWorkspace failed: %s", resp.Status.GetMessage())})
+			"message": "PrepareWorkspace failed"})
 		return
 	}
 
@@ -463,7 +492,7 @@ func DeleteHandler(ctx *gin.Context) {
 	if err != nil {
 		log.GetLogger().Errorf("failed to get workspace ownership owner=%s: %v", owner, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("failed to read workspace ownership: %v", err)})
+			"message": "failed to read workspace ownership"})
 		return
 	}
 	// 无归属视为已删除(幂等)
@@ -494,7 +523,7 @@ func DeleteHandler(ctx *gin.Context) {
 		log.GetLogger().Errorf("failed to get frontend proxy client owner=%s addr=%s: %v",
 			owner, endpoint.GRPCAddress, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("failed to connect owning node: %v", err)})
+			"message": "failed to connect owning node"})
 		return
 	}
 	rpcCtx, cancel := context.WithTimeout(parentCtx, defaultWorkspaceGRPCTimeout)
@@ -510,14 +539,14 @@ func DeleteHandler(ctx *gin.Context) {
 	if err != nil {
 		log.GetLogger().Errorf("RemoveWorkspace RPC failed owner=%s ip=%s: %v", owner, owningIP, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("RemoveWorkspace failed: %v", err)})
+			"message": "RemoveWorkspace failed"})
 		return
 	}
 	if resp != nil && resp.Status != nil && !isFrontendProxyStatusOK(resp.Status) {
 		log.GetLogger().Errorf("RemoveWorkspace returned error owner=%s ip=%s code=%d message=%s",
 			owner, owningIP, resp.Status.GetCode(), resp.Status.GetMessage())
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("RemoveWorkspace failed: %s", resp.Status.GetMessage())})
+			"message": "RemoveWorkspace failed"})
 		return
 	}
 
@@ -525,7 +554,7 @@ func DeleteHandler(ctx *gin.Context) {
 	if err := store.Delete(parentCtx, owner); err != nil {
 		log.GetLogger().Errorf("failed to delete workspace ownership owner=%s: %v", owner, err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError,
-			"message": fmt.Sprintf("RemoveWorkspace succeeded but failed to delete ownership: %v", err)})
+			"message": "RemoveWorkspace succeeded but failed to delete ownership"})
 		return
 	}
 

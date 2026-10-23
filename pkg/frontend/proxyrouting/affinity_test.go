@@ -35,6 +35,8 @@ func TestHRWDistributionUniformity(t *testing.T) {
 	policy := HRWPolicy{}
 	counts := make(map[string]int, len(nodeIPs))
 	const numUsers = 1000
+	// distributionTolerance 允许各节点分配数相对期望值的最大偏差比例。
+	const distributionTolerance = 0.3
 	for i := 0; i < numUsers; i++ {
 		user := fmt.Sprintf("user-%d", i)
 		ip, err := policy.Select(user, nodeIPs)
@@ -44,7 +46,7 @@ func TestHRWDistributionUniformity(t *testing.T) {
 
 	expected := numUsers / len(nodeIPs)
 	for _, ip := range nodeIPs {
-		require.InDelta(t, expected, counts[ip], float64(expected)*0.3,
+		require.InDelta(t, expected, counts[ip], float64(expected)*distributionTolerance,
 			"node %s got %d assignments, expected ~%d", ip, counts[ip], expected)
 	}
 }
@@ -61,21 +63,24 @@ func TestHRWMigrationRatioOnNodeAdd(t *testing.T) {
 	policy := HRWPolicy{}
 
 	const numUsers = 1000
+	// migrationTolerance 允许实际迁移用户数相对期望值的最大偏差比例。
+	const migrationTolerance = 0.05
 	changed := 0
 	for i := 0; i < numUsers; i++ {
 		user := fmt.Sprintf("user-%d", i)
 		old, err := policy.Select(user, nodeIPs)
 		require.NoError(t, err)
-		new, err := policy.Select(user, newNodeIPs)
+		updated, err := policy.Select(user, newNodeIPs)
 		require.NoError(t, err)
-		if old != new {
+		if old != updated {
 			changed++
 		}
 	}
 
 	// Adding 1 node to 5 should migrate roughly 1/6 of users.
-	require.InDelta(t, numUsers/6, changed, float64(numUsers)*0.05,
-		"expected ~%d migrations, got %d", numUsers/6, changed)
+	expectedMigrations := numUsers / len(newNodeIPs)
+	require.InDelta(t, expectedMigrations, changed, float64(numUsers)*migrationTolerance,
+		"expected ~%d migrations, got %d", expectedMigrations, changed)
 }
 
 func TestHRWListOrderIndependence(t *testing.T) {
