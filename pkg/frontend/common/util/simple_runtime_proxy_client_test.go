@@ -60,21 +60,29 @@ const (
 )
 
 type fakeFrontendProxyServiceClient struct {
-	req        *frontend_proxy.InvokeInstanceRequest
-	resp       *frontend_proxy.InvokeInstanceResponse
-	createReq  *frontend_proxy.CreateInstanceRequest
-	createResp *frontend_proxy.CreateInstanceResponse
-	killReq    *frontend_proxy.KillInstanceRequest
-	killResp   *frontend_proxy.KillInstanceResponse
-	invokeCtx  context.Context
-	createCtx  context.Context
-	killCtx    context.Context
-	invokeFn   func(context.Context, *frontend_proxy.InvokeInstanceRequest) (*frontend_proxy.InvokeInstanceResponse, error)
-	createFn   func(context.Context, *frontend_proxy.CreateInstanceRequest) (*frontend_proxy.CreateInstanceResponse, error)
-	killFn     func(context.Context, *frontend_proxy.KillInstanceRequest) (*frontend_proxy.KillInstanceResponse, error)
-	err        error
-	calls      int
-	stream     frontend_proxy.FrontendProxyService_InvokeInstanceStreamClient
+	req         *frontend_proxy.InvokeInstanceRequest
+	resp        *frontend_proxy.InvokeInstanceResponse
+	createReq   *frontend_proxy.CreateInstanceRequest
+	createResp  *frontend_proxy.CreateInstanceResponse
+	killReq     *frontend_proxy.KillInstanceRequest
+	killResp    *frontend_proxy.KillInstanceResponse
+	prepareReq  *frontend_proxy.PrepareWorkspaceRequest
+	prepareResp *frontend_proxy.PrepareWorkspaceResponse
+	removeReq   *frontend_proxy.RemoveWorkspaceRequest
+	removeResp  *frontend_proxy.RemoveWorkspaceResponse
+	invokeCtx   context.Context
+	createCtx   context.Context
+	killCtx     context.Context
+	prepareCtx  context.Context
+	removeCtx   context.Context
+	invokeFn    func(context.Context, *frontend_proxy.InvokeInstanceRequest) (*frontend_proxy.InvokeInstanceResponse, error)
+	createFn    func(context.Context, *frontend_proxy.CreateInstanceRequest) (*frontend_proxy.CreateInstanceResponse, error)
+	killFn      func(context.Context, *frontend_proxy.KillInstanceRequest) (*frontend_proxy.KillInstanceResponse, error)
+	prepareFn   func(context.Context, *frontend_proxy.PrepareWorkspaceRequest) (*frontend_proxy.PrepareWorkspaceResponse, error)
+	removeFn    func(context.Context, *frontend_proxy.RemoveWorkspaceRequest) (*frontend_proxy.RemoveWorkspaceResponse, error)
+	err         error
+	calls       int
+	stream      frontend_proxy.FrontendProxyService_InvokeInstanceStreamClient
 }
 
 type fakeInvokeInstanceStreamClient struct {
@@ -192,6 +200,30 @@ func (f *fakeFrontendProxyServiceClient) KillInstance(ctx context.Context, in *f
 		return f.killFn(ctx, in)
 	}
 	return f.killResp, f.err
+}
+
+func (f *fakeFrontendProxyServiceClient) PrepareWorkspace(ctx context.Context, in *frontend_proxy.PrepareWorkspaceRequest,
+	opts ...grpc.CallOption,
+) (*frontend_proxy.PrepareWorkspaceResponse, error) {
+	f.calls++
+	f.prepareReq = in
+	f.prepareCtx = ctx
+	if f.prepareFn != nil {
+		return f.prepareFn(ctx, in)
+	}
+	return f.prepareResp, f.err
+}
+
+func (f *fakeFrontendProxyServiceClient) RemoveWorkspace(ctx context.Context, in *frontend_proxy.RemoveWorkspaceRequest,
+	opts ...grpc.CallOption,
+) (*frontend_proxy.RemoveWorkspaceResponse, error) {
+	f.calls++
+	f.removeReq = in
+	f.removeCtx = ctx
+	if f.removeFn != nil {
+		return f.removeFn(ctx, in)
+	}
+	return f.removeResp, f.err
 }
 
 func createResponseWithUnknownReadyCallResult(
@@ -2907,4 +2939,74 @@ func canceledContextForTest() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	return ctx
+}
+
+// --- workspace affinity 错误分类 ---
+
+// stubOwnershipResolver 是 OwnershipResolver 的桩实现,注入归属 IP 或读错误。
+type stubOwnershipResolver struct {
+	owningIP string
+	err      error
+}
+
+func (s *stubOwnershipResolver) Resolve(_ context.Context, _ string) (string, error) {
+	return s.owningIP, s.err
+}
+
+func TestResolveOwningEndpointClassifiesRetryability(t *testing.T) {
+	// 空 discovery:保证 GetByIP 一定未命中(归属节点不可用场景)
+	restoreDiscovery := proxyrouting.SetDiscoveryForTest(proxyrouting.NewMemoryDiscovery())
+	defer restoreDiscovery()
+
+	cases := []struct {
+		name      string
+		resolver  proxyrouting.OwnershipResolver
+		workspace string
+		retryable bool
+	}{
+		{
+			name:      "invalid workspace path is not retryable",
+			resolver:  &stubOwnershipResolver{},
+			workspace: "/",
+			retryable: false,
+		},
+		{
+			name:      "missing resolver is not retryable",
+			resolver:  nil,
+			workspace: "/home/agentos/users/alice",
+			retryable: false,
+		},
+		{
+			name:      "missing ownership record is not retryable",
+			resolver:  &stubOwnershipResolver{},
+			workspace: "/home/agentos/users/alice",
+			retryable: false,
+		},
+		{
+			name:      "etcd read failure is retryable",
+			resolver:  &stubOwnershipResolver{err: errors.New("etcd unavailable")},
+			workspace: "/home/agentos/users/alice",
+			retryable: true,
+		},
+		{
+			name:      "owning node unavailable is retryable",
+			resolver:  &stubOwnershipResolver{owningIP: "10.0.0.99"},
+			workspace: "/home/agentos/users/alice",
+			retryable: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			restoreResolver := proxyrouting.SetOwnershipResolverForTest(c.resolver)
+			defer restoreResolver()
+
+			_, err := resolveOwningEndpoint(context.Background(), c.workspace)
+			require.Error(t, err)
+
+			metadata, ok := GetDirectProxyErrorMetadata(err)
+			require.True(t, ok)
+			require.Equal(t, workspaceAffinityRetryReason, metadata.RetryReason)
+			require.Equal(t, c.retryable, metadata.Retryable)
+		})
+	}
 }

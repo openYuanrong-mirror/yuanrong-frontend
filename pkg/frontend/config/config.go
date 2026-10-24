@@ -34,6 +34,7 @@ import (
 	"frontend/pkg/common/faas_common/sts"
 	commonType "frontend/pkg/common/faas_common/types"
 	"frontend/pkg/common/faas_common/utils"
+	"frontend/pkg/frontend/proxyrouting"
 	"frontend/pkg/frontend/types"
 	"frontend/pkg/frontend/upgradecompatible"
 )
@@ -108,11 +109,20 @@ func InitFunctionConfig(data []byte) error {
 	initDefaultLocalAuthConfig()
 	initDefaultHeartbeatConfig()
 	initDefaultHTTPConfig()
+	initDefaultWorkspaceOwnershipResolver()
 	err = initWatchConfig(fConfig, stopCh)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+// initDefaultWorkspaceOwnershipResolver sets the default workspace ownership
+// resolver name when the config does not specify one.
+func initDefaultWorkspaceOwnershipResolver() {
+	if fConfig.WorkspaceOwnershipResolver == "" {
+		fConfig.WorkspaceOwnershipResolver = "etcd"
+	}
 }
 
 // loadFunctionConfig is used to initialize the config
@@ -192,6 +202,7 @@ func InitModuleConfig() error {
 	initDefaultMemoryEvaluatorConfig()
 	initDefaultHeartbeatConfig()
 	initDefaultHTTPConfig()
+	initDefaultWorkspaceOwnershipResolver()
 	return nil
 }
 
@@ -246,6 +257,8 @@ func InitEtcd(stopCh <-chan struct{}) error {
 		}
 		log.GetLogger().Infof("init dataSystemEtcd success")
 	}
+
+	proxyrouting.InitGlobalOwnershipResolver(fConfig.WorkspaceOwnershipResolver, etcd3.GetMetaEtcdClient())
 
 	return nil
 }
