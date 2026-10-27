@@ -29,8 +29,14 @@ import (
 )
 
 const (
-	maxInvokeRetries        = 5
+	maxInvokeRetries = 5
+	// traceParentExtensionKey is the CustomExtensions/createOptions key that
+	// carries the W3C traceparent down to the C++ side
+	// (TraceManager::GetTraceParentFromOptions).
 	traceParentExtensionKey = "traceparent"
+	// TraceParentExtensionKey re-exports traceParentExtensionKey for callers
+	// outside the util package (e.g. the agent create handler).
+	TraceParentExtensionKey = traceParentExtensionKey
 )
 
 type invokerLibruntime interface {

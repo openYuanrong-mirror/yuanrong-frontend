@@ -217,20 +217,26 @@ func InitRoute(r *gin.Engine) {
 	}
 
 	// agent management (create/kill/get/list by user function URN, with workspace/user/userid)
+	// Every route is wrapped with tracer.WrapGinHandler so the agent APIs get a
+	// request entry span (named by the request path) and a Traceparent header
+	// injected into the in-memory request when tracing is enabled; the group
+	// agentTraceMiddleware still resolves/echoes X-Trace-Id first so the wrapper
+	// derives the trace id from it. When tracing is disabled the wrapper is a
+	// pass-through and behavior is unchanged.
 	agentGroup := r.Group("/api/agent")
 	agentGroup.Use(agentTraceMiddleware)
 	{
-		agentGroup.POST("", agent.CreateHandler)
-		agentGroup.POST("/:instanceId/invoke", agent.InvokeHandler)
-		agentGroup.DELETE("/:instanceId", agent.DeleteHandler)
-		agentGroup.GET("", agent.ListHandler)
-		agentGroup.GET("/:instanceId", agent.GetHandler)
+		agentGroup.POST("", tracer.WrapGinHandler(agent.CreateHandler))
+		agentGroup.POST("/:instanceId/invoke", tracer.WrapGinHandler(agent.InvokeHandler))
+		agentGroup.DELETE("/:instanceId", tracer.WrapGinHandler(agent.DeleteHandler))
+		agentGroup.GET("", tracer.WrapGinHandler(agent.ListHandler))
+		agentGroup.GET("/:instanceId", tracer.WrapGinHandler(agent.GetHandler))
 		// agent instance file transfer (upload/download to the owning proxy)
-		agentGroup.POST("/:instanceId/files/upload", agent.FileUploadHandler)
-		agentGroup.GET("/:instanceId/files/download", agent.FileDownloadHandler)
-		agentGroup.GET("/:instanceId/files/list", agent.FileListHandler)
-		agentGroup.POST("/:instanceId/files/mkdir", agent.FileMkdirHandler)
-		agentGroup.POST("/:instanceId/exec", agent.ExecHandler)
+		agentGroup.POST("/:instanceId/files/upload", tracer.WrapGinHandler(agent.FileUploadHandler))
+		agentGroup.GET("/:instanceId/files/download", tracer.WrapGinHandler(agent.FileDownloadHandler))
+		agentGroup.GET("/:instanceId/files/list", tracer.WrapGinHandler(agent.FileListHandler))
+		agentGroup.POST("/:instanceId/files/mkdir", tracer.WrapGinHandler(agent.FileMkdirHandler))
+		agentGroup.POST("/:instanceId/exec", tracer.WrapGinHandler(agent.ExecHandler))
 	}
 
 	// workspace management (create/delete per-owner workspace directory on the
